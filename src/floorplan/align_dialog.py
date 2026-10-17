@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 
@@ -18,6 +19,18 @@ from .align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, validat
 
 
 ACTIVE = {"starting", "generating", "serving", "stopping"}
+
+_TERMINAL_ESCAPE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC, including terminal hyperlinks
+    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"  # CSI, including ANSI colours
+    r"|\x1b[ -/]*[@-Z\\-_]")
+
+
+def _plain_log(text):
+    """Render terminal output as plain text without changing the saved log."""
+    text = _TERMINAL_ESCAPE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", text)
 
 
 def open_align_browser(url):
@@ -80,7 +93,7 @@ class AlignSettingsDialog(QDialog):
         self.backend = QLineEdit(str(config.backend_path))
         self.run_root = QLineEdit(str(config.run_root))
         for title, field, directory in (
-                ("Isolated ALIGN Python:", self.python, False),
+                ("ALIGN Python:", self.python, False),
                 ("ALIGN backend folder:", self.backend, True),
                 ("Placement runs folder:", self.run_root, True)):
             row = QHBoxLayout()
@@ -90,14 +103,7 @@ class AlignSettingsDialog(QDialog):
             row.addWidget(browse)
             form.addRow(title, row)
         layout.addLayout(form)
-        layout.addWidget(_label(
-            "Technologies come from the ROAR sizing library. Placement also requires an "
-            "ALIGN backend; unavailable technologies are shown above. Python, backend and "
-            "run folders are saved on this machine. ALIGN runs separately from ROAR."))
-        defaults = PROFILE["run_defaults"]
-        layout.addWidget(_label(
-            f"Placement defaults: seed {defaults['seed']}, {defaults['placer_sa_iterations']} placement iterations, "
-            f"{defaults['nvariants']} alternatives."))
+        self.python.setToolTip("Python executable from the separate ALIGN environment.")
         self.error = _label()
         layout.addWidget(self.error)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -140,21 +146,20 @@ class PlacementRunDialog(QDialog):
         layout.addWidget(self.status)
         self.url = QLineEdit()
         self.url.setReadOnly(True)
-        self.url.setPlaceholderText("Browser address appears after ALIGN is ready")
+        self.url.setPlaceholderText("Viewer URL")
         layout.addWidget(self.url)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log)
-        layout.addWidget(_label("Closing this window stops the managed ALIGN process. Run files are kept; completed placements can be reopened."))
         buttons = QHBoxLayout()
         self.stop_button = QPushButton("Cancel generation")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(lambda: self._stop())
         buttons.addWidget(self.stop_button)
         buttons.addStretch()
-        close = QPushButton("Close")
-        close.clicked.connect(self.close)
-        buttons.addWidget(close)
+        self.close_button = QPushButton("Close")
+        self.close_button.clicked.connect(self.close)
+        buttons.addWidget(self.close_button)
         layout.addLayout(buttons)
 
     def update_state(self, state, text, log):
@@ -162,6 +167,8 @@ class PlacementRunDialog(QDialog):
         self.url.setText(str(state.url or ""))
         self.stop_button.setEnabled(state.can_stop and state.status != "stopping")
         self.stop_button.setText("Stop ALIGN" if state.status == "serving" else "Cancel generation")
+        self.close_button.setText("Stop and close" if state.status in ACTIVE else "Close")
+        log = _plain_log(log)
         if self.log.toPlainText() != log:
             scroll = self.log.verticalScrollBar()
             at_end, position = scroll.value() == scroll.maximum(), scroll.value()
@@ -220,10 +227,6 @@ class PlacementPanel(QWidget):
         layout = QVBoxLayout(self)
         self.profile_label = _label()
         layout.addWidget(self.profile_label)
-        layout.addWidget(_label(
-            "Generate placement for the selected technology, then inspect it in ALIGN's "
-            "browser viewer. ROAR stays available while ALIGN runs. Saved runs use the "
-            "floorplan input captured when generation started."))
         buttons = QHBoxLayout()
         self.generate_button = QPushButton("Generate placement and open ALIGN")
         self.generate_button.clicked.connect(lambda: self._guard(self.generate))
@@ -235,7 +238,7 @@ class PlacementPanel(QWidget):
         self.settings_button.clicked.connect(lambda: self._guard(self.edit_settings))
         buttons.addWidget(self.settings_button)
         layout.addLayout(buttons)
-        self.status = _label("Open a floorplan to generate placement.")
+        self.status = _label()
         layout.addWidget(self.status)
         self.last_label = _label()
         layout.addWidget(self.last_label)
@@ -254,7 +257,7 @@ class PlacementPanel(QWidget):
         try:
             action()
         except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
-            message = str(exc) + " Check ALIGN settings and the selected layout technology."
+            message = str(exc)
             self.status.setText(message)
             if self._view is not None and self._view.isVisible():
                 self._view.status.setText(message)
@@ -284,12 +287,12 @@ class PlacementPanel(QWidget):
             self.generate_button.setEnabled(self._active())
             self.open_last_button.setEnabled(False)
             self.status.setText(str(exc))
-            self.last_label.setText("Current edits cannot be validated. Existing placement uses the captured run input.")
+            self.last_label.setText("Placement uses saved input." if self._state else "")
             return
         self._input_error = ""
         self.profile_label.setText("Layout technology: " + (
             PROFILE["technology"] if project.align_profile == PROFILE_ID else
-            ("Unavailable backend" if project.align_profile else "None — select a technology in ALIGN settings")))
+            ("Unavailable backend" if project.align_profile else "None")))
         self.profile_label.setToolTip(project.align_profile or "")
         error = ""
         try:
@@ -307,16 +310,12 @@ class PlacementPanel(QWidget):
         self.settings_button.setEnabled(not self._active())
         state = runner.last_placement(project)
         self.open_last_button.setEnabled(state is not None and not (self._active() and self._state.status != "serving"))
-        if state is None:
-            self.last_label.setText("No saved placement for this floorplan.")
-        else:
-            self.last_label.setText(
-                ("Floorplan changed since this placement. Open last shows the saved run; regenerate to apply current input.\n" if state.stale else "Saved placement matches the current floorplan input.\n")
-                + str(state.run_dir))
+        self.open_last_button.setToolTip(str(state.run_dir) if state else "")
+        self.last_label.setText("Placement out of date. Regenerate to apply changes." if state and state.stale else "")
         if error and not self._active():
             self.status.setText(error)
         elif self._state is None:
-            self.status.setText("Ready to generate placement with the selected layout technology.")
+            self.status.clear()
 
     def _show_view(self):
         if self._view is None:
@@ -365,15 +364,15 @@ class PlacementPanel(QWidget):
         self._state = state
         if state is None:
             return
-        labels = {"starting": "Starting isolated ALIGN…", "generating": "Generating placement…",
-                  "serving": "ALIGN placement is ready.", "stopping": "Stopping ALIGN…",
-                  "stopped": "ALIGN stopped. Run files are kept.",
-                  "failed": "ALIGN failed.", "completed": "ALIGN process completed; run files are saved."}
+        labels = {"starting": "Starting ALIGN…", "generating": "Generating placement…",
+                  "serving": "Placement ready.", "stopping": "Stopping ALIGN…",
+                  "stopped": "ALIGN stopped.",
+                  "failed": "ALIGN failed.", "completed": "ALIGN finished."}
         text = labels.get(state.status, state.status)
         if state.stale:
-            text += " This run uses saved input that differs from the current floorplan; current edits are not applied."
+            text += " Placement out of date; regenerate to apply changes."
         elif self._input_error:
-            text += " Current edits cannot be validated; this run displays its captured input."
+            text += " Current edits are invalid; showing saved input."
         if state.error:
             text += " " + str(state.error)
         if self._open_when_ready and state.status == "serving" and state.url:
@@ -383,7 +382,7 @@ class PlacementPanel(QWidget):
             except (OSError, ValueError, RuntimeError):
                 opened = False
             if not opened:
-                self._browser_error = "Could not open the browser. Copy the ready address from this window."
+                self._browser_error = "Could not open the browser. Copy the viewer URL."
         if state.status in ("failed", "stopped"):
             self._open_when_ready = False
         if self._browser_error:

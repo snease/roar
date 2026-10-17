@@ -7,7 +7,6 @@ and MOS width is per finger, independently of the source's width convention.
 from __future__ import annotations
 
 import json
-import math
 import os
 from pathlib import Path
 
@@ -19,7 +18,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .model import FloorplanProject
+from .model import FloorplanProject, _scalar
 from .constraint_editor import ConstraintEditorDialog, constraint_summary, editable_constraint
 
 from .workspace import editor_signature, load_roar_design
@@ -299,13 +298,8 @@ class NetlistImportDialog(QDialog):
         self.source_mode.currentIndexChanged.connect(self._source_changed)
         self._source_changed()
         layout.addLayout(form)
-        explanation = QLabel(
-            "Choose the scale used by numbers without a suffix. SPICE suffixes "
-            "remain explicit: W=1u always means 1 µm.\n"
-            "The editor always shows W per finger and L in µm. For total width, "
-            "W=8u with NF=4 becomes 2 µm per finger.")
-        explanation.setWordWrap(True)
-        layout.addWidget(explanation)
+        self.dimension_unit.setToolTip("SPICE suffixes override this scale: W=1u always means 1 µm.")
+        self.width_convention.setToolTip("Total W=8u with NF=4 becomes 2 µm per finger in the device table.")
         self.source_status = QLabel()
         self.source_status.setTextFormat(Qt.TextFormat.PlainText)
         self.source_status.setWordWrap(True)
@@ -363,7 +357,8 @@ class ParameterImportDialog(QDialog):
         self.width_convention.addItem("Total width — divide W by NF", "total")
         form.addRow("W values mean:", self.width_convention)
         layout.addLayout(form)
-        note = QLabel("SPICE suffixes set their own scale. Imported symbols replace saved values and clear their ROAR bindings; expressions are not evaluated.")
+        self.dimension_unit.setToolTip("SPICE suffixes override this scale. Expressions are not evaluated.")
+        note = QLabel("Replaces matching values and clears their ROAR bindings.")
         note.setWordWrap(True)
         layout.addWidget(note)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -397,11 +392,6 @@ class FloorplanDialog(QDialog):
         self._dirty = False
         self._rendering = False
         layout = QVBoxLayout(self)
-        note = QLabel(
-            "Edit device sizes and placement rules. Export ALIGN inputs or use the "
-            "Placement tab to generate a placement with a supported technology library.")
-        note.setWordWrap(True)
-        layout.addWidget(note)
         bar = QHBoxLayout()
         for title, action in (("New floorplan…", self._load_netlist),
                               ("Open floorplan…", self._open_project),
@@ -413,9 +403,6 @@ class FloorplanDialog(QDialog):
                 button.setToolTip("Export a sized netlist and placement constraints together for ALIGN.")
             bar.addWidget(button)
         layout.addLayout(bar)
-        self.project_label = QLabel("Load a SPICE netlist or open a floorplan project.")
-        self.project_label.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.project_label)
         source_bar = QHBoxLayout()
         source_bar.addWidget(QLabel("Sizing source:"))
         self.source_mode = QComboBox()
@@ -501,38 +488,34 @@ class FloorplanDialog(QDialog):
     def _build_devices_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        label = QLabel(
-            "Select device rows to use their names below. Edit MOS W per finger, "
-            "L and NF directly; shared symbol fields are edited on Parameters. "
-            "NF must be even and at least 2. Other devices "
-            "remain in the netlist; their physical generators are not checked here.")
-        label.setWordWrap(True)
-        layout.addWidget(label)
         self.devices_table = QTableWidget(0, 6)
         self.devices_table.setHorizontalHeaderLabels(
             ["Instance", "Kind", "Model", "W per finger (µm)", "L (µm)", "NF"])
+        self.devices_table.setToolTip("Select rows to use their names as targets. Shared sizes are edited on Parameters.")
+        self.devices_table.horizontalHeaderItem(5).setToolTip("Even integer, at least 2.")
         self.devices_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.devices_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.devices_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.devices_table.itemChanged.connect(self._mark_dirty)
         self.devices_table.itemSelectionChanged.connect(self._use_selection)
         layout.addWidget(self.devices_table)
-        box = QGroupBox("Copy concrete MOS sizes from the loaded ROAR source")
+        box = QGroupBox("Copy ROAR sizes")
         form = QFormLayout(box)
         self.source_instance = QComboBox()
-        form.addRow("ROAR source instance:", self.source_instance)
+        form.addRow("ROAR instance:", self.source_instance)
         self.import_targets = QLineEdit()
         self.import_targets.setPlaceholderText("Explicit target names, e.g. M1, M2")
-        form.addRow("Selected-circuit targets:", self.import_targets)
+        form.addRow("Target devices:", self.import_targets)
         self.roar_unit = QComboBox()
         self.roar_unit.addItem("Metres (m)", "m")
         self.roar_unit.addItem("Micrometres (µm)", "um")
-        form.addRow("ROAR W/L units:", self.roar_unit)
+        form.addRow("Source W/L units:", self.roar_unit)
+        self.roar_unit.setToolTip("Units of the ROAR source values before conversion; the device table shows µm.")
         self.roar_width = QComboBox()
         self.roar_width.addItem("Total width (divide by NF)", "total")
         self.roar_width.addItem("Width per finger", "per_finger")
         form.addRow("ROAR W means:", self.roar_width)
-        form.addRow(self._button("Apply sizes to mapped targets", self._apply_roar))
+        form.addRow(self._button("Apply sizes", self._apply_roar))
         layout.addWidget(box)
         self.tabs.addTab(tab, "Devices")
 
@@ -571,10 +554,9 @@ class FloorplanDialog(QDialog):
         manual.addWidget(self._button("Set manual value", self._set_parameter))
         form.addRow("Manual value:", manual)
         parameter_import = QHBoxLayout()
-        parameter_import.addWidget(self._button("Import numeric .param…", self._import_parameters))
-        import_note = QLabel("Choose file units and W meaning when importing; replaced values lose their bindings.")
-        import_note.setWordWrap(True)
-        parameter_import.addWidget(import_note, 1)
+        import_button = self._button("Import numeric .param…", self._import_parameters)
+        import_button.setToolTip("Choose units when importing. Replaces matching values and clears their bindings.")
+        parameter_import.addWidget(import_button)
         form.addRow(parameter_import)
         self.binding_instance = QComboBox()
         self.binding_attribute = QComboBox()
@@ -587,6 +569,7 @@ class FloorplanDialog(QDialog):
         self.binding_unit = QComboBox()
         self.binding_unit.addItem("Metres (m)", "m")
         self.binding_unit.addItem("Micrometres (µm)", "um")
+        self.binding_unit.setToolTip("Units of the ROAR source values before conversion; the device table shows µm.")
         self.binding_width = QComboBox()
         self.binding_width.addItem("Total width (divide by NF)", "total")
         self.binding_width.addItem("Width per finger", "per_finger")
@@ -595,14 +578,10 @@ class FloorplanDialog(QDialog):
         interpretation.addWidget(self.binding_width)
         form.addRow("Source W/L units and W meaning:", interpretation)
         layout.addLayout(form)
-        refresh = QHBoxLayout()
         # Retain the alias for callers; the header owns the single reload action.
         self.refresh_bindings_button = self.source_reload_button
         self.refresh_bindings_button.setEnabled(False)
-        note = QLabel("Bindings follow the selected sizing source. Manual values stay unchanged.")
-        note.setWordWrap(True)
-        refresh.addWidget(note, 1)
-        layout.addLayout(refresh)
+        self.binding_instance.setToolTip("Bindings follow the selected sizing source; manual values are unchanged.")
         self.tabs.addTab(tab, "Parameters")
 
     def _parameter_selected(self, *_args):
@@ -626,6 +605,15 @@ class FloorplanDialog(QDialog):
         self.binding_unit.setEnabled(dimensional)
         self.parameter_width.setEnabled("W" in row["roles"])
         self.binding_width.setEnabled("W" in row["roles"])
+        binding = row["binding"]
+        if binding:
+            self.binding_unit.setCurrentIndex(self.binding_unit.findData(row["dimension_unit"]))
+            self.binding_width.setCurrentIndex(self.binding_width.findData(row["width_convention"]))
+            self.binding_instance.setCurrentIndex(self.binding_instance.findText(binding["instance"]))
+            self._binding_attributes()
+            index = next((index for index in range(self.binding_attribute.count())
+                          if self.binding_attribute.itemData(index).upper() == binding["attribute"].upper()), -1)
+            self.binding_attribute.setCurrentIndex(index)
 
     def _set_parameter(self):
         candidate = self._collect_project()
@@ -658,7 +646,7 @@ class FloorplanDialog(QDialog):
             self.project = candidate
             self._render()
             self._dirty = True
-            self.status.setText("Imported numeric parameter values; replaced values have no ROAR binding." + (
+            self.status.setText("Imported parameter values." + (
                 " Unused names: " + ", ".join(unused) if unused else ""))
 
     def _binding_attributes(self, *_args):
@@ -669,25 +657,26 @@ class FloorplanDialog(QDialog):
         for name, info in attrs.items():
             value = info.get("value")
             try:
-                finite = not isinstance(value, bool) and math.isfinite(float(value))
+                _scalar(value, name)
             except (TypeError, ValueError):
-                finite = False
-            if finite:
-                self.binding_attribute.addItem(f"{name} = {value}", name)
+                continue
+            self.binding_attribute.addItem(f"{name} = {value}", name)
 
     def _bind_parameter(self):
+        symbol = self.parameter_symbol.currentText()
+        instance = self.binding_instance.currentText()
+        attribute = self.binding_attribute.currentData()
+        unit = self.binding_unit.currentData()
+        width = self.binding_width.currentData()
         self._ensure_current_source()
         candidate = self._collect_project()
         if self.roar_design is None:
-            raise ValueError("Load a saved ROAR design or explicitly read the current ROAR sizes first.")
-        symbol = self.parameter_symbol.currentText()
-        attribute = self.binding_attribute.currentData()
+            raise ValueError("Choose a ROAR sizing source first.")
         if not symbol or not attribute:
             raise ValueError("Choose a shared symbol and a resolved scalar ROAR attribute.")
         candidate.bind_parameter(
-            self.roar_design, symbol, self.binding_instance.currentText(), attribute,
-            dimension_unit=self.binding_unit.currentData(),
-            width_convention=self.binding_width.currentData(), source=self._source_origin)
+            self.roar_design, symbol, instance, attribute,
+            dimension_unit=unit, width_convention=width, source=self._source_origin)
         self.project = candidate
         self._render()
         self._dirty = True
@@ -743,11 +732,9 @@ class FloorplanDialog(QDialog):
     def _build_constraints_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        note = QLabel("Each row is one placement rule. Double-click a row to edit it. Unsupported settings stay saved unchanged; ALIGN export validates every rule.")
-        note.setWordWrap(True)
-        layout.addWidget(note)
         self.constraints_table = QTableWidget(0, 3)
         self.constraints_table.setHorizontalHeaderLabels(["Constraint", "Devices / ports", "Settings"])
+        self.constraints_table.setToolTip("Double-click to edit. Unsupported settings are preserved; export validates all rules.")
         self.constraints_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.constraints_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.constraints_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -772,10 +759,9 @@ class FloorplanDialog(QDialog):
         advanced_content = QWidget()
         advanced_content_layout = QVBoxLayout(advanced_content)
         advanced_content_layout.setContentsMargins(0, 0, 0, 0)
-        explanation = QLabel("Load placement rules from another ALIGN project. This changes only constraints; the circuit, sizes and ROAR design link stay the same. Use Open floorplan to open a complete floorplan file.")
-        explanation.setWordWrap(True)
-        advanced_content_layout.addWidget(explanation)
-        advanced_content_layout.addWidget(self._button("Load ALIGN constraints…", self._import_constraints))
+        load_button = self._button("Load ALIGN constraints…", self._import_constraints)
+        load_button.setToolTip("Loads only constraints; keeps the circuit, sizes and ROAR association. Use Open floorplan for a complete document.")
+        advanced_content_layout.addWidget(load_button)
         advanced_layout.addWidget(advanced_content)
         advanced.toggled.connect(advanced_content.setVisible)
         advanced_content.setVisible(False)
@@ -846,7 +832,7 @@ class FloorplanDialog(QDialog):
     def _check_constraints(self):
         candidate = self._collect_project()
         candidate.set_constraints(candidate.constraints)
-        self.status.setText("Constraint fields are valid. Physical placement feasibility is not checked.")
+        self.status.setText("Constraint fields valid; placement feasibility unchecked.")
 
     @staticmethod
     def _names(text):
@@ -884,9 +870,7 @@ class FloorplanDialog(QDialog):
         selected_symbol = self.parameter_symbol.currentText()
         try:
             project = self.project
-            self.project_label.setText(
-                f"Circuit: {project.top}  •  {len(project.devices)} devices  •  "
-                + (str(self.project_path) if self.project_path else "Unsaved project"))
+            self._update_document_title()
             self.devices_table.setRowCount(len(project.devices))
             for row, device in enumerate(project.devices):
                 values = [device.name, device.kind, device.model,
@@ -926,12 +910,11 @@ class FloorplanDialog(QDialog):
             if selected_symbol:
                 self.parameter_symbol.setCurrentIndex(max(0, self.parameter_symbol.findText(selected_symbol)))
             missing = project.unresolved_parameters
-            message = "Missing values: " + ", ".join(missing) + ". Saving is available; resolve them before exporting." if missing else (
-                "Shared symbols are resolved. Change a manual value or explicitly refresh a source binding."
-                if rows else "This netlist uses numeric sizes. Edit them on Devices.")
+            message = "Missing values: " + ", ".join(missing) + ". Resolve before export or placement." if missing else ""
             if project.omitted_parameters:
-                message += f" Geometry export omits layout-derived parameters for {len(project.omitted_parameters)} devices."
+                message += (" " if message else "") + f"Layout-derived parameters omitted for {len(project.omitted_parameters)} devices."
             self.pending_label.setText(message)
+            self.pending_label.setVisible(bool(message))
             self.pending_label.setToolTip("\n".join(
                 f"{name}: {', '.join(parameters)}" for name, parameters in project.omitted_parameters.items()))
             self.tabs.setEnabled(True)
@@ -940,6 +923,11 @@ class FloorplanDialog(QDialog):
         self._parameter_selected()
         self.placement_panel.schedule_refresh()
 
+    def _update_document_title(self):
+        identity = f"{self.project.top} — {self.project_path.name}" if self.project_path else f"{self.project.top} (unsaved)"
+        self.setWindowTitle(f"{identity} — ROAR Floorplan")
+        self.setWindowFilePath(str(self.project_path or ""))
+
     def set_project(self, project, path=None, design=None, source_origin=None):
         self.placement_panel.project_changed()
         self.project = project
@@ -947,8 +935,7 @@ class FloorplanDialog(QDialog):
         self._set_source(design, source_origin)
         self._render()
         self._dirty = False
-        self.status.setText("Floorplan loaded. Dimensions are W per finger and L in µm." + (
-            " Missing shared values are listed on Parameters." if project.unresolved_parameters else ""))
+        self.status.clear()
 
     def _discard_edits(self):
         if not self._dirty:
@@ -1024,7 +1011,7 @@ class FloorplanDialog(QDialog):
             self.project = candidate
             self.project_path = Path(path)
             self._dirty = False
-            self.project_label.setText(f"Circuit: {candidate.top}  •  {len(candidate.devices)} devices  •  {path}")
+            self._update_document_title()
             self.status.setText(f"Saved {path}")
             self.placement_panel.saved_as(self.project_path)
 
@@ -1036,9 +1023,7 @@ class FloorplanDialog(QDialog):
         if directory:
             netlist, constraints = candidate.export_align(directory)
             self.project = candidate
-            self.status.setText(
-                f"Exported {netlist} and {constraints}. Inputs validated; PDK generators "
-                "and physical layout have not been checked.")
+            self.status.setText(f"Exported ALIGN inputs to {netlist.parent}.")
 
     def _source_selected(self, *_args):
         self._guard(lambda: self._activate_source(self.source_mode.currentData()))
@@ -1120,7 +1105,7 @@ class FloorplanDialog(QDialog):
         self.project = candidate
         self._render()
         self._dirty = True
-        self.status.setText("Imported sizes into the floorplan project. The ROAR design is unchanged.")
+        self.status.setText("Sizes applied.")
 
     def _import_constraints(self):
         candidate = self._collect_project()
@@ -1155,4 +1140,4 @@ class FloorplanDialog(QDialog):
         self.project = candidate
         self._render_constraints()
         self._dirty = True
-        self.status.setText(f"Loaded {len(constraints)} ALIGN placement rules; circuit, sizes and ROAR link are unchanged.")
+        self.status.setText(f"Loaded {len(constraints)} placement rules.")

@@ -338,37 +338,36 @@ class ConstraintEditorDialog(QDialog):
             groups = self.original.get("pairs", [self.selected_devices[index:index + 2] for index in range(0, len(self.selected_devices), 2)])
             self.pairs_editor = PairsEditor(devices, groups)
             self.form.addRow(self.pairs_editor)
-            note = "All groups share one axis. A device on the axis can accompany the paired groups. Paired devices must have matching models and sizes."
+            self.pairs_editor.setToolTip("All groups share one axis. Paired devices must have matching models and sizes.")
         elif kind == "Floorplan":
             self.regions_editor = RegionsEditor(devices, self.original.get("regions", [self.selected_devices] if self.selected_devices else []))
-            self.form.addRow(self.regions_editor)
+            self.form.addRow("Rows (top to bottom):", self.regions_editor)
             self._flag("Order devices left to right within each row", "order")
             self._flag("Mirror row ends about one shared vertical axis", "symmetrize")
-            note = "Rows always run top to bottom. Select a row to edit its device list; changes apply to that row. Use Row up / down to change row order. Rows do not add center or edge alignment."
+            self.regions_editor.rows.setToolTip("Select a row to edit its devices. Rows run top to bottom and add no center or edge alignment.")
+            self.flags["symmetrize"][0].setToolTip("Pairs the listed ends of each row about one shared axis; an odd middle device lies on the axis.")
         elif kind == "CompactPlacement":
             self.option = self._choice("Final compaction:", [("Toward left", "left"), ("Toward center", "center"), ("Toward right", "right")], self.original.get("style", "left"))
-            note = "Controls final placement compaction; it does not set a fixed boundary or spacing."
+            self.option.setToolTip("Final placement compaction; sets no fixed boundary or spacing.")
         else:
             ports = kind in ("PowerPorts", "GroundPorts")
             key = "ports" if ports else "instances"
             self.names_editor = NamesEditor(self.project.ports if ports else devices)
             self.names_editor.set_names(self.original.get(key, [] if ports else self.selected_devices))
-            self.form.addRow("Ordered ports:" if ports else "Devices in order:", self.names_editor)
+            self.form.addRow("Ports in order:" if ports else "Devices in order:" if kind == "Order" else "Devices:", self.names_editor)
             if kind == "Order":
                 self.option = self._choice("Direction:", [("Left to right", "left_to_right"), ("Top to bottom", "top_to_bottom")], self.original.get("direction", "left_to_right"))
                 self._flag("Devices touch (abut)", "abut")
-                note = "Use Move up / down to reverse or reorder devices. Ordering does not add center or edge alignment."
+                self.names_editor.setToolTip("List order determines placement order. Adds no center or edge alignment.")
+                self.flags["abut"][0].setToolTip("Devices touch along the ordering direction; adds no center or edge alignment.")
             elif kind == "Align":
                 self.option = self._choice("Align:", LINES, self.original.get("line", "h_center"))
-                note = "Choose the centers or edges that should share a line."
+                self.option.setToolTip("Selected centers or edges share a line.")
             elif ports:
                 self._flag("Propagate port roles to child circuits", "propagate", True)
-                note = "Port order is preserved. ALIGN uses the first port for the top-level power or ground grid."
+                self.names_editor.setToolTip("ALIGN uses the first port for the top-level power or ground grid.")
             else:
-                note = "Prefer placing these devices near one another; no fixed distance is specified."
-        description = QLabel(note)
-        description.setWordWrap(True)
-        self.form.addRow(description)
+                self.names_editor.setToolTip("Prefers nearby placement without a fixed distance.")
 
     def value(self):
         kind = self.kind.currentData()

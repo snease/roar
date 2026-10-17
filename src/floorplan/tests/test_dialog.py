@@ -363,6 +363,8 @@ class FloorplanDialogTests(unittest.TestCase):
         editor.deleteLater()
 
     def test_floorplan_names_filters_default_extension_and_source_protection(self):
+        self.assertIn("pair (unsaved)", self.dialog.windowTitle())
+        self.assertFalse(hasattr(self.dialog, "project_label"))
         labels = [button.text() for button in self.dialog.findChildren(QPushButton)]
         self.assertIn("New floorplan…", labels)
         self.assertIn("Open floorplan…", labels)
@@ -371,6 +373,8 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._save_project()
         self.assertEqual(picker.call_args.args[2], "pair.roar.floorplan")
         self.assertTrue(Path(str(target) + ".roar.floorplan").exists())
+        self.assertIn("no_extension.roar.floorplan", self.dialog.windowTitle())
+        self.assertEqual(self.dialog.windowFilePath(), str(target) + ".roar.floorplan")
         legacy = self.root / "legacy.floorplan.json"
         self.dialog.project.save(legacy)
         options = OpenFloorplanDialog(self.parent)
@@ -562,6 +566,81 @@ class FloorplanDialogTests(unittest.TestCase):
         self.dialog._set_parameter()
         self.assertIsNone(self.dialog.project.parameter_rows[0]["binding"])
         self.assertEqual(self.dialog.project.devices[0].width_um, 3)
+
+    def test_saved_bindings_restore_source_and_units_before_rebinding(self):
+        source = (Design().add_instance("First", W=100, L=100, NF=2)
+                  .add_instance("M1_2", W=1.1, L=0.5, NF=2))
+        project = FloorplanProject.from_text(SYMBOLIC.replace("L=0.15u", "L=ls"))
+        project.set_parameter("nfs", 2)
+        project.bind_parameter(source, "ws", "M1_2", "W", dimension_unit="um", width_convention="per_finger")
+        project.bind_parameter(source, "ls", "M1_2", "L", dimension_unit="um", width_convention="per_finger")
+        sidecar = self.root / "binding-units.roar.floorplan"
+        project.save(sidecar)
+        self.dialog.snapshot_provider = lambda: source
+        self.dialog.set_project(FloorplanProject.load(sidecar), sidecar, source, "live")
+        for symbol, attribute in (("ls", "L"), ("ws", "W"), ("ls", "L"), ("ws", "W")):
+            # Simulate the previous symbol/control state differing from the saved binding.
+            self.dialog.binding_unit.setCurrentIndex(self.dialog.binding_unit.findData("m"))
+            self.dialog.binding_width.setCurrentIndex(self.dialog.binding_width.findData("total"))
+            self.dialog.binding_instance.setCurrentText("First")
+            self.dialog.parameter_symbol.setCurrentText(symbol)
+            self.dialog._parameter_selected()
+            self.assertEqual(self.dialog.binding_instance.currentText(), "M1_2")
+            self.assertEqual(self.dialog.binding_attribute.currentData(), attribute)
+            self.assertEqual(self.dialog.binding_unit.currentData(), "um")
+            self.assertEqual(self.dialog.binding_width.currentData(), "per_finger")
+            self.dialog._bind_parameter()
+            self.assertEqual(self.dialog.project.devices[0].width_um, 1.1)
+            self.assertEqual(self.dialog.project.devices[0].length_um, 0.5)
+        # A manual symbol leaves the user's existing source interpretation alone.
+        self.dialog.parameter_symbol.setCurrentText("nfs")
+        self.assertEqual(self.dialog.binding_unit.currentData(), "um")
+        self.assertEqual(self.dialog.binding_width.currentData(), "per_finger")
+        # A fresh source render must also preserve an intentional new binding choice.
+        self.dialog.parameter_symbol.setCurrentText("ws")
+        self.dialog.binding_instance.setCurrentText("First")
+        self.dialog.binding_attribute.setCurrentIndex(self.dialog.binding_attribute.findData("W"))
+        self.dialog.binding_unit.setCurrentIndex(self.dialog.binding_unit.findData("m"))
+        self.dialog.binding_width.setCurrentIndex(self.dialog.binding_width.findData("total"))
+        source.set_instance_attribute("First", "W", 12e-6)
+        source.set_instance_attribute("M1_2", "W", 2.2)
+        self.dialog._bind_parameter()
+        self.assertEqual(self.dialog.project.devices[0].width_um, 6)
+        self.assertEqual(self.dialog.project.parameter_rows[0]["binding"]["instance"], "First")
+
+    def test_spice_suffix_source_attributes_bind_reopen_and_rebind(self):
+        source = Design().add_instance("M1_2", W="4u", L="0.15u", NF=2, expression="2*W")
+        source_path = self.root / "suffix-sizes.roar"
+        source.save(source_path)
+        project = FloorplanProject.from_text(SYMBOLIC.replace("L=0.15u", "L=ls"))
+        project.set_parameter("nfs", 2)
+        self.dialog.set_project(project)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source_path), "")):
+            self.dialog._load_linked_roar()
+        attributes = [self.dialog.binding_attribute.itemData(index) for index in range(self.dialog.binding_attribute.count())]
+        self.assertIn("W", attributes)
+        self.assertIn("L", attributes)
+        self.assertNotIn("expression", attributes)
+        for symbol, attribute in (("ws", "W"), ("ls", "L")):
+            self.dialog.parameter_symbol.setCurrentText(symbol)
+            self.dialog.binding_attribute.setCurrentIndex(self.dialog.binding_attribute.findData(attribute))
+            self.dialog._bind_parameter()
+        sidecar = self.root / "suffix.roar.floorplan"
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(sidecar), "")):
+            self.dialog._save_project()
+        def open_saved():
+            options = QApplication.activeModalWidget()
+            options.floorplan_path.setText(str(sidecar))
+            options.floorplan_path.editingFinished.emit()
+            options.buttons.button(QDialogButtonBox.StandardButton.Open).click()
+        QTimer.singleShot(0, open_saved)
+        self.dialog._open_project()
+        for symbol, attribute in (("ls", "L"), ("ws", "W")):
+            self.dialog.parameter_symbol.setCurrentText(symbol)
+            self.assertEqual(self.dialog.binding_attribute.currentData(), attribute)
+            self.dialog._bind_parameter()
+            self.assertEqual(self.dialog.project.devices[0].width_um, 2)
+            self.assertAlmostEqual(self.dialog.project.devices[0].length_um, 0.15)
 
     def test_numeric_parameter_file_uses_own_options_even_when_count_selected(self):
         self.dialog.set_project(FloorplanProject.from_text(SYMBOLIC))

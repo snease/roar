@@ -122,7 +122,6 @@ class PlacementPanelTests(unittest.TestCase):
 
     def test_generate_waits_for_verified_readiness_and_reuses_active_run(self):
         self.assertTrue(self.panel.generate_button.isEnabled())
-        self.assertIn("Ready to generate", self.panel.status.text())
         self.panel.generate()
         runner = self.runners[-1]
         self.assertEqual(runner.starts, 1)
@@ -137,6 +136,19 @@ class PlacementPanelTests(unittest.TestCase):
         self.panel._poll()
         self.assertEqual(len(self.opened), 1)
 
+    def test_log_display_removes_terminal_codes_and_preserves_unicode_and_raw_log(self):
+        self.panel.generate()
+        runner = self.runners[-1]
+        raw = ('\x1b[32mwerkzeug INFO\x1b[0m: W=1 µm\r\n'
+               '\x1b]8;;http://127.0.0.1:9001/\x1b\\viewer\x1b]8;;\x1b\\\n'
+               '\x9b31merror\x9b0m\tπ\x00\x07\n')
+        with patch.object(runner, "log_tail", return_value=raw):
+            runner.serve()
+            self.panel._poll()
+            self.assertEqual(self.panel._view.log.toPlainText(),
+                             'werkzeug INFO: W=1 µm\nviewer\nerror\tπ\n')
+            self.assertEqual(runner.log_tail(), raw)
+
     def test_stale_last_placement_is_explicit_and_reopening_does_not_generate(self):
         self.panel.generate()
         runner = self.runners[-1]
@@ -146,7 +158,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.panel._poll()
         self.project.set_mos_parameters("M1", width_um=3, length_um=0.15, nf=2)
         self.panel.refresh()
-        self.assertIn("changed since", self.panel.last_label.text())
+        self.assertIn("out of date", self.panel.last_label.text())
         self.panel.open_last()
         self.assertEqual(runner.starts, 1)
         self.assertEqual(runner.opens, 1)
@@ -154,7 +166,7 @@ class PlacementPanelTests(unittest.TestCase):
         runner.serve()
         self.panel._poll()
         self.assertEqual(len(self.opened), 2)
-        self.assertIn("current edits are not applied", self.panel._view.status.text())
+        self.assertIn("out of date", self.panel._view.status.text())
 
     def test_failed_latest_attempt_keeps_previous_saved_placement_available(self):
         self.panel.generate()
@@ -167,8 +179,8 @@ class PlacementPanelTests(unittest.TestCase):
         self.panel.refresh()
         self.assertIn("Missing primitive", self.panel.status.text())
         self.assertTrue(self.panel.open_last_button.isEnabled())
-        self.assertIn(previous.run_dir, self.panel.last_label.text())
-        self.assertNotIn("failed-new-run", self.panel.last_label.text())
+        self.assertIn(previous.run_dir, self.panel.open_last_button.toolTip())
+        self.assertNotIn("failed-new-run", self.panel.open_last_button.toolTip())
 
     def test_profile_and_complete_input_gate_generation_and_missing_tools_are_actionable(self):
         self.project.align_profile = None
@@ -313,8 +325,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.panel._poll()
         self.project.roar_project_path = str(self.root / "other-source.roar")
         self.panel.refresh()
-        self.assertIn("Floorplan changed since this placement", self.panel.last_label.text())
-        self.assertNotIn("sizes or constraints", self.panel.last_label.text())
+        self.assertIn("out of date", self.panel.last_label.text())
 
     def test_observing_existing_run_does_not_take_lifecycle_ownership(self):
         runner = self.runners[-1]
@@ -368,7 +379,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.panel._poll()
         self.panel._poll()
         self.assertIn("Could not open the browser", self.panel.status.text())
-        self.assertIn("Copy the ready address", self.panel._view.status.text())
+        self.assertIn("Copy the viewer URL", self.panel._view.status.text())
         self.assertEqual(self.panel._view.url.text(), "http://127.0.0.1:9001/")
 
     def test_start_failure_is_visible_in_the_open_run_window(self):
