@@ -7,17 +7,68 @@ and MOS width is per finger, independently of the source's width convention.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMessageBox, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem,
     QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .model import FloorplanProject
+
+
+class NetlistImportDialog(QDialog):
+    """Choose the circuit and interpret source dimensions before importing."""
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import SPICE netlist")
+        self.setMinimumWidth(540)
+        layout = QVBoxLayout(self)
+        filename = QLabel(str(Path(path)))
+        filename.setTextFormat(Qt.TextFormat.PlainText)
+        filename.setWordWrap(True)
+        layout.addWidget(filename)
+        form = QFormLayout()
+        self.circuit_combo = QComboBox()
+        names = FloorplanProject.subcircuit_names(path)
+        if len(names) > 1:
+            self.circuit_combo.addItem("Choose a subcircuit…", None)
+        for name in names:
+            self.circuit_combo.addItem(name, name)
+        form.addRow("Subcircuit in this file:", self.circuit_combo)
+        self.dimension_unit = QComboBox()
+        self.dimension_unit.addItem("Micrometres — W=1 means 1 µm", "um")
+        self.dimension_unit.addItem("Metres — W=1 means 1 m", "m")
+        form.addRow("W/L without a suffix:", self.dimension_unit)
+        self.width_convention = QComboBox()
+        self.width_convention.addItem("Width per finger", "per_finger")
+        self.width_convention.addItem("Total width — divide W by NF", "total")
+        form.addRow("Netlist W is:", self.width_convention)
+        layout.addLayout(form)
+        explanation = QLabel(
+            "Choose the scale used by numbers without a suffix. SPICE suffixes "
+            "remain explicit: W=1u always means 1 µm.\n"
+            "The editor always shows W per finger and L in µm. For total width, "
+            "W=8u with NF=4 becomes 2 µm per finger.")
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Import")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.circuit_combo.currentIndexChanged.connect(self._update_import_button)
+        self._update_import_button()
+        layout.addWidget(self.buttons)
+
+    def _update_import_button(self, *_args):
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+            self.circuit_combo.currentData() is not None)
 
 
 class FloorplanDialog(QDialog):
@@ -264,22 +315,27 @@ class FloorplanDialog(QDialog):
     def _load_netlist(self):
         if not self._discard_edits():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Load SPICE netlist", "", "SPICE (*.sp *.spi *.cir *.spice);;All files (*)")
+        initial_directory = ""
+        design_directory = os.environ.get("ROAR_DESIGN")
+        if design_directory:
+            examples = Path(design_directory) / "floorplan"
+            if examples.is_dir():
+                initial_directory = str(examples)
+            elif Path(design_directory).is_dir():
+                initial_directory = design_directory
+        path, _ = QFileDialog.getOpenFileName(self, "Load SPICE netlist", initial_directory, "SPICE (*.sp *.spi *.cir *.spice);;All files (*)")
         if not path:
             return
-        top, ok = QInputDialog.getText(self, "Selected circuit", "Subcircuit name (blank if the file contains one circuit):")
-        if not ok:
+        options = NetlistImportDialog(path, self)
+        if options.exec() != QDialog.DialogCode.Accepted:
+            options.deleteLater()
             return
-        unit, ok = QInputDialog.getItem(self, "Netlist dimensions", "Units for bare W/L numbers (SPICE suffixes remain explicit):", ["Metres (m)", "Micrometres (µm)"], 0, False)
-        if not ok:
-            return
-        width, ok = QInputDialog.getItem(self, "Netlist width convention", "Netlist W means:", ["Width per finger", "Total width (divide by NF)"], 0, False)
-        if not ok:
-            return
+        top = options.circuit_combo.currentData()
+        unit = options.dimension_unit.currentData()
+        width = options.width_convention.currentData()
+        options.deleteLater()
         project = FloorplanProject.from_netlist(
-            path, top=top.strip() or None,
-            dimension_unit="um" if unit.startswith("Micro") else "m",
-            width_convention="total" if width.startswith("Total") else "per_finger")
+            path, top=top, dimension_unit=unit, width_convention=width)
         self.set_project(project)
         self._dirty = True
 

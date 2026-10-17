@@ -1,13 +1,15 @@
 """Qt smoke tests; run with QT_QPA_PLATFORM=offscreen and the GUI extra."""
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 try:
-    from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox, QWidget
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QWidget
 except ImportError:
     QApplication = None
 
@@ -15,7 +17,7 @@ from roar_api import Design
 from roar_api.floorplan import FloorplanProject
 
 if QApplication is not None:
-    from roar_api.floorplan.dialog import FloorplanDialog
+    from roar_api.floorplan.dialog import FloorplanDialog, NetlistImportDialog
 
 
 NETLIST = """.subckt pair d g s b
@@ -105,10 +107,17 @@ class FloorplanDialogTests(unittest.TestCase):
     def test_netlist_import_save_open_and_align_export_paths(self):
         source = self.root / "input.sp"
         source.write_text(NETLIST.replace("W=2u", "W=8").replace("L=0.15u", "L=0.2"))
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")), \
-             patch.object(QInputDialog, "getText", return_value=("pair", True)), \
-             patch.object(QInputDialog, "getItem", side_effect=[("Micrometres (µm)", True), ("Total width (divide by NF)", True)]):
+        examples = self.root / "design" / "floorplan"
+        examples.mkdir(parents=True)
+        def accept_import():
+            options = QApplication.activeModalWidget()
+            options.width_convention.setCurrentIndex(options.width_convention.findData("total"))
+            options.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+        QTimer.singleShot(0, accept_import)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")) as picker, \
+             patch.dict(os.environ, {"ROAR_DESIGN": str(examples.parent)}):
             self.dialog._load_netlist()
+        self.assertEqual(picker.call_args.args[2], str(examples))
         self.assertEqual(self.dialog.project.devices[0].width_um, 4)
         with patch.object(QFileDialog, "getSaveFileName", return_value=(str(source), "")):
             with self.assertRaisesRegex(ValueError, "cannot overwrite the source"):
@@ -134,6 +143,50 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._guard(self.dialog._export_align)
         warning.assert_called_once()
         self.assertIn("File exists", self.dialog.status.text())
+
+    def test_unified_import_dialog_selects_sole_circuit_and_combines_options(self):
+        source = self.root / "commented.spice"
+        source.write_text(NETLIST.replace(".subckt", "**.subckt").replace(".ends", "**.ends"))
+        options = NetlistImportDialog(source, self.parent)
+        self.assertEqual(options.circuit_combo.count(), 1)
+        self.assertEqual(options.circuit_combo.currentData(), "pair")
+        self.assertEqual(options.dimension_unit.currentData(), "um")
+        self.assertEqual(options.width_convention.currentData(), "per_finger")
+        QTimer.singleShot(0, lambda: options.buttons.button(QDialogButtonBox.StandardButton.Ok).click())
+        self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
+        options.deleteLater()
+
+    def test_multiple_circuits_require_selection_and_metres_import_correctly(self):
+        source = self.root / "multiple.sp"
+        si_circuit = NETLIST.replace("pair", "second").replace("W=2u", "W=8e-6").replace("L=0.15u", "L=0.2e-6")
+        source.write_text(NETLIST + si_circuit)
+        options = NetlistImportDialog(source, self.parent)
+        self.assertEqual([options.circuit_combo.itemData(i) for i in range(options.circuit_combo.count())],
+                         [None, "pair", "second"])
+        self.assertFalse(options.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled())
+        options.deleteLater()
+        def accept_import():
+            modal = QApplication.activeModalWidget()
+            modal.circuit_combo.setCurrentIndex(modal.circuit_combo.findData("second"))
+            modal.dimension_unit.setCurrentIndex(modal.dimension_unit.findData("m"))
+            modal.width_convention.setCurrentIndex(modal.width_convention.findData("total"))
+            modal.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+        QTimer.singleShot(0, accept_import)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+            self.dialog._load_netlist()
+        self.assertEqual(self.dialog.project.top, "second")
+        self.assertEqual(self.dialog.project.devices[0].width_um, 4)
+        self.assertAlmostEqual(self.dialog.project.devices[0].length_um, 0.2)
+
+    def test_cancelling_unified_import_leaves_current_project_unchanged(self):
+        source = self.root / "cancel.sp"
+        source.write_text(NETLIST)
+        original = self.dialog.project
+        QTimer.singleShot(0, lambda: QApplication.activeModalWidget().buttons.button(QDialogButtonBox.StandardButton.Cancel).click())
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+            self.dialog._load_netlist()
+        self.assertIs(self.dialog.project, original)
+        self.assertFalse(self.dialog._dirty)
 
     def test_constraints_import_can_replace_invalid_editor_and_export(self):
         native = [{"constraint": "Order", "instances": ["M2", "M1"], "direction": "left_to_right"}]

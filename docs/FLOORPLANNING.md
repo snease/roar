@@ -16,9 +16,11 @@ the headless installation, `pip install -e .`.
 1. Click the layout button, then **Load netlist…**. Choose
    [`current_mirror_ota.sp`](../design/floorplan/ota/current_mirror_ota.sp) or
    [`common_source.sp`](../design/floorplan/common_source/common_source.sp).
-   Leave the circuit name blank; each file contains one subcircuit. Select
-   metres for bare dimensions and width per finger. These examples use explicit
-   SPICE suffixes, which take precedence over the dimension selector.
+   The import dialog selects the only subcircuit automatically. Choose a circuit
+   from the dropdown for files containing several. Units and width convention
+   appear together in the same dialog; keep micrometres and width per finger for
+   these examples. Their explicit SPICE suffixes take precedence over the unit
+   selector.
 2. Edit **W per finger (µm)**, **L (µm)** and **NF** on the Devices tab. Sizes
    are synthetic geometry examples, not optimized or simulation-qualified designs.
    NF must be an even integer of at least two for the SKY130 generator.
@@ -39,6 +41,18 @@ example contains one MOS device and a resistor, with the resistor above the MOS.
 Its generic resistor is useful for input/export testing; physical layout requires
 a compatible resistor primitive in the selected ALIGN PDK. The tested SKY130
 backend does not currently provide that complete path.
+
+The older [`design/cm_ota.spice`](../design/cm_ota.spice) is a schematic template
+with unresolved sizes such as `W=w1_2` and `nf=nf1_2`. Import requires concrete
+sizes; the separate `design/floorplan/ota` example supplies synthetic ones for
+trying the editor.
+
+The import unit selector applies only to numbers without a suffix: with
+micrometres selected, `L=0.5` means 0.5 µm. Select metres for a netlist that writes
+the same dimension as `L=0.5e-6`. `L=0.5u` means 0.5 µm with either selection.
+The editing table always uses micrometres, and export converts to SI. The headless
+`from_netlist` API retains its metre default; pass `dimension_unit="um"` for bare
+micrometre inputs.
 
 ## Placement intent
 

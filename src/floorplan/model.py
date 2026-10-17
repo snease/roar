@@ -14,12 +14,13 @@ from pathlib import Path
 import re
 import tempfile
 
-from parse_netlist import MOSFETInstance, parse_spice_netlist
+from parse_netlist import MOSFETInstance, _split_tokens, parse_spice_netlist
 
 
 _SUFFIX = {'': 1, 't': 1e12, 'g': 1e9, 'meg': 1e6, 'k': 1e3,
            'm': 1e-3, 'u': 1e-6, 'n': 1e-9, 'p': 1e-12, 'f': 1e-15}
 _NUMBER = re.compile(r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(meg|[tgkmunpf])?', re.I)
+_PARAMETER = re.compile(r"([A-Za-z_]\w*)\s*=\s*('[^']*'|[^\s'=]+)")
 
 
 def _positive(value, label):
@@ -63,6 +64,49 @@ def _convention(value):
         raise ValueError('width_convention must be total or per_finger')
 
 
+def _read_blocks(source):
+    """Read wrappers and continuations shared by discovery and import."""
+    lines = []
+    for raw in source.splitlines():
+        line = raw.strip()
+        if line.startswith('+'):
+            if not lines:
+                raise ValueError('Continuation without a preceding line')
+            lines[-1] += ' ' + line[1:].strip()
+        else:
+            lines.append(line)
+    blocks, current = {}, None
+    for line in lines:
+        if re.match(r'^\*+\.(subckt|ends)\b', line, re.I):
+            line = line.lstrip('*')  # xschem commented circuit wrapper
+        if not line or line.startswith('*'):
+            continue
+        tokens = line.split()
+        directive = tokens[0].lower()
+        if directive == '.subckt':
+            if current is not None or len(tokens) < 2:
+                raise ValueError('Nested or malformed .subckt is unsupported')
+            current = tokens[1]
+            if current.upper() in blocks:
+                raise ValueError(f'Duplicate subcircuit {current}')
+            blocks[current.upper()] = [tokens[2:], [], current]
+        elif directive == '.ends':
+            if current is None:
+                raise ValueError('.ends without .subckt')
+            if len(tokens) > 1 and tokens[1].upper() != current.upper():
+                raise ValueError('.ends name does not match .subckt')
+            current = None
+        elif current is not None:
+            blocks[current.upper()][1].append(line)
+        elif directive.startswith('.') and directive != '.end':
+            raise ValueError(f'Unsupported global directive {tokens[0]}; provide a self-contained flat subcircuit')
+    if current is not None:
+        raise ValueError('Missing .ends')
+    if not blocks:
+        raise ValueError('A flat .subckt/.ends circuit wrapper is required')
+    return blocks
+
+
 @dataclass
 class Device:
     name: str
@@ -83,6 +127,12 @@ class FloorplanProject:
     the result; export does this automatically. Save/open preserve unsupported
     imported constraint dictionaries so they can be inspected and corrected.
     """
+
+    @staticmethod
+    def subcircuit_names(path):
+        """List circuit wrappers without requiring resolved device sizing."""
+        source = Path(path).expanduser().read_text(encoding='utf-8')
+        return [block[2] for block in _read_blocks(source).values()]
 
     @classmethod
     def from_netlist(cls, path, top=None, dimension_unit='m', width_convention='per_finger'):
@@ -106,46 +156,7 @@ class FloorplanProject:
         if dimension_unit not in ('m', 'um'):
             raise ValueError('dimension_unit must be m or um')
         source = path.read_text(encoding='utf-8')
-        # Bound the existing permissive parser: every selected line must have
-        # supported semantics, and parameters cannot masquerade as ports.
-        lines = []
-        for raw in source.splitlines():
-            line = raw.strip()
-            if line.startswith('+'):
-                if not lines:
-                    raise ValueError('Continuation without a preceding line')
-                lines[-1] += ' ' + line[1:].strip()
-            else:
-                lines.append(line)
-        blocks, current = {}, None
-        for line in lines:
-            if re.match(r'^\*+\.(subckt|ends)\b', line, re.I):
-                line = line.lstrip('*')  # xschem commented circuit wrapper
-            if not line or line.startswith('*'):
-                continue
-            tokens = line.split()
-            directive = tokens[0].lower()
-            if directive == '.subckt':
-                if current is not None or len(tokens) < 2:
-                    raise ValueError('Nested or malformed .subckt is unsupported')
-                current = tokens[1]
-                if current.upper() in blocks:
-                    raise ValueError(f'Duplicate subcircuit {current}')
-                blocks[current.upper()] = [tokens[2:], [], current]
-            elif directive == '.ends':
-                if current is None:
-                    raise ValueError('.ends without .subckt')
-                if len(tokens) > 1 and tokens[1].upper() != current.upper():
-                    raise ValueError('.ends name does not match .subckt')
-                current = None
-            elif current is not None:
-                blocks[current.upper()][1].append(line)
-            elif directive.startswith('.') and directive != '.end':
-                raise ValueError(f'Unsupported global directive {tokens[0]}; provide a self-contained flat subcircuit')
-        if current is not None:
-            raise ValueError('Missing .ends')
-        if not blocks:
-            raise ValueError('A flat .subckt/.ends circuit wrapper is required')
+        blocks = _read_blocks(source)
         if top is None and len(blocks) != 1:
             raise ValueError('Select top explicitly when the netlist contains multiple subcircuits')
         selected = str(top).upper() if top is not None else next(iter(blocks))
@@ -161,22 +172,28 @@ class FloorplanProject:
         if not selected_lines:
             raise ValueError('Selected circuit has no devices')
         for line in selected_lines:
-            tokens = line.split()
+            tokens = _split_tokens(line)
             prefix = tokens[0][0].upper()
             if prefix not in ('M', 'X', 'R'):
                 raise ValueError(f'Unsupported selected circuit line: {line}')
-            positional = next((i for i, token in enumerate(tokens) if '=' in token), len(tokens))
             if prefix in ('M', 'X'):
-                parameter_names = []
-                for token in tokens[6:]:
-                    if not re.fullmatch(r'[A-Za-z_]\w*=[^=\s]+', token):
-                        raise ValueError(f'{tokens[0]}: parameters must be concrete key=value tokens')
-                    parameter_names.append(token.split('=', 1)[0].upper())
+                if len(tokens) < 6 or any('=' in token for token in tokens[:6]) or tokens[5].upper() in blocks:
+                    raise ValueError(f'{tokens[0]}: only flat four-terminal MOS devices are supported; hierarchy is unsupported')
+                # The shared tokenizer keeps quoted xschem expressions intact.
+                # Bound its parameter section without evaluating any expression.
+                section = ' '.join(tokens[6:])
+                parameter_names, position = [], 0
+                for match in _PARAMETER.finditer(section):
+                    gap = section[position:match.start()]
+                    if gap.strip() or (position and not gap):
+                        raise ValueError(f'{tokens[0]}: malformed MOS parameter assignments')
+                    parameter_names.append(match[1].upper())
+                    position = match.end()
+                if section[position:].strip():
+                    raise ValueError(f'{tokens[0]}: malformed MOS parameter assignments')
                 if len(set(parameter_names)) != len(parameter_names):
                     raise ValueError(f'{tokens[0]}: duplicate MOS parameter names')
-                if positional != 6 or tokens[5].upper() in blocks:
-                    raise ValueError(f'{tokens[0]}: only flat four-terminal MOS devices are supported; hierarchy is unsupported')
-            elif positional != 4 or len(tokens) != 4:
+            elif len(tokens) != 4 or any('=' in token for token in tokens):
                 raise ValueError(f'{tokens[0]}: only two-terminal numeric resistors are supported')
         # Feed only the validated selection to the shared parser. This also
         # normalizes xschem comment wrappers and indented continuations without
@@ -194,11 +211,18 @@ class FloorplanProject:
         for instance in circuit.instances:
             if isinstance(instance, MOSFETInstance):
                 params = {key.upper(): value for key, value in instance.parameters.items()}
+                if not {'W', 'L', 'NF'} <= params.keys():
+                    raise ValueError(f'{instance.name}: concrete W, L and NF are required')
+                unresolved = [f'{key}={params[key]!r}' for key in ('W', 'L', 'NF')
+                              if not _NUMBER.fullmatch(str(params[key]).strip())]
+                if unresolved:
+                    raise ValueError(f'{instance.name}: unresolved sizing parameters {", ".join(unresolved)}. '
+                                     'Use a resolved sizing netlist with numeric W/L/NF; symbolic xschem parameters '
+                                     'are not evaluated. For the geometry-only OTA example, use '
+                                     'design/floorplan/ota/current_mirror_ota.sp.')
                 unknown = set(params) - {'W', 'L', 'NF', 'M'}
                 if unknown:
                     raise ValueError(f'{instance.name}: unsupported MOS parameters {", ".join(sorted(unknown))}; provide W/L/NF and optional M only')
-                if not {'W', 'L', 'NF'} <= params.keys():
-                    raise ValueError(f'{instance.name}: concrete W, L and NF are required')
                 nf = _fingers(params['NF'])
                 width = _dimension(params['W'], dimension_unit, f'{instance.name} W')
                 if width_convention == 'total':

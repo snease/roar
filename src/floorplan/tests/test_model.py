@@ -46,6 +46,40 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(len(project.devices), 3)
         self.assertEqual(project.source_netlist, source)
 
+    def test_discovery_shares_wrappers_without_resolving_sizing(self):
+        source = CIRCUIT.replace('.subckt amp', '**.SUBCKT amp').replace('.ends amp', '**.ENDS amp')
+        source = source.replace('W=2.2u', 'W=unresolved')
+        source += '.subckt Other VDD VSS\n.ends Other\n'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'discovery.sp'
+            path.write_text(source)
+            self.assertEqual(FloorplanProject.subcircuit_names(path), ['amp', 'Other'])
+
+    def test_original_xschem_ota_reports_unresolved_sizing_before_parasitics(self):
+        path = Path(__file__).resolve().parents[3] / 'design/cm_ota.spice'
+        self.assertEqual(FloorplanProject.subcircuit_names(path), ['cm_ota'])
+        with self.assertRaises(ValueError) as raised:
+            FloorplanProject.from_netlist(path, top='cm_ota', dimension_unit='um', width_convention='total')
+        self.assertEqual(str(raised.exception),
+                         "XM1: unresolved sizing parameters W='w1_2', NF='nf1_2'. "
+                         'Use a resolved sizing netlist with numeric W/L/NF; symbolic xschem parameters '
+                         'are not evaluated. For the geometry-only OTA example, use '
+                         'design/floorplan/ota/current_mirror_ota.sp.')
+
+    def test_quoted_numeric_parameters_and_assignment_whitespace(self):
+        source = CIRCUIT.replace('W=2.2u L=0.5u nf=2', "W = ' 2.2u ' L = '0.5u' nf = '2'")
+        project = FloorplanProject.from_text(source)
+        self.assertAlmostEqual(project.devices[0].width_um, 2.2)
+        self.assertAlmostEqual(project.devices[0].length_um, 0.5)
+        self.assertEqual(project.devices[0].nf, 2)
+        for malformed in ("W='1u'L='0.5u' nf=2", "W='1u L='0.5u' nf=2", "W=1u L=0.5u nf='2"):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(ValueError, 'malformed MOS parameter assignments'):
+                    FloorplanProject.from_text(CIRCUIT.replace('W=2.2u L=0.5u nf=2', malformed))
+        unsupported = source.replace("nf = '2'", "nf = '2' ad = 'int((nf+1)/2) * W/nf * 0.29'")
+        with self.assertRaisesRegex(ValueError, 'unsupported MOS parameters AD'):
+            FloorplanProject.from_text(unsupported)
+
     def test_bare_units_and_suffix_override(self):
         bare = CIRCUIT.replace('2.2u', '2.2').replace('0.5u', '0.5')
         um = FloorplanProject.from_text(bare, dimension_unit='um', width_convention='total')
