@@ -1,0 +1,268 @@
+{
+  "version": 2,
+  "source_netlist": "** sch_path: /home/adair/Documents/CAD/xschem_library_adair/schematics/cm_ota.sch\n**.subckt cm_ota vdd out inp inn itail vss\n*.iopin inn\n*.iopin inp\n*.iopin out\n*.iopin vss\n*.iopin vdd\n*.iopin itail\nXM1 ds1_3 inn source source sky130_fd_pr__nfet_01v8 L=0.500 W=w1_2 nf=nf1_2 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nxM3 ds1_3 ds1_3 vdd vdd sky130_fd_pr__pfet_01v8 L=0.500 W=w3_4 nf=nf3_4 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM2 ds2_4 inp source source sky130_fd_pr__nfet_01v8 L=0.500 W=w1_2 nf=nf1_2 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nxM4 ds2_4 ds2_4 vdd vdd sky130_fd_pr__pfet_01v8 L=0.500 W=w3_4 nf=nf3_4 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nxM7 ds5_7 ds1_3 vdd vdd sky130_fd_pr__pfet_01v8 L=0.500 W=w7_8 nf=nf7_8 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM5 ds5_7 ds5_7 vss vss sky130_fd_pr__nfet_01v8 L=0.500 W=w5_6 nf=nf5_6 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM6 out ds5_7 vss vss sky130_fd_pr__nfet_01v8 L=0.500 W=w5_6 nf=nf5_6 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nxM8 out ds2_4 vdd vdd sky130_fd_pr__pfet_01v8 L=0.500 W=w7_8 nf=nf7_8 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM9 source itail vss vss sky130_fd_pr__nfet_01v8 L=0.500 W=w9_10 nf=nf9_10 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM10 itail itail vss vss sky130_fd_pr__nfet_01v8 L=0.500 W=w9_10 nf=nf1_2 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\n**.ends\n.end\n",
+  "source_path": null,
+  "top": "cm_ota",
+  "dimension_unit": "um",
+  "width_convention": "total",
+  "devices": [
+    {
+      "name": "XM1",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "xM3",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "XM2",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "xM4",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "xM7",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "XM5",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "XM6",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "xM8",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "XM9",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    },
+    {
+      "name": "XM10",
+      "width_um": 1.1,
+      "length_um": 0.5,
+      "nf": 2
+    }
+  ],
+  "constraints": [
+    {
+      "constraint": "PowerPorts",
+      "ports": [
+        "vdd"
+      ]
+    },
+    {
+      "constraint": "GroundPorts",
+      "ports": [
+        "vss"
+      ]
+    },
+    {
+      "constraint": "SymmetricBlocks",
+      "pairs": [
+        [
+          "XM1",
+          "XM2"
+        ],
+        [
+          "xM3",
+          "xM4"
+        ],
+        [
+          "XM5",
+          "XM6"
+        ],
+        [
+          "xM7",
+          "xM8"
+        ],
+        [
+          "XM9",
+          "XM10"
+        ]
+      ],
+      "direction": "V"
+    },
+    {
+      "constraint": "Align",
+      "instances": [
+        "XM1",
+        "XM2"
+      ],
+      "line": "h_center"
+    },
+    {
+      "constraint": "Align",
+      "instances": [
+        "xM3",
+        "xM4"
+      ],
+      "line": "h_center"
+    },
+    {
+      "constraint": "Align",
+      "instances": [
+        "XM5",
+        "XM6"
+      ],
+      "line": "h_center"
+    },
+    {
+      "constraint": "Align",
+      "instances": [
+        "xM7",
+        "xM8"
+      ],
+      "line": "h_center"
+    },
+    {
+      "constraint": "Align",
+      "instances": [
+        "XM9",
+        "XM10"
+      ],
+      "line": "h_center"
+    },
+    {
+      "constraint": "CompactPlacement",
+      "style": "center"
+    }
+  ],
+  "parameters": {
+    "w1_2": {
+      "value": 2.2e-06,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M1_2.W (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M1_2",
+        "attribute": "W",
+        "source": "linked"
+      }
+    },
+    "nf1_2": {
+      "value": 2.0,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M1_2.NF (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M1_2",
+        "attribute": "NF",
+        "source": "linked"
+      }
+    },
+    "w3_4": {
+      "value": 2.2e-06,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M3_4.W (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M3_4",
+        "attribute": "W",
+        "source": "linked"
+      }
+    },
+    "nf3_4": {
+      "value": 2.0,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M3_4.NF (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M3_4",
+        "attribute": "NF",
+        "source": "linked"
+      }
+    },
+    "w7_8": {
+      "value": 2.2e-06,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M7_8.W (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M7_8",
+        "attribute": "W",
+        "source": "linked"
+      }
+    },
+    "nf7_8": {
+      "value": 2.0,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M7_8.NF (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M7_8",
+        "attribute": "NF",
+        "source": "linked"
+      }
+    },
+    "w5_6": {
+      "value": 2.2e-06,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M5_6.W (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M5_6",
+        "attribute": "W",
+        "source": "linked"
+      }
+    },
+    "nf5_6": {
+      "value": 2.0,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M5_6.NF (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M5_6",
+        "attribute": "NF",
+        "source": "linked"
+      }
+    },
+    "w9_10": {
+      "value": 2.2e-06,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M9_10.W (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M9_10",
+        "attribute": "W",
+        "source": "linked"
+      }
+    },
+    "nf9_10": {
+      "value": 2.0,
+      "dimension_unit": "m",
+      "width_convention": "total",
+      "source": "ROAR linked: M9_10.NF (Synthetic floorplan demo)",
+      "binding": {
+        "instance": "M9_10",
+        "attribute": "NF",
+        "source": "linked"
+      }
+    }
+  },
+  "overrides": {},
+  "roar_project_path": "cm_ota_sizes.roar"
+}

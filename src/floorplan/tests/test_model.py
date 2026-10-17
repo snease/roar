@@ -55,16 +55,21 @@ class ProjectTests(unittest.TestCase):
             path.write_text(source)
             self.assertEqual(FloorplanProject.subcircuit_names(path), ['amp', 'Other'])
 
-    def test_original_xschem_ota_reports_unresolved_sizing_before_parasitics(self):
+    def test_original_xschem_ota_preserves_unresolved_parameters_and_declares_omissions(self):
         path = Path(__file__).resolve().parents[3] / 'design/cm_ota.spice'
         self.assertEqual(FloorplanProject.subcircuit_names(path), ['cm_ota'])
-        with self.assertRaises(ValueError) as raised:
-            FloorplanProject.from_netlist(path, top='cm_ota', dimension_unit='um', width_convention='total')
-        self.assertEqual(str(raised.exception),
-                         "XM1: unresolved sizing parameters W='w1_2', NF='nf1_2'. "
-                         'Use a resolved sizing netlist with numeric W/L/NF; symbolic xschem parameters '
-                         'are not evaluated. For the geometry-only OTA example, use '
-                         'design/floorplan/ota/current_mirror_ota.sp.')
+        project = FloorplanProject.from_netlist(path, top='cm_ota', dimension_unit='um', width_convention='total')
+        self.assertEqual(project.source_netlist, path.read_text())
+        self.assertEqual(project.devices[0].length_um, 0.5)
+        self.assertIsNone(project.devices[0].width_um)
+        self.assertIn('w1_2', project.unresolved_parameters)
+        self.assertEqual(project.devices[0].parameters, {'M': 1})
+        self.assertIn('AD', project.omitted_parameters['XM1'])
+        project.set_constraints([{'constraint': 'SymmetricBlocks', 'pairs': [['XM1', 'XM2']], 'direction': 'V'}])
+        clone = FloorplanProject.from_dict(project.to_dict())
+        self.assertEqual(clone.to_dict(), project.to_dict())
+        with self.assertRaisesRegex(ValueError, 'Unresolved sizing parameters'):
+            clone.validate()
 
     def test_quoted_numeric_parameters_and_assignment_whitespace(self):
         source = CIRCUIT.replace('W=2.2u L=0.5u nf=2', "W = ' 2.2u ' L = '0.5u' nf = '2'")
@@ -77,8 +82,12 @@ class ProjectTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'malformed MOS parameter assignments'):
                     FloorplanProject.from_text(CIRCUIT.replace('W=2.2u L=0.5u nf=2', malformed))
         unsupported = source.replace("nf = '2'", "nf = '2' ad = 'int((nf+1)/2) * W/nf * 0.29'")
-        with self.assertRaisesRegex(ValueError, 'unsupported MOS parameters AD'):
-            FloorplanProject.from_text(unsupported)
+        project = FloorplanProject.from_text(unsupported)
+        self.assertEqual(project.omitted_parameters['M1'], ['AD'])
+        with tempfile.TemporaryDirectory() as directory:
+            netlist, _ = project.export_align(directory)
+            self.assertIn('Layout export omits SKY130 simulation parameters for M1: AD', netlist.read_text())
+            self.assertNotIn('ad=', netlist.read_text())
 
     def test_bare_units_and_suffix_override(self):
         bare = CIRCUIT.replace('2.2u', '2.2').replace('0.5u', '0.5')
@@ -172,7 +181,7 @@ class ProjectTests(unittest.TestCase):
             CIRCUIT.replace('VIN VOUT VDD VSS\n', 'VIN VOUT VDD VSS params: gain=2\n'),
             '.include models.sp\n' + CIRCUIT,
             CIRCUIT.replace(' W=2.2u', " W='total/nf'"),
-            CIRCUIT.replace(' nf=2', ' nf=2 ad=1p'),
+            CIRCUIT.replace(' nf=2', ' nf=2 unknown_field=1p'),
             CIRCUIT.replace(' nf=2', ' nf=2 m=0.5'),
             CIRCUIT.replace(' nf=2', ' nf=2 trailing'),
             CIRCUIT.replace(' nf=2', ' nf=2 NF=4'),
@@ -186,6 +195,148 @@ class ProjectTests(unittest.TestCase):
         hierarchy = CIRCUIT.replace('sky130_fd_pr__nfet_01v8', 'child') + '.subckt child D G S B\nM3 D G S B nmos W=1u L=.1u nf=2\n.ends child\n'
         with self.assertRaisesRegex(ValueError, 'hierarchy'):
             FloorplanProject.from_text(hierarchy, top='amp')
+
+    def test_shared_parameters_rebuild_atomically_and_keep_numeric_fields_editable(self):
+        source = CIRCUIT.replace('W=2.2u L=0.5u nf=2', 'W=width L=0.5u nf=fingers')
+        project = FloorplanProject.from_text(source, width_convention='total')
+        project.set_parameter('width', 4.2e-6)
+        self.assertIsNone(project.devices[0].width_um)
+        project.set_parameter('fingers', 4)
+        self.assertAlmostEqual(project.devices[0].width_um, 1.05)
+        self.assertEqual(project.devices[0].width_um, project.devices[1].width_um)
+        project.set_mos_parameters('M1', project.devices[0].width_um, 0.7, 4)
+        clone = FloorplanProject.from_dict(project.to_dict())
+        self.assertEqual(clone.devices[0].length_um, 0.7)
+        clone.set_parameter('fingers', 2)
+        self.assertAlmostEqual(clone.devices[0].width_um, 2.1)
+        self.assertEqual(clone.devices[0].length_um, 0.7)
+        before = clone.to_dict()
+        with self.assertRaisesRegex(ValueError, 'controlled by shared parameter'):
+            clone.set_mos_parameters('M1', 123, 0.8, 2)
+        self.assertEqual(clone.to_dict(), before)
+        for invalid in (1, 3, 2.5, float('inf'), 0):
+            with self.assertRaises(ValueError):
+                clone.set_parameter('fingers', invalid)
+            self.assertEqual(clone.to_dict(), before)
+        clone.set_parameter('width', None)
+        self.assertIn('width', clone.unresolved_parameters)
+        self.assertEqual(clone.devices[0].length_um, 0.7)
+
+    def test_bindings_copy_scalars_track_sources_and_refresh_atomically(self):
+        source = CIRCUIT.replace('W=2.2u L=0.5u nf=2', 'W=width L=length nf=fingers')
+        project = FloorplanProject.from_text(source)
+        design = Design().add_instance('M1_2', W=8e-6, L=0.5e-6, NF=4)
+        original = design.to_state()
+        project.bind_parameter(design, 'width', 'M1_2', 'W', source='linked')
+        project.bind_parameter(design, 'fingers', 'M1_2', 'NF', source='linked')
+        project.bind_parameter(design, 'length', 'M1_2', 'L', source='live')
+        self.assertEqual(project.devices[0].width_um, 2)
+        self.assertEqual(design.to_state(), original)
+        self.assertEqual(project.parameter_rows[0]['binding']['source'], 'linked')
+        refreshed = Design().add_instance('M1_2', W=12e-6, L=0.7e-6, NF=6)
+        project.refresh_bindings(refreshed, source='live')
+        self.assertAlmostEqual(project.devices[0].length_um, 0.7)
+        self.assertEqual(project.devices[0].nf, 4)
+        before = project.to_dict()
+        invalid = Design().add_instance('M1_2', W=16e-6, L=0.5e-6, NF=3)
+        with self.assertRaises(ValueError):
+            project.refresh_bindings(invalid, source='linked')
+        self.assertEqual(project.to_dict(), before)
+        arrays = Design().add_instance('M1_2', W=[1e-6, 2e-6], NF=4)
+        with self.assertRaises(ValueError):
+            project.bind_parameter(arrays, 'width', 'M1_2', 'W')
+        self.assertEqual(project.to_dict(), before)
+        project.set_parameter('width', 6, dimension_unit='um', width_convention='per_finger')
+        self.assertEqual(project.devices[0].width_um, 6)
+        self.assertIsNone(project.parameter_rows[0]['binding'])
+
+    def test_numeric_parameter_import_is_atomic_reports_unused_and_clears_bindings(self):
+        source = CIRCUIT.replace('W=2.2u L=0.5u nf=2', 'W=width L=0.5u nf=fingers')
+        project = FloorplanProject.from_text(source)
+        design = Design().add_instance('group', W=4e-6)
+        project.bind_parameter(design, 'width', 'group', 'W')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'sizes.sp'
+            path.write_text("* sizing\n.param WIDTH = '8u'\n+ fingers=4 unused=10k\n")
+            self.assertEqual(project.import_parameters(path, dimension_unit='um'), ['unused'])
+            self.assertAlmostEqual(project.devices[0].width_um, 2)
+            self.assertIsNone(project.parameter_rows[0]['binding'])
+            self.assertIn('sizes.sp', project.parameter_rows[0]['source'])
+            before = project.to_dict()
+            for invalid in ('.param width=16u fingers=1', '.param width=16u\n.param WIDTH=8u',
+                            ".param width='total / 2'", '.include others.sp'):
+                path.write_text(invalid)
+                with self.assertRaises(ValueError):
+                    project.import_parameters(path)
+                self.assertEqual(project.to_dict(), before)
+        original = FloorplanProject.from_netlist(Path(__file__).resolve().parents[3] / 'design/cm_ota.spice',
+                                                 dimension_unit='um', width_convention='total')
+        before = original.to_dict()
+        params = Path(__file__).resolve().parents[3] / 'design/cm_ota/simulation/spice/cm_ota_params.sp'
+        with self.assertRaisesRegex(ValueError, 'NF must be an even integer'):
+            original.import_parameters(params, dimension_unit='um')
+        self.assertEqual(original.to_dict(), before)
+
+    def test_shared_total_width_tracks_manual_numeric_nf_without_competing_override(self):
+        project = FloorplanProject.from_text(CIRCUIT.replace('W=2.2u', 'W=width'))
+        project.set_parameter('width', 4e-6)
+        project.set_mos_parameters('M1', project.devices[0].width_um, 0.5, 4)
+        self.assertEqual(project.devices[0].width_um, 1)
+        self.assertEqual(FloorplanProject.from_dict(project.to_dict()).devices[0].width_um, 1)
+        numeric = self.project(width_convention='total')
+        width = numeric.devices[0].width_um
+        numeric.set_mos_parameters('M1', width, 0.5, 4)
+        self.assertEqual(numeric.devices[0].width_um, width)
+        self.assertEqual(FloorplanProject.from_dict(numeric.to_dict()).devices[0].width_um, width)
+
+    def test_numeric_total_width_waits_for_shared_nf_and_survives_clone(self):
+        project = FloorplanProject.from_text(CIRCUIT.replace('nf=2', 'nf=fingers'), width_convention='total')
+        project.set_mos_parameters('M1', None, 0.7, None)
+        clone = FloorplanProject.from_dict(project.to_dict())
+        clone.set_parameter('fingers', 2)
+        self.assertAlmostEqual(clone.devices[0].width_um, 1.1)
+        self.assertEqual(clone.devices[0].length_um, 0.7)
+        clone.set_parameter('fingers', 4)
+        self.assertAlmostEqual(clone.devices[0].width_um, 0.55)
+
+    def test_multiplicity_symbols_and_ambiguous_alias_rejection(self):
+        project = FloorplanProject.from_text(CIRCUIT.replace(' nf=2', ' nf=2 mult=multiplicity'))
+        self.assertIn('multiplicity', project.unresolved_parameters)
+        project.set_parameter('multiplicity', 2)
+        self.assertEqual(project.devices[0].parameters, {'M': 2})
+        with self.assertRaises(ValueError):
+            project.set_parameter('multiplicity', 0.5)
+        with self.assertRaisesRegex(ValueError, 'ambiguous'):
+            FloorplanProject.from_text(CIRCUIT.replace(' nf=2', ' nf=2 M=1 mult=1'))
+        with self.assertRaisesRegex(ValueError, 'resolve arithmetic expressions'):
+            FloorplanProject.from_text(CIRCUIT.replace('W=2.2u', "W='width / 2'"))
+
+    def test_v1_backward_read_and_v2_companion_link_rebasing(self):
+        project = self.project()
+        v1 = project.to_dict()
+        v1['version'] = 1
+        for key in ('parameters', 'overrides', 'roar_project_path'):
+            v1.pop(key)
+        self.assertEqual(FloorplanProject.from_dict(v1).devices[0].width_um, project.devices[0].width_um)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            roar = base / 'designs' / 'amp.roar'
+            roar.parent.mkdir()
+            roar.write_text('unchanged ROAR bytes')
+            project.roar_project_path = roar
+            first = project.save(base / 'first' / 'amp.floorplan.json')
+            raw = json.loads(first.read_text())
+            self.assertEqual(raw['roar_project_path'], '../designs/amp.roar')
+            restored = FloorplanProject.load(first)
+            self.assertEqual(restored.roar_project_path, str(roar.resolve()))
+            second = restored.save(base / 'another' / 'deeper' / 'amp.floorplan.json')
+            self.assertEqual(json.loads(second.read_text())['roar_project_path'], '../../designs/amp.roar')
+            self.assertEqual(FloorplanProject.load(second).roar_project_path, str(roar.resolve()))
+            with self.assertRaisesRegex(ValueError, 'ROAR project'):
+                restored.save(roar)
+            self.assertEqual(roar.read_text(), 'unchanged ROAR bytes')
+            roar.unlink()
+            self.assertEqual(FloorplanProject.load(second).roar_project_path, str(roar.resolve()))
 
     def test_invalid_dimensions_and_fingers_rejected_atomically(self):
         project = self.project()

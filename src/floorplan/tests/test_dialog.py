@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 try:
-    from PyQt6.QtCore import QTimer
+    from PyQt6.QtCore import QTimer, Qt
     from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QWidget
 except ImportError:
     QApplication = None
@@ -17,7 +17,7 @@ from roar_api import Design
 from roar_api.floorplan import FloorplanProject
 
 if QApplication is not None:
-    from roar_api.floorplan.dialog import FloorplanDialog, NetlistImportDialog
+    from roar_api.floorplan.dialog import FloorplanDialog, NetlistImportDialog, OpenFloorplanDialog, load_roar_design
 
 
 NETLIST = """.subckt pair d g s b
@@ -26,6 +26,12 @@ M2 d g s b nch W=2u L=0.15u nf=2
 M3 d g s b nch W=2u L=0.15u nf=2
 M4 d g s b nch W=2u L=0.15u nf=2
 .ends pair
+"""
+
+SYMBOLIC = """.subckt shared d g s b
+M1 d g s b nch W=ws L=0.15u nf=nfs
+M2 d g s b nch W=ws L=0.15u nf=nfs
+.ends shared
 """
 
 
@@ -130,8 +136,13 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._save_project()
         self.assertFalse(self.dialog._dirty)
         self.dialog.devices_table.item(0, 3).setText("99")
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(project_path), "")), \
-             patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
+        def open_saved():
+            options = QApplication.activeModalWidget()
+            options.floorplan_path.setText(str(project_path))
+            options.floorplan_path.editingFinished.emit()
+            options.buttons.button(QDialogButtonBox.StandardButton.Open).click()
+        QTimer.singleShot(0, open_saved)
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
             self.dialog._open_project()
         self.assertEqual(self.dialog.devices_table.item(0, 3).text(), "4.0")
         with patch.object(QFileDialog, "getExistingDirectory", return_value=str(self.root)):
@@ -218,6 +229,198 @@ class FloorplanDialogTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.dialog.devices_table.item(0, 3).text(), "6")
         self.assertIs(self.dialog.parent(), self.parent)
+
+    def test_open_dialog_follows_suggestions_but_preserves_explicit_override(self):
+        first_design = self.root / "first.roar"
+        second_design = self.root / "second.roar"
+        self.design.save(first_design)
+        self.design.save(second_design)
+        project = FloorplanProject.from_text(NETLIST)
+        first = self.root / "first.floorplan.json"
+        second = self.root / "second.floorplan.json"
+        project.roar_project_path = first_design
+        project.save(first)
+        project.roar_project_path = second_design
+        project.save(second)
+        options = OpenFloorplanDialog(self.parent, first)
+        self.assertEqual(options.design_path.text(), str(first_design))
+        with patch.object(FloorplanProject, "load", wraps=FloorplanProject.load) as loader:
+            options.floorplan_path.setText(str(second))
+            loader.assert_not_called()
+            self.assertFalse(options.buttons.button(QDialogButtonBox.StandardButton.Open).isEnabled())
+            options.floorplan_path.editingFinished.emit()
+            loader.assert_called_once()
+        self.assertEqual(options.design_path.text(), str(second_design))
+        options.design_path.setText(str(first_design))
+        options.design_path.textEdited.emit(str(first_design))
+        options.floorplan_path.setText(str(first))
+        options.floorplan_path.editingFinished.emit()
+        options.floorplan_path.setText(str(second))
+        options.floorplan_path.editingFinished.emit()
+        self.assertEqual(options.design_path.text(), str(first_design))
+        self.assertIn("Using your ROAR choice", options.link_status.text())
+        QTimer.singleShot(0, lambda: options.buttons.button(QDialogButtonBox.StandardButton.Open).click())
+        self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
+        self.assertEqual(options.project.roar_project_path, str(first_design))
+        options.deleteLater()
+
+    def test_missing_link_opens_saved_sizes_without_losing_association(self):
+        project = FloorplanProject.from_text(NETLIST)
+        missing = self.root / "missing.roar"
+        project.roar_project_path = missing
+        sidecar = self.root / "missing.floorplan.json"
+        project.save(sidecar)
+        options = OpenFloorplanDialog(self.parent, sidecar)
+        self.assertTrue(options.without_design.isChecked())
+        self.assertIn("missing", options.link_status.text())
+        self.assertTrue(options.buttons.button(QDialogButtonBox.StandardButton.Open).isEnabled())
+        QTimer.singleShot(0, lambda: options.buttons.button(QDialogButtonBox.StandardButton.Open).click())
+        self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
+        self.assertIsNone(options.design)
+        self.assertEqual(options.project.roar_project_path, str(missing))
+        self.dialog.set_project(options.project, sidecar, options.design)
+        self.assertFalse(self.dialog.refresh_bindings_button.isEnabled())
+        self.assertEqual(self.dialog.project.devices[0].width_um, 2)
+        options.deleteLater()
+
+    def test_wrong_roar_file_is_rejected_inline_and_open_cancel_is_transactional(self):
+        sidecar = self.root / "existing.floorplan.json"
+        self.dialog.project.save(sidecar)
+        options = OpenFloorplanDialog(self.parent, sidecar)
+        options.design_path.setText(str(sidecar))
+        options.design_path.textEdited.emit(str(sidecar))
+        options.accept()
+        self.assertEqual(options.result(), QDialog.DialogCode.Rejected)
+        self.assertIn("Choose a ROAR design", options.link_status.text())
+        self.assertIsNone(options.project)
+        with self.assertRaisesRegex(ValueError, "Choose a ROAR design"):
+            load_roar_design(sidecar)
+        options.deleteLater()
+        self.dialog._read_roar()
+        original_project, original_source = self.dialog.project, self.dialog.roar_design
+        def cancel_open():
+            modal = QApplication.activeModalWidget()
+            modal.floorplan_path.setText(str(sidecar))
+            modal.floorplan_path.editingFinished.emit()
+            modal.buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
+        QTimer.singleShot(0, cancel_open)
+        self.dialog._open_project()
+        self.assertIs(self.dialog.project, original_project)
+        self.assertIs(self.dialog.roar_design, original_source)
+
+    def test_parameter_fields_are_shared_constant_fields_remain_editable_and_draft_saves(self):
+        self.dialog.set_project(FloorplanProject.from_text(SYMBOLIC, dimension_unit="um"))
+        self.assertEqual(self.dialog.project.unresolved_parameters, ["ws", "nfs"])
+        self.assertFalse(self.dialog.devices_table.item(0, 3).flags() & Qt.ItemFlag.ItemIsEditable)
+        self.assertFalse(self.dialog.devices_table.item(0, 5).flags() & Qt.ItemFlag.ItemIsEditable)
+        self.assertTrue(self.dialog.devices_table.item(0, 4).flags() & Qt.ItemFlag.ItemIsEditable)
+        draft = self.root / "draft.floorplan.json"
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(draft), "")):
+            self.dialog._save_project()
+        self.assertEqual(FloorplanProject.load(draft).unresolved_parameters, ["ws", "nfs"])
+        with self.assertRaisesRegex(ValueError, "[Uu]nresolved"):
+            self.dialog._export_align()
+        self.dialog.devices_table.item(0, 4).setText("0.25")
+        self.dialog.parameter_symbol.setCurrentText("nfs")
+        self.dialog.parameter_value.setText("4")
+        self.dialog._set_parameter()
+        self.dialog.parameter_symbol.setCurrentText("ws")
+        self.dialog.parameter_value.setText("8u")
+        self.dialog.parameter_unit.setCurrentIndex(self.dialog.parameter_unit.findData("um"))
+        self.dialog.parameter_width.setCurrentIndex(self.dialog.parameter_width.findData("total"))
+        self.dialog._set_parameter()
+        self.assertEqual([d.width_um for d in self.dialog.project.devices], [2, 2])
+        self.assertEqual([d.length_um for d in self.dialog.project.devices], [0.25, 0.15])
+        with patch.object(QFileDialog, "getSaveFileName") as picker:
+            self.dialog._save_project()
+        picker.assert_not_called()
+
+    def test_saved_source_open_keeps_captured_values_until_explicit_refresh(self):
+        saved_design = self.root / "sizes.roar"
+        self.design.save(saved_design)
+        original_running = self.design.to_state()
+        project = FloorplanProject.from_text(SYMBOLIC)
+        project.roar_project_path = saved_design
+        project.set_parameter("nfs", 4)
+        project.bind_parameter(self.design, "ws", "M1_2", "W", source="linked")
+        sidecar = self.root / "bound.floorplan.json"
+        project.save(sidecar)
+        changed = Design.from_state(self.design.to_state()).set_instance_attribute("M1_2", "W", 20e-6)
+        changed.save(saved_design)
+        source_bytes = saved_design.read_bytes()
+        def open_saved():
+            modal = QApplication.activeModalWidget()
+            modal.floorplan_path.setText(str(sidecar))
+            modal.floorplan_path.editingFinished.emit()
+            modal.buttons.button(QDialogButtonBox.StandardButton.Open).click()
+        QTimer.singleShot(0, open_saved)
+        self.dialog._open_project()
+        self.assertEqual(self.dialog._source_origin, "linked")
+        self.assertEqual(self.dialog.project.devices[0].width_um, 2)
+        self.dialog._refresh_bindings()
+        self.assertEqual(self.dialog.project.devices[0].width_um, 5)
+        self.assertEqual(self.design.to_state(), original_running)
+        self.assertEqual(saved_design.read_bytes(), source_bytes)
+        before = self.dialog.project.to_dict()
+        saved_design.unlink()
+        with self.assertRaises(OSError):
+            self.dialog._refresh_bindings()
+        self.assertIsNone(self.dialog.roar_design)
+        self.assertFalse(self.dialog.refresh_bindings_button.isEnabled())
+        self.assertEqual(self.dialog.project.to_dict(), before)
+
+    def test_parameter_binding_uses_explicit_attribute_and_preserves_captured_source(self):
+        self.dialog.set_project(FloorplanProject.from_text(SYMBOLIC))
+        self.dialog._read_roar()
+        self.dialog.parameter_symbol.setCurrentText("nfs")
+        self.dialog.binding_attribute.setCurrentIndex(self.dialog.binding_attribute.findData("NF"))
+        self.dialog._bind_parameter()
+        self.dialog.parameter_symbol.setCurrentText("ws")
+        self.dialog.binding_attribute.setCurrentIndex(self.dialog.binding_attribute.findData("W"))
+        self.dialog._bind_parameter()
+        self.assertEqual(self.dialog.project.devices[0].width_um, 2)
+        self.assertEqual(self.dialog.project.parameter_rows[0]["binding"],
+                         {"instance": "M1_2", "attribute": "W", "source": "live"})
+        self.dialog.parameter_value.setText("12e-6")
+        self.dialog._set_parameter()
+        self.assertIsNone(self.dialog.project.parameter_rows[0]["binding"])
+        self.assertEqual(self.dialog.project.devices[0].width_um, 3)
+
+    def test_numeric_parameter_file_uses_own_options_even_when_count_selected(self):
+        self.dialog.set_project(FloorplanProject.from_text(SYMBOLIC))
+        self.dialog.parameter_symbol.setCurrentText("nfs")
+        self.assertFalse(self.dialog.parameter_unit.isEnabled())
+        parameters = self.root / "sizes.param"
+        parameters.write_text(".param ws=8 nfs=4 unused=1\n")
+        def accept_parameters():
+            modal = QApplication.activeModalWidget()
+            modal.dimension_unit.setCurrentIndex(modal.dimension_unit.findData("um"))
+            modal.width_convention.setCurrentIndex(modal.width_convention.findData("total"))
+            modal.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+        QTimer.singleShot(0, accept_parameters)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(parameters), "")):
+            self.dialog._import_parameters()
+        self.assertEqual([d.width_um for d in self.dialog.project.devices], [2, 2])
+        self.assertIn("Unused names: unused", self.dialog.status.text())
+
+    def test_creation_can_associate_saved_design_without_changing_current_roar(self):
+        source = self.root / "shared.sp"
+        source.write_text(SYMBOLIC)
+        saved_design = self.root / "source.roar"
+        self.design.save(saved_design)
+        original = self.design.to_state()
+        def accept_import():
+            modal = QApplication.activeModalWidget()
+            modal.source_mode.setCurrentIndex(modal.source_mode.findData("linked"))
+            modal.design_path.setText(str(saved_design))
+            modal.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+        QTimer.singleShot(0, accept_import)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+            self.dialog._load_netlist()
+        self.assertEqual(self.dialog.project.roar_project_path, str(saved_design))
+        self.assertEqual(self.dialog._source_origin, "linked")
+        self.assertEqual(self.dialog.project.unresolved_parameters, ["ws", "nfs"])
+        self.assertEqual(self.design.to_state(), original)
 
 
 if __name__ == "__main__":

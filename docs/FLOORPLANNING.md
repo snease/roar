@@ -11,9 +11,61 @@ with `pip install -e '.[gui]'`, then launch it normally. ALIGN, Xschem, Magic an
 a PDK are not required to author or export a project. The Python API works with
 the headless installation, `pip install -e .`.
 
+## A companion to the ROAR design
+
+The editable layout data lives in a separate `.floorplan.json` companion file.
+It contains the circuit template, chosen subcircuit, size values and bindings,
+placement constraints, and an optional link to a saved ROAR design. ROAR's
+existing `.roar` format is unchanged. Floorplan actions never write to that
+design file or replace the running ROAR workspace.
+
+**Open floorplan…** shows both file paths in one dialog. Choosing a floorplan
+fills in its linked ROAR design; you can browse for a different design. An
+explicit design choice is retained when changing the floorplan, with the
+different saved link shown for comparison. Missing links can be repaired with
+Browse, or the floorplan can open using its saved sizes alone.
+
+Links are saved relative to the companion file. Moving the two files together
+preserves their association, and **Save as…** rebases the link to the same design.
+The original netlist text is embedded, so it remains available even if its
+original file moves. Version 1 floorplan files still open; new saves use version 2.
+
+Opening a floorplan restores its saved size snapshot. Loading or relinking a
+ROAR design supplies a source for subsequent assignments; it does not silently
+refresh the saved sizes. **Refresh bindings from this source** explicitly updates
+values from the selected source. Failed refreshes keep the previous sizes and clear the
+unavailable source from the editor.
+
+## Try a linked, parameterized OTA
+
+1. Click the header's layout button, then **Open floorplan…** and choose
+   [`cm_ota.floorplan.json`](../design/floorplan/ota/cm_ota.floorplan.json).
+   Its linked [`cm_ota_sizes.roar`](../design/floorplan/ota/cm_ota_sizes.roar)
+   appears automatically. Open the companion.
+2. Inspect the **Parameters** tab. Each shared symbol lists its affected device
+   fields, captured value and ROAR source. For example, `w1_2` is bound to
+   `M1_2.W`. W is 2.2 µm total, NF is 2, and the Devices tab therefore shows
+   1.1 µm per finger. These are synthetic demo sizes, not optimized designs.
+3. Select a parameter to enter a manual value or bind a different resolved ROAR
+   instance attribute. Manual assignment replaces that parameter's binding.
+   Clearing its value makes it unresolved again. Shared symbols update all
+   their device references together.
+4. Use **Save** or **Save as…**, then **Export ALIGN inputs…**. Export creates a
+   fresh circuit directory with sized SPICE and native constraint JSON.
+
+This example embeds the actual [`design/cm_ota.spice`](../design/cm_ota.spice)
+template. To start from scratch instead, choose **New from netlist…**, select
+that file, and choose micrometres and total width. Optionally select
+`cm_ota_sizes.roar` as the sizing source in the same dialog. The template loads
+with unresolved widths and finger counts; you can save that draft and author
+constraints before assigning all values. Export waits for complete, valid sizes.
+
+The source template makes `XM10` refer to `nf1_2`, while `XM9` refers to `nf9_10`.
+The affected-device column exposes that relationship and preserves it exactly.
+
 ## Try the OTA or common-source example
 
-1. Click the layout button, then **Load netlist…**. Choose
+1. Click the layout button, then **New from netlist…**. Choose
    [`current_mirror_ota.sp`](../design/floorplan/ota/current_mirror_ota.sp) or
    [`common_source.sp`](../design/floorplan/common_source/common_source.sp).
    The import dialog selects the only subcircuit automatically. Choose a circuit
@@ -27,7 +79,7 @@ the headless installation, `pip install -e .`.
 3. On the Constraints tab, use **Import constraints…** to load the sibling
    `.const.json`, or select an intent and enter device names. Separate names
    with commas and symmetry pairs or rows with semicolons.
-4. Use **Validate / format JSON**, then **Save project…** to retain your work.
+4. Use **Validate / format JSON**, then **Save** to retain your work.
    The project includes the original netlist text, edited sizes and constraints;
    reopening does not depend on the original file still being present.
 5. **Export ALIGN inputs…** asks for a parent folder and creates a fresh
@@ -41,11 +93,6 @@ example contains one MOS device and a resistor, with the resistor above the MOS.
 Its generic resistor is useful for input/export testing; physical layout requires
 a compatible resistor primitive in the selected ALIGN PDK. The tested SKY130
 backend does not currently provide that complete path.
-
-The older [`design/cm_ota.spice`](../design/cm_ota.spice) is a schematic template
-with unresolved sizes such as `W=w1_2` and `nf=nf1_2`. Import requires concrete
-sizes; the separate `design/floorplan/ota` example supplies synthetic ones for
-trying the editor.
 
 The import unit selector applies only to numbers without a suffix: with
 micrometres selected, `L=0.5` means 0.5 µm. Select metres for a netlist that writes
@@ -82,16 +129,33 @@ export alone does not establish DRC, LVS, model-bin validity or generated geomet
 
 ## Bring sizes over from ROAR
 
-**Read current ROAR sizes** captures the current design. Choose an enabled source
-row, enter explicit target MOS names, and choose the source units and width
-convention before applying. For a grouped ROAR row such as `M1_2`, explicitly map
-to `M1, M2`; names are never expanded automatically. Read again to refresh after
-changing the ROAR design. Applying sizes changes only the floorplan project.
+Use **Load / relink ROAR design…** for a saved design or **Read current ROAR sizes**
+for the running design. Both supply detached snapshots. The Parameters tab binds
+one netlist symbol to one explicitly chosen instance attribute, using ROAR's
+existing assigned scalar values. It records whether that binding came from the
+linked file or the running design, and preserves the captured value on save.
+Refreshing updates bindings for the selected source only. Missing assignments,
+disabled instances, nonfinite values and vectors are rejected; the editor does
+not evaluate sweeps or select a design point on your behalf.
+
+For a fully numeric netlist, the Devices tab also accepts explicit source-row
+to target-device mappings. For example, map ROAR row `M1_2` to `M1, M2`; names
+are never expanded automatically. Fields controlled by template symbols are
+edited through those shared parameters instead. Numeric fields, such as a
+literal L in an otherwise parameterized device, remain editable directly.
+
+**Import numeric .param…** can populate matching symbols from a numeric SPICE parameter
+file. Choose the file's units and width convention. The import is atomic:
+invalid used values leave all existing sizes intact. Unused names are reported;
+matched assignments replace their previous bindings. Expressions and includes
+are outside this importer. The existing simulation parameter files with NF=1
+therefore need explicit layout-appropriate finger counts before import.
 
 The defaults are metres for ROAR W/L and total width. When total width is selected,
 the editor divides W by NF once. Its table always shows per-finger W and L in
-micrometres. Export always writes SI dimensions and per-finger W. W, L and NF must
-already be concrete scalar values; unresolved expressions are rejected.
+micrometres. Export always writes SI dimensions and per-finger W. Assigned ROAR
+values must be concrete scalars; unresolved template symbols can remain in a
+saved draft, but prevent export.
 
 ## Python API
 
@@ -120,15 +184,41 @@ project.import_roar_parameters(
 )
 ```
 
+For a template and companion association:
+
+```python
+from roar_api import Design
+
+project = FloorplanProject.from_netlist(
+    "design/cm_ota.spice", dimension_unit="um", width_convention="total")
+project.roar_project_path = "design/floorplan/ota/cm_ota_sizes.roar"
+design = Design.load(project.roar_project_path)
+project.bind_parameter(design, "w1_2", "M1_2", "W",
+                       dimension_unit="m", width_convention="total", source="linked")
+project.set_parameter("nf1_2", 2)
+project.save("ota-draft.floorplan.json")  # remaining symbols can be assigned later
+```
+
+`parameter_rows` lists values, units, provenance and affected fields.
+`unresolved_parameters` lists symbols awaiting values. `refresh_bindings(design,
+source="linked")` updates linked bindings atomically; `import_parameters(path,
+dimension_unit="um", width_convention="total")` imports numeric `.param` values.
+
 ## Supported input boundary
 
 This version accepts a selected flat `.subckt` with four-terminal `M` or `X`
-MOS devices and numeric two-terminal resistors. MOS parameters are concrete W,
-L, NF and optional positive integer M. Select the top explicitly for a file with
-multiple subcircuits. Xschem's commented subcircuit wrappers and continuation
-lines are supported. Hierarchy, includes, parameter expressions, extra MOS
-parameters and other selected device kinds are rejected with an explanation;
-prepare a self-contained flat sizing netlist for this editor.
+MOS devices and numeric two-terminal resistors. W, L, NF and optional M can be
+numbers or simple shared symbol names. NF must resolve to an even integer of at
+least two; M must resolve to a positive integer. `MULT` is accepted as M, while
+specifying both is rejected as ambiguous. Select the top explicitly for files
+with multiple subcircuits. Xschem's commented wrappers and continuations work.
+
+The original template remains intact. For SKY130 devices, the editor identifies
+simulation parameters AD, AS, PD, PS, NRD, NRS, SA, SB and SD and lists their
+omission from the generated layout input. Those expressions are not evaluated;
+ALIGN generates its own device geometry. Other extra parameters, arithmetic
+sizing expressions, hierarchy, includes and unsupported device kinds produce
+actionable errors. This adapter is a bounded layout export, not a SPICE simulator.
 
 The JSON controls support the subset listed above. Unsupported constraint
 dictionaries already present in project JSON can be saved and reopened for
@@ -157,7 +247,8 @@ SKY130 ALIGN PDK directory containing `models.sp`:
     --repo /path/to/roar --pdk /path/to/ALIGN-pdk-sky130/SKY130_PDK
 ```
 
-This checks both exported examples and ordinary/symmetric xschem rows through
+This checks both numeric examples, the linked OTA companion, and
+ordinary/symmetric xschem rows through
 ALIGN's parser, constraint verification and native placement translation. It
 prints a receipt and writes bundles and logs to a temporary directory. It does
 not run physical placement or routing.

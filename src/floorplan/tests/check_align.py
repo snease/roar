@@ -60,6 +60,14 @@ for relative in ['ota/current_mirror_ota', 'common_source/common_source']:
     result['source_sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
     results['cases'].append(result)
 
+companion = args.repo / 'design/floorplan/ota/cm_ota.floorplan.json'
+project = FloorplanProject.load(companion)
+assert Path(project.roar_project_path) == companion.with_name('cm_ota_sizes.roar')
+assert not project.unresolved_parameters
+result = native(project, output / 'companion')
+result['source_sha256'] = hashlib.sha256(companion.read_bytes()).hexdigest()
+results['cases'].append(result)
+
 base = '.subckt XSCHEM d g s b\nXM1 d g s b sky130_fd_pr__nfet_01v8 W=2.2 L=0.5 NF=2\nXM2 d g s b sky130_fd_pr__nfet_01v8 W=2.2 L=0.5 NF=2\n.ends XSCHEM\n'
 for symmetrize in [False, True]:
     project = FloorplanProject.from_text(base, dimension_unit='um', width_convention='total')

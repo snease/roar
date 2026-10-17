@@ -14,13 +14,31 @@ from pathlib import Path
 import re
 import tempfile
 
-from parse_netlist import MOSFETInstance, _split_tokens, parse_spice_netlist
+from parse_netlist import MOSFETInstance, _parse_parameters, _split_tokens, parse_spice_netlist
 
 
 _SUFFIX = {'': 1, 't': 1e12, 'g': 1e9, 'meg': 1e6, 'k': 1e3,
            'm': 1e-3, 'u': 1e-6, 'n': 1e-9, 'p': 1e-12, 'f': 1e-15}
 _NUMBER = re.compile(r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(meg|[tgkmunpf])?', re.I)
+_SIMULATION_PARAMETERS = {'AD', 'AS', 'PD', 'PS', 'NRD', 'NRS', 'SA', 'SB', 'SD'}
+_IDENTIFIER = re.compile(r'[A-Za-z_]\w*')
 _PARAMETER = re.compile(r"([A-Za-z_]\w*)\s*=\s*('[^']*'|[^\s'=]+)")
+
+
+def _assignments(section, label):
+    """Bound the shared parser's key=value syntax without evaluating values."""
+    names, position = [], 0
+    for match in _PARAMETER.finditer(section):
+        gap = section[position:match.start()]
+        if gap.strip() or (position and not gap):
+            raise ValueError(f'{label}: malformed MOS parameter assignments')
+        names.append(match[1].upper())
+        position = match.end()
+    if section[position:].strip():
+        raise ValueError(f'{label}: malformed MOS parameter assignments')
+    if len(set(names)) != len(names):
+        raise ValueError(f'{label}: duplicate parameter names')
+    return _parse_parameters(section)
 
 
 def _positive(value, label):
@@ -118,6 +136,7 @@ class Device:
     nf: int | None = None
     parameters: dict = field(default_factory=dict)
     value: str = ''
+    symbols: dict = field(default_factory=dict)
 
 
 class FloorplanProject:
@@ -181,18 +200,7 @@ class FloorplanProject:
                     raise ValueError(f'{tokens[0]}: only flat four-terminal MOS devices are supported; hierarchy is unsupported')
                 # The shared tokenizer keeps quoted xschem expressions intact.
                 # Bound its parameter section without evaluating any expression.
-                section = ' '.join(tokens[6:])
-                parameter_names, position = [], 0
-                for match in _PARAMETER.finditer(section):
-                    gap = section[position:match.start()]
-                    if gap.strip() or (position and not gap):
-                        raise ValueError(f'{tokens[0]}: malformed MOS parameter assignments')
-                    parameter_names.append(match[1].upper())
-                    position = match.end()
-                if section[position:].strip():
-                    raise ValueError(f'{tokens[0]}: malformed MOS parameter assignments')
-                if len(set(parameter_names)) != len(parameter_names):
-                    raise ValueError(f'{tokens[0]}: duplicate MOS parameter names')
+                _assignments(' '.join(tokens[6:]), tokens[0])
             elif len(tokens) != 4 or any('=' in token for token in tokens):
                 raise ValueError(f'{tokens[0]}: only two-terminal numeric resistors are supported')
         # Feed only the validated selection to the shared parser. This also
@@ -208,38 +216,45 @@ class FloorplanProject:
         project.source_netlist, project.top = source, circuit.name
         project.dimension_unit, project.width_convention = dimension_unit, width_convention
         project.ports, project.devices, project.constraints = list(circuit.ports), [], []
+        project._sizing, project._parameters, project._overrides = {}, {}, {}
+        project.omitted_parameters = {}
+        project._roar_project_path = None
         for instance in circuit.instances:
             if isinstance(instance, MOSFETInstance):
-                params = {key.upper(): value for key, value in instance.parameters.items()}
+                params = {key.upper(): value.strip() for key, value in instance.parameters.items()}
                 if not {'W', 'L', 'NF'} <= params.keys():
-                    raise ValueError(f'{instance.name}: concrete W, L and NF are required')
-                unresolved = [f'{key}={params[key]!r}' for key in ('W', 'L', 'NF')
-                              if not _NUMBER.fullmatch(str(params[key]).strip())]
-                if unresolved:
-                    raise ValueError(f'{instance.name}: unresolved sizing parameters {", ".join(unresolved)}. '
-                                     'Use a resolved sizing netlist with numeric W/L/NF; symbolic xschem parameters '
-                                     'are not evaluated. For the geometry-only OTA example, use '
-                                     'design/floorplan/ota/current_mirror_ota.sp.')
-                unknown = set(params) - {'W', 'L', 'NF', 'M'}
+                    raise ValueError(f'{instance.name}: W, L and NF are required, as numbers or simple parameter names')
+                if 'M' in params and 'MULT' in params:
+                    raise ValueError(f'{instance.name}: M and mult together are ambiguous; provide one multiplicity only')
+                if 'MULT' in params:
+                    params['M'] = params.pop('MULT')
+                omitted = set(params) & _SIMULATION_PARAMETERS if instance.model.lower().startswith('sky130_') else set()
+                unknown = set(params) - {'W', 'L', 'NF', 'M'} - omitted
                 if unknown:
-                    raise ValueError(f'{instance.name}: unsupported MOS parameters {", ".join(sorted(unknown))}; provide W/L/NF and optional M only')
-                nf = _fingers(params['NF'])
-                width = _dimension(params['W'], dimension_unit, f'{instance.name} W')
-                if width_convention == 'total':
-                    width /= nf
-                extra = {}
-                if 'M' in params:
-                    multiplier = _scalar(params['M'], f'{instance.name} M')
-                    if not multiplier.is_integer():
-                        raise ValueError(f'{instance.name}: M must be a positive integer for the SKY130 generator')
-                    extra['M'] = int(multiplier)
+                    raise ValueError(f'{instance.name}: unsupported MOS parameters {", ".join(sorted(unknown))}')
+                if omitted:
+                    project.omitted_parameters[instance.name] = sorted(omitted)
+                sizing = {key: value for key, value in params.items() if key in {'W', 'L', 'NF', 'M'}}
+                symbols = {}
+                for role, value in sizing.items():
+                    if _NUMBER.fullmatch(value):
+                        continue
+                    if not _IDENTIFIER.fullmatch(value):
+                        raise ValueError(f'{instance.name} {role}={value!r}: only numbers or simple parameter names are supported; '
+                                         'resolve arithmetic expressions before import')
+                    # SPICE symbols are case-insensitive; preserve first spelling.
+                    existing = next((name for name in project._parameters if name.upper() == value.upper()), value)
+                    symbols[role] = existing
+                    project._parameters.setdefault(existing, {'value': None, 'dimension_unit': dimension_unit,
+                        'width_convention': width_convention, 'source': 'unresolved', 'binding': None})
+                project._sizing[instance.name] = sizing
                 project.devices.append(Device(instance.name, 'mos',
-                    (instance.drain, instance.gate, instance.source, instance.body), instance.model,
-                    width, _dimension(params['L'], dimension_unit, f'{instance.name} L'), nf, extra))
+                    (instance.drain, instance.gate, instance.source, instance.body), instance.model, symbols=symbols))
             else:
                 value = instance.nodes[2]
                 _scalar(value, f'{instance.name} resistance')
                 project.devices.append(Device(instance.name, 'resistor', tuple(instance.nodes[:2]), value=value))
+        project.devices = project._rebuild(project._parameters)
         if len(project.devices) != len(selected_lines):
             raise ValueError('The selected circuit contains unsupported or unparsed lines')
         names = [device.name.upper() for device in project.devices]
@@ -253,12 +268,203 @@ class FloorplanProject:
                 return device
         raise ValueError(f'Unknown circuit instance {name!r}')
 
+    @property
+    def roar_project_path(self):
+        return self._roar_project_path
+
+    @roar_project_path.setter
+    def roar_project_path(self, value):
+        self._roar_project_path = str(Path(value).expanduser().resolve()) if value else None
+
+    @property
+    def parameter_rows(self):
+        rows = []
+        for symbol, record in self._parameters.items():
+            usages = [(device.name, role) for device in self.devices for role, name in device.symbols.items() if name == symbol]
+            rows.append(dict(deepcopy(record), symbol=symbol, roles=sorted({role for _, role in usages}),
+                             usages=[f'{name}.{role}' for name, role in usages]))
+        return rows
+
+    @property
+    def unresolved_parameters(self):
+        return [symbol for symbol, record in self._parameters.items() if record['value'] is None]
+
+    def _symbol(self, symbol):
+        for name in self._parameters:
+            if name.upper() == str(symbol).upper():
+                return name
+        raise ValueError(f'Unknown sizing parameter {symbol!r}')
+
+    def _rebuild(self, parameters, overrides=None):
+        """Resolve a candidate snapshot without modifying state on failure."""
+        devices = deepcopy(self.devices)
+        overrides = self._overrides if overrides is None else overrides
+        for row in self.parameter_rows:
+            roles = set(row['roles'])
+            if roles & {'W', 'L'} and roles & {'NF', 'M'}:
+                raise ValueError(f"{row['symbol']}: one symbol cannot represent both a dimension and a count")
+        for device in devices:
+            if device.kind != 'mos':
+                continue
+            resolved = {}
+            conventions = {}
+            for role, literal in self._sizing[device.name].items():
+                if role in device.symbols:
+                    record = parameters[device.symbols[role]]
+                else:
+                    record = {'value': literal, 'dimension_unit': self.dimension_unit,
+                              'width_convention': self.width_convention}
+                value = record['value']
+                conventions[role] = record['width_convention']
+                if value is None:
+                    resolved[role] = None
+                elif role in ('W', 'L'):
+                    resolved[role] = _dimension(value, record['dimension_unit'], f'{device.name} {role}')
+                elif role == 'NF':
+                    resolved[role] = _fingers(value)
+                else:
+                    multiplier = _scalar(value, f'{device.name} M')
+                    if not multiplier.is_integer():
+                        raise ValueError(f'{device.name}: M must be a positive integer for the SKY130 generator')
+                    resolved[role] = int(multiplier)
+            changes = overrides.get(device.name, {})
+            if 'nf' in changes:
+                resolved['NF'] = changes['nf']
+            width = resolved['W']
+            if conventions['W'] == 'total':
+                width = width / resolved['NF'] if width is not None and resolved['NF'] is not None else None
+            device.width_um, device.length_um, device.nf = width, resolved['L'], resolved['NF']
+            device.parameters = {'M': resolved['M']} if 'M' in resolved else {}
+            for key, value in changes.items():
+                setattr(device, key, value)
+        return devices
+
+    def _set_parameter_record(self, symbol, record, parameters):
+        symbol = self._symbol(symbol)
+        _convention(record['width_convention'])
+        if record['dimension_unit'] not in ('m', 'um'):
+            raise ValueError('dimension_unit must be m or um')
+        if record['value'] is not None:
+            value = record['value']
+            record['value'] = _scalar(value, symbol)
+            if any(role in ('W', 'L') for device in self.devices for role, name in device.symbols.items() if name == symbol):
+                match = _NUMBER.fullmatch(str(value).strip())
+                if match[2] and record['dimension_unit'] == 'um':
+                    record['value'] *= 1e6
+        parameters[symbol] = record
+
+    def set_parameter(self, symbol, value, dimension_unit='m', width_convention='total'):
+        parameters = deepcopy(self._parameters)
+        self._set_parameter_record(symbol, {'value': value, 'dimension_unit': dimension_unit,
+            'width_convention': width_convention, 'source': 'manual' if value is not None else 'unresolved', 'binding': None}, parameters)
+        devices = self._rebuild(parameters)
+        self._parameters, self.devices = parameters, devices
+
+    def import_parameters(self, path, dimension_unit='m', width_convention='total'):
+        """Import numeric .param assignments atomically; return unused names.
+
+        Only comments, continuations and .param lines are accepted. No include,
+        expression evaluation, or implicit normalization of invalid NF occurs.
+        """
+        path = Path(path).expanduser().resolve()
+        _convention(width_convention)
+        if dimension_unit not in ('m', 'um'):
+            raise ValueError('dimension_unit must be m or um')
+        lines = []
+        for raw in path.read_text(encoding='utf-8').splitlines():
+            line = raw.strip()
+            if not line or line.startswith('*'):
+                continue
+            if line.startswith('+'):
+                if not lines:
+                    raise ValueError('Parameter continuation without a preceding .param line')
+                lines[-1] += ' ' + line[1:].strip()
+            else:
+                lines.append(line)
+        if not lines:
+            raise ValueError('No .param assignments found')
+        parameters, seen, unused = deepcopy(self._parameters), set(), []
+        symbols = {name.upper(): name for name in parameters}
+        for line in lines:
+            tokens = _split_tokens(line)
+            if not tokens or tokens[0].lower() != '.param' or len(tokens) == 1:
+                raise ValueError('Parameter files support .param assignments only; includes and other directives are unsupported')
+            for name, value in _assignments(' '.join(tokens[1:]), path.name).items():
+                if name.upper() in seen:
+                    raise ValueError(f'{path.name}: duplicate parameter {name}')
+                seen.add(name.upper())
+                if name.upper() not in symbols:
+                    unused.append(name)
+                    continue
+                self._set_parameter_record(symbols[name.upper()], {'value': value, 'dimension_unit': dimension_unit,
+                    'width_convention': width_convention, 'source': f'parameters: {path}', 'binding': None}, parameters)
+        devices = self._rebuild(parameters)
+        self._parameters, self.devices = parameters, devices
+        return unused
+
+    @staticmethod
+    def _roar_value(design, instance, attribute):
+        row = next((row for row in design.instances if row['Instance'] == instance), None)
+        if row is None or row.get('disabled'):
+            raise ValueError(f'Choose an enabled ROAR instance row: {instance}')
+        attrs = design.get_instance_parameters().get(instance, {})
+        key = next((key for key in attrs if key.upper() == attribute.upper()), None)
+        if key is None:
+            raise ValueError(f'ROAR {instance}.{attribute} has no concrete assigned value')
+        info = attrs[key]
+        _scalar(info['value'], f'ROAR {instance}.{attribute}')
+        return info['value'], info.get('source', 'assigned')
+
+    def bind_parameter(self, design, symbol, source_instance, attribute, dimension_unit='m', width_convention='total', source='live'):
+        if source not in ('live', 'linked'):
+            raise ValueError('Binding source must be live or linked')
+        value, origin = self._roar_value(design, source_instance, attribute)
+        parameters = deepcopy(self._parameters)
+        self._set_parameter_record(symbol, {'value': value, 'dimension_unit': dimension_unit,
+            'width_convention': width_convention, 'source': f'ROAR {source}: {source_instance}.{attribute} ({origin})',
+            'binding': {'instance': source_instance, 'attribute': attribute, 'source': source}}, parameters)
+        devices = self._rebuild(parameters)
+        self._parameters, self.devices = parameters, devices
+
+    def refresh_bindings(self, design, source='live'):
+        if source not in ('live', 'linked'):
+            raise ValueError('Binding source must be live or linked')
+        parameters = deepcopy(self._parameters)
+        for symbol, record in parameters.items():
+            binding = record['binding']
+            if binding and binding['source'] == source:
+                value, origin = self._roar_value(design, binding['instance'], binding['attribute'])
+                record['value'] = value
+                self._set_parameter_record(symbol, record, parameters)
+                record['source'] = f"ROAR {source}: {binding['instance']}.{binding['attribute']} ({origin})"
+                binding['source'] = source
+        devices = self._rebuild(parameters)
+        self._parameters, self.devices = parameters, devices
+
     def set_mos_parameters(self, name, width_um, length_um, nf):
         device = self._device(name)
         if device.kind != 'mos':
             raise ValueError(f'{name} is not a MOS device')
-        width, length, fingers = _positive(width_um, 'W per finger'), _positive(length_um, 'L'), _fingers(nf)
-        device.width_um, device.length_um, device.nf = width, length, fingers
+        changes = {}
+        for role, field_name, value in (('W', 'width_um', width_um), ('L', 'length_um', length_um), ('NF', 'nf', nf)):
+            current = getattr(device, field_name)
+            if role in device.symbols:
+                if value != current:
+                    raise ValueError(f'{name}.{role} is controlled by shared parameter {device.symbols[role]}; edit or bind that parameter instead')
+                continue
+            if role == 'W' and value is None and current is None and device.nf is None:
+                continue  # Numeric total W is still pending its shared NF.
+            value = _fingers(value) if role == 'NF' else _positive(value, f'{name} {role}')
+            if value != current:
+                changes[field_name] = value
+        if not changes:
+            return
+        if 'nf' in changes and 'W' not in device.symbols and width_um is not None:
+            changes['width_um'] = _positive(width_um, f'{name} W per finger')
+        overrides = deepcopy(self._overrides)
+        overrides.setdefault(device.name, {}).update(changes)
+        devices = self._rebuild(self._parameters, overrides)
+        self._overrides, self.devices = overrides, devices
 
     def import_roar_parameters(self, design, source_instance, targets, dimension_unit='m', width_convention='total'):
         """Copy concrete assigned W/L/NF from one explicitly chosen ROAR row.
@@ -285,6 +491,8 @@ class FloorplanProject:
         devices = [self._device(target) for target in targets]
         if any(device.kind != 'mos' for device in devices):
             raise ValueError('ROAR size targets must all be MOS instances')
+        if any(device.symbols for device in devices):
+            raise ValueError('Targets use shared parameters; bind those parameters explicitly instead')
         for device in devices:
             self.set_mos_parameters(device.name, width, length, nf)
 
@@ -300,11 +508,15 @@ class FloorplanProject:
         del self.constraints[index]
 
     def validate(self):
+        if self.unresolved_parameters:
+            raise ValueError('Unresolved sizing parameters: ' + ', '.join(self.unresolved_parameters) + '; assign numeric values or bind ROAR fields before export')
         for device in self.devices:
             if device.kind == 'mos':
                 _positive(device.width_um, f'{device.name} W')
                 _positive(device.length_um, f'{device.name} L')
                 _fingers(device.nf)
+                if device.parameters.get('M', 1) is None:
+                    raise ValueError(f'{device.name}: unresolved M')
         self._validate_constraints(self.constraints)
 
     def _validate_constraints(self, constraints):
@@ -331,7 +543,7 @@ class FloorplanProject:
             ids([name for pair in pairs for name in pair])
             for pair in pairs:
                 devices = ids(pair)
-                if len(devices) == 2:
+                if len(devices) == 2 and all(d.kind != 'mos' or (d.width_um is not None and d.length_um is not None and d.nf is not None and d.parameters.get('M', 1) is not None) for d in devices):
                     # Compare the exact SI strings written to ALIGN, so harmless
                     # arithmetic rounding during ROAR import cannot break a pair.
                     signatures = [(d.kind, d.model.upper(),
@@ -387,18 +599,56 @@ class FloorplanProject:
                     raise ValueError(f'{kind} ports must be unique')
 
     def to_dict(self):
-        return {'version': 1, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
+        return {'version': 2, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
                 'top': self.top, 'dimension_unit': self.dimension_unit, 'width_convention': self.width_convention,
                 'devices': [{'name': d.name, 'width_um': d.width_um, 'length_um': d.length_um, 'nf': d.nf}
-                            for d in self.devices if d.kind == 'mos'], 'constraints': deepcopy(self.constraints)}
+                            for d in self.devices if d.kind == 'mos'], 'constraints': deepcopy(self.constraints),
+                'parameters': deepcopy(self._parameters), 'overrides': deepcopy(self._overrides),
+                'roar_project_path': self.roar_project_path}
 
     @classmethod
     def from_dict(cls, state):
         expected = {'version', 'source_netlist', 'source_path', 'top', 'dimension_unit', 'width_convention', 'devices', 'constraints'}
-        if not isinstance(state, dict) or state.get('version') != 1 or set(state) != expected:
+        if isinstance(state, dict) and state.get('version') == 2:
+            expected |= {'parameters', 'overrides', 'roar_project_path'}
+        if not isinstance(state, dict) or state.get('version') not in (1, 2) or set(state) != expected:
             raise ValueError('Unsupported or malformed floorplan project version/fields')
         project = cls.from_text(state['source_netlist'], state['top'], state['dimension_unit'], state['width_convention'])
         project.source_path = state['source_path']
+        if state['version'] == 2:
+            link = state['roar_project_path']
+            if link is not None and (not isinstance(link, str) or not Path(link).is_absolute()):
+                raise ValueError('In-memory ROAR project links must be absolute; use load() for relative sidecar links')
+            project.roar_project_path = link
+            records = state['parameters']
+            if not isinstance(records, dict) or set(records) != set(project._parameters):
+                raise ValueError('Saved parameters do not match the source circuit symbols')
+            parameters = deepcopy(project._parameters)
+            for symbol, record in records.items():
+                if not isinstance(record, dict) or set(record) != {'value', 'dimension_unit', 'width_convention', 'source', 'binding'}:
+                    raise ValueError('Malformed saved parameter record')
+                if not isinstance(record['source'], str):
+                    raise ValueError('Parameter provenance must be text')
+                binding = record['binding']
+                if binding is not None and (not isinstance(binding, dict) or set(binding) != {'instance', 'attribute', 'source'} or
+                                             any(not isinstance(v, str) or not v for v in binding.values()) or binding.get('source') not in ('live', 'linked')):
+                    raise ValueError('Malformed ROAR parameter binding')
+                project._set_parameter_record(symbol, deepcopy(record), parameters)
+            project._parameters = parameters
+            overrides = state['overrides']
+            if not isinstance(overrides, dict):
+                raise ValueError('Malformed saved numeric device overrides')
+            for name, changes in overrides.items():
+                device = project._device(name)
+                if name != device.name or device.kind != 'mos' or not isinstance(changes, dict) or set(changes) - {'width_um', 'length_um', 'nf'}:
+                    raise ValueError('Malformed saved numeric device overrides')
+                for field_name, value in changes.items():
+                    role = {'width_um': 'W', 'length_um': 'L', 'nf': 'NF'}[field_name]
+                    if role in device.symbols:
+                        raise ValueError(f'{name}.{role}: numeric override conflicts with a shared parameter')
+                    _fingers(value) if role == 'NF' else _positive(value, f'{name} {role}')
+            project._overrides = deepcopy(overrides)
+            project.devices = project._rebuild(parameters)
         sizes = state['devices']
         expected_names = {device.name for device in project.devices if device.kind == 'mos'}
         if not isinstance(sizes, list) or any(not isinstance(row, dict) or set(row) != {'name', 'width_um', 'length_um', 'nf'} for row in sizes):
@@ -406,7 +656,13 @@ class FloorplanProject:
         if len(sizes) != len(expected_names) or {row['name'] for row in sizes} != expected_names:
             raise ValueError('Saved sizes do not match the source circuit instances')
         for row in sizes:
-            project.set_mos_parameters(**row)
+            device = project._device(row['name'])
+            if state['version'] == 2:
+                actual = {'name': device.name, 'width_um': device.width_um, 'length_um': device.length_um, 'nf': device.nf}
+                if row != actual:
+                    raise ValueError(f'{device.name}: saved sizes conflict with source parameters or overrides')
+            else:
+                project.set_mos_parameters(**row)
         constraints = state['constraints']
         if not isinstance(constraints, list) or any(not isinstance(c, dict) for c in constraints):
             raise ValueError('Saved constraints must be native dictionaries')
@@ -415,22 +671,33 @@ class FloorplanProject:
 
     def save(self, path):
         path = Path(path).expanduser().resolve()
+        if path.suffix.lower() == '.roar' or (self.roar_project_path and path == Path(self.roar_project_path)):
+            raise ValueError('Floorplan save cannot overwrite a ROAR project')
         if self.source_path and path == Path(self.source_path):
             raise ValueError('Project save cannot overwrite the source netlist')
-        content = json.dumps(self.to_dict(), indent=2, allow_nan=False) + '\n'
+        state = self.to_dict()
+        if self.roar_project_path:
+            state['roar_project_path'] = os.path.relpath(self.roar_project_path, path.parent)
+        content = json.dumps(state, indent=2, allow_nan=False) + '\n'
         path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, encoding='utf-8', delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(content)
+        temporary = None
         try:
+            with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, encoding='utf-8', delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
             os.replace(temporary, path)
         finally:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return path
 
     @classmethod
     def load(cls, path):
-        return cls.from_dict(json.loads(Path(path).expanduser().read_text(encoding='utf-8')))
+        path = Path(path).expanduser().resolve()
+        state = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(state, dict) and state.get('version') == 2 and state.get('roar_project_path'):
+            state['roar_project_path'] = str((path.parent / state['roar_project_path']).resolve())
+        return cls.from_dict(state)
 
     def export_align(self, directory):
         """Write a new two-file bundle, refusing collisions or source overwrites.
@@ -439,8 +706,10 @@ class FloorplanProject:
         provides a primitive generator (notably for resistors).
         """
         self.validate()
-        lines = ['* ROAR floorplan export: SI dimensions; W is per finger',
-                 '.subckt ' + self.top + ' ' + ' '.join(self.ports)]
+        lines = ['* ROAR floorplan export: SI dimensions; W is per finger']
+        for name, parameters in self.omitted_parameters.items():
+            lines.append('* Layout export omits SKY130 simulation parameters for ' + name + ': ' + ', '.join(parameters))
+        lines.append('.subckt ' + self.top + ' ' + ' '.join(self.ports))
         for device in self.devices:
             prefix = device.name + ' ' + ' '.join(device.terminals)
             if device.kind == 'mos':
@@ -455,10 +724,12 @@ class FloorplanProject:
         netlist_text = '\n'.join(lines) + '\n'
         constraint_text = json.dumps(self.constraints, indent=2, allow_nan=False) + '\n'
         destination = Path(directory).expanduser().resolve() / self.top
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.mkdir()  # no reuse of stale or partially matching artifacts
         netlist = destination / (self.top + '.sp')
         constraints = destination / (self.top + '.const.json')
+        if any(value and Path(value) in (netlist, constraints) for value in (self.source_path, self.roar_project_path)):
+            raise ValueError('ALIGN export cannot overwrite the source netlist or linked ROAR project')
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.mkdir()  # no reuse of stale or partially matching artifacts
         try:
             netlist.write_text(netlist_text, encoding='utf-8')
             constraints.write_text(constraint_text, encoding='utf-8')
