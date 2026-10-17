@@ -1,9 +1,10 @@
-"""Verify ROAR exports with an independently installed ALIGN (no placement run)."""
+"""Verify native ALIGN exports; optionally check representative placed geometry."""
 import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 
@@ -11,6 +12,7 @@ args = argparse.ArgumentParser(description=__doc__)
 args.add_argument('--repo', type=Path, required=True)
 args.add_argument('--pdk', type=Path, required=True)
 args.add_argument('--output', type=Path)
+args.add_argument('--placement', action='store_true', help='Generate representative native placements and verify geometry/compiled effects')
 args = args.parse_args()
 args.repo = args.repo.resolve()
 args.pdk = args.pdk.resolve()
@@ -24,6 +26,35 @@ import align
 from align.schema.parser import SpiceParser
 from align.compiler.user_const import ConstraintParser
 from align.pnr.write_constraint import PnRConstraintWriter
+
+PAIR = '''.subckt pair d1 d2 g s b
+M1 d1 g s b sky130_fd_pr__nfet_01v8 W=1u L=0.15u NF=2
+M2 d2 g s b sky130_fd_pr__nfet_01v8 W=1u L=0.15u NF=2
+.ends pair
+'''
+CAPABILITIES = [
+    {'constraint': 'Boundary', 'max_width': 50, 'max_height': 40, 'halo_horizontal': 1.5, 'halo_vertical': 2},
+    {'constraint': 'AspectRatio', 'ratio_low': 0.5, 'ratio_high': 2, 'weight': 2},
+    {'constraint': 'Spread', 'instances': ['M1', 'M2'], 'direction': 'horizontal', 'distance': 420},
+    {'constraint': 'BlockDistance', 'abs_distance': 420},
+    {'constraint': 'HorizontalDistance', 'abs_distance': 420},
+    {'constraint': 'VerticalDistance', 'abs_distance': 280},
+    {'constraint': 'SameTemplate', 'instances': ['M1', 'M2']},
+    {'constraint': 'AlignInOrder', 'instances': ['M1', 'M2'], 'line': 'center', 'direction': 'vertical', 'abut': False},
+    {'constraint': 'PortLocation', 'ports': ['d1'], 'location': 'TC'},
+    {'constraint': 'SymmetricNets', 'net1': 'd1', 'net2': 'd2', 'pins1': ['M1/D', 'd1'], 'pins2': ['M2/D', 'd2'], 'direction': 'V'},
+    {'constraint': 'ClockPorts', 'ports': ['g'], 'propagate': False},
+    {'constraint': 'DoNotIdentify', 'instances': ['M1']},
+    {'constraint': 'ConfigureCompiler', 'merge_series_devices': False, 'merge_parallel_devices': False, 'auto_constraint': False},
+]
+EXPORT_ONLY = [
+    {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 2},
+    {'constraint': 'NetConst', 'nets': ['d1'], 'shield': 's', 'criticality': 3},
+    {'constraint': 'MultiConnection', 'nets': ['d1'], 'multiplier': 2},
+    {'constraint': 'DoNotRoute', 'nets': ['s']},
+    {'constraint': 'DoNotUseLib', 'libraries': ['dp_nmos'], 'propagate': True},
+    {'constraint': 'Route', 'min_layer': 'm1', 'max_layer': 'm4', 'customize': [{'nets': ['d1'], 'match': True}]},
+]
 
 results = {'align_version': align.__version__, 'align_module': align.__file__,
            'pdk': str(args.pdk.resolve()), 'repo': str(args.repo.resolve()), 'cases': []}
@@ -50,7 +81,9 @@ def native(project, parent):
     (netlist.parent / 'native.pnr.constraints.json').write_text(json.dumps(mapped, indent=2)+'\n')
     return {'top': top.name, 'devices': len(top.elements), 'status': 'PASS',
             'bundle': str(netlist.parent), 'native_constraints': len(mapped['constraints']),
-            'native_kinds': [item['const_name'] for item in mapped['constraints']]}
+            'native_kinds': [item['const_name'] for item in mapped['constraints']],
+            'native_mapping': mapped['constraints'],
+            'annotated_constraints': [item.dict() for item in top.constraints]}
 
 for relative in ['ota/current_mirror_ota']:
     source = args.repo / 'examples/floorplan' / (relative + '.sp')
@@ -76,13 +109,178 @@ for symmetrize in [False, True]:
     results['cases'].append(native(project, output / ('rows-symmetric' if symmetrize else 'rows')))
     assert project.devices[0].width_um == 1.1
 
-for bad in ['NF=1', 'NF=3', 'NF=2 M=0.5']:
+for nf in [1, 3]:
+    draft = FloorplanProject.from_text(base.replace('NF=2', f'NF={nf}'), dimension_unit='um')
+    assert FloorplanProject.from_dict(draft.to_dict()).devices[0].nf == nf
+results['repairable_draft_fingers'] = [1, 3]
+for bad in ['NF=0', 'NF=2.5', 'NF=2 M=0.5']:
     try:
         FloorplanProject.from_text(base.replace('NF=2', bad), dimension_unit='um')
     except ValueError:
         pass
     else:
         raise AssertionError('Invalid generator size accepted: ' + bad)
-results['rejected_sizes'] = ['NF=1', 'NF=3', 'M=0.5']
+results['rejected_sizes'] = ['NF=0', 'NF=2.5', 'M=0.5']
+
+for rule in CAPABILITIES + EXPORT_ONLY:
+    project = FloorplanProject.from_text(PAIR)
+    project.set_constraints([rule])
+    result = native(project, output / ('native-' + rule['constraint']))
+    result['rule'] = rule
+    mapped = result['native_mapping']
+    kind = rule['constraint']
+    if kind == 'PortLocation':
+        assert mapped == [{'const_name': 'PortLocation', 'location': 'TC', 'terminal_name': 'D1'}]
+    elif kind == 'NetConst':
+        assert mapped == [{'const_name': 'ShieldNet', 'net_name': 'D1', 'shield_net': 'S'},
+                          {'const_name': 'CritNet', 'net_name': 'D1', 'priority': 3}]
+    elif kind == 'Route':
+        assert mapped[0]['min_layer'] == 'M1' and mapped[0]['max_layer'] == 'M4'
+        assert mapped[0]['customize'][0]['nets'] == ['D1']
+    elif kind == 'DoNotUseLib':
+        assert result['annotated_constraints'][0]['libraries'] == ['DP_NMOS']
+    results['cases'].append(result)
+
+
+def placed_boxes(data, module):
+    templates = {row['concrete_name']: row['bbox'] for row in data['leaves'] + data['modules']}
+    boxes = {}
+    for instance in module['instances']:
+        llx, lly, urx, ury = templates[instance['concrete_template_name']]
+        transform = instance['transformation']
+        xs = [transform['oX'] + transform['sX'] * x for x in (llx, urx)]
+        ys = [transform['oY'] + transform['sY'] * y for y in (lly, ury)]
+        boxes[instance['instance_name']] = [min(xs), min(ys), max(xs), max(ys)]
+    return boxes
+
+
+def terminal_positions(path):
+    """Read native placer terminal coordinates, in its original database units."""
+    positions, die = {}, None
+    for line in path.read_text().splitlines():
+        if line.startswith('DIE '):
+            die = [int(value) for value in re.findall(r'-?\d+', line)]
+        fields = line.split()
+        if len(fields) == 3:
+            positions[fields[0]] = [int(value) for value in fields[1:]]
+    assert die is not None, path
+    return die, positions
+
+
+def placement_case(name, rules, verify, source=PAIR, compiler_controls=True):
+    project = FloorplanProject.from_text(source)
+    if compiler_controls:
+        rules = [
+            {'constraint': 'ConfigureCompiler', 'auto_constraint': False,
+             'merge_series_devices': False, 'merge_parallel_devices': False},
+            {'constraint': 'DoNotIdentify', 'instances': ['M1', 'M2']},
+        ] + rules
+    project.set_constraints(rules)
+    netlist, _ = project.export_align(output / name / 'input')
+    work = output / name / 'run'
+    work.mkdir()
+    align.schematic2layout(netlist_dir=netlist.parent, pdk_dir=args.pdk, subckt=project.top,
+        working_dir=work, nvariants=4, placer_sa_iterations=100, seed=0,
+        gui=False, flow_stop='3_pnr:place')
+    dump = work / '3_pnr/__placer_dump__.json'
+    top, _leaves, variants, _metrics = json.loads(dump.read_text())
+    records = []
+    for concrete, data in variants:
+        module = next(row for row in data['modules'] if row['abstract_name'] == top)
+        boxes = placed_boxes(data, module)
+        die, terminals = terminal_positions(work / '3_pnr/Results' / (concrete + '.pl'))
+        verify(module, boxes, die, terminals)
+        records.append({'variant': concrete, 'bbox_nm': module['bbox'], 'instance_boxes_nm': boxes,
+                        'terminal_positions_database_units': terminals})
+    assert records, f'No placement candidates for {name}'
+    compiled = json.loads((work / '1_topology' / (project.top.lower() + '.const.json')).read_text())
+    return {'case': name, 'status': 'PASS', 'rules': rules, 'dump': str(dump),
+            'compiled_constraints': compiled, 'verified_candidates': records}
+
+
+if args.placement:
+    results['placements'] = []
+
+    def horizontal(module, boxes, die, terminals):
+        first, second = boxes['X_M1'], boxes['X_M2']
+        assert second[0] - first[2] >= 840, boxes
+        assert first[1] == second[1], boxes
+        width, height = module['bbox'][2:]
+        assert width <= 20000 and height <= 20000 and .5 <= width / height < 2, module['bbox']
+        for llx, lly, urx, ury in boxes.values():
+            assert llx >= 430 and lly >= 420 and urx <= width - 430 and ury <= height - 420, boxes
+        assert len({row['concrete_template_name'] for row in module['instances']}) == 1
+
+    results['placements'].append(placement_case('placement-horizontal', [
+        {'constraint': 'Boundary', 'max_width': 20, 'max_height': 20, 'halo_horizontal': .43, 'halo_vertical': .42},
+        {'constraint': 'AspectRatio', 'ratio_low': .5, 'ratio_high': 2, 'weight': 2},
+        {'constraint': 'AlignInOrder', 'instances': ['M1', 'M2'], 'line': 'bottom', 'direction': 'horizontal'},
+        {'constraint': 'Spread', 'instances': ['M1', 'M2'], 'direction': 'horizontal', 'distance': 420},
+        {'constraint': 'HorizontalDistance', 'abs_distance': 840},
+        {'constraint': 'SameTemplate', 'instances': ['M1', 'M2']},
+    ], horizontal))
+
+    def vertical(module, boxes, die, terminals):
+        first, second = boxes['X_M1'], boxes['X_M2']
+        assert first[1] - second[3] >= 1120, boxes
+        assert first[0] + first[2] == second[0] + second[2], boxes
+
+    results['placements'].append(placement_case('placement-vertical', [
+        {'constraint': 'VerticalDistance', 'abs_distance': 1120},
+        {'constraint': 'AlignInOrder', 'instances': ['M1', 'M2'], 'line': 'center', 'direction': 'vertical'},
+    ], vertical))
+
+    def block_distance(module, boxes, die, terminals):
+        assert boxes['X_M2'][0] - boxes['X_M1'][2] >= 1260, boxes
+
+    results['placements'].append(placement_case('placement-block-distance', [
+        {'constraint': 'BlockDistance', 'abs_distance': 1260},
+        {'constraint': 'AlignInOrder', 'instances': ['M1', 'M2'], 'line': 'bottom', 'direction': 'horizontal'},
+    ], block_distance))
+
+    def spread(module, boxes, die, terminals):
+        assert boxes['X_M2'][0] - boxes['X_M1'][2] >= 1720, boxes
+
+    results['placements'].append(placement_case('placement-spread', [
+        {'constraint': 'Spread', 'instances': ['M1', 'M2'], 'direction': 'horizontal', 'distance': 1720},
+        {'constraint': 'AlignInOrder', 'instances': ['M1', 'M2'], 'line': 'bottom', 'direction': 'horizontal'},
+    ], spread))
+
+    def ports(module, boxes, die, terminals):
+        assert terminals['D1'][1] == die[3] and terminals['D2'][1] == die[1], (die, terminals)
+        for port in ('D1', 'D2'):
+            assert die[2] / 3 <= terminals[port][0] <= 2 * die[2] / 3, (die, terminals)
+
+    results['placements'].append(placement_case('placement-ports', [
+        {'constraint': 'PortLocation', 'ports': ['d1'], 'location': 'TC'},
+        {'constraint': 'PortLocation', 'ports': ['d2'], 'location': 'BC'},
+    ], ports))
+
+    def symmetry(module, boxes, die, terminals):
+        first, second = boxes['X_M1'], boxes['X_M2']
+        assert first[1::2] == second[1::2], boxes
+        assert first[0] + second[2] == first[2] + second[0] == module['bbox'][0] + module['bbox'][2], boxes
+        assert terminals['D1'][1] == terminals['D2'][1], terminals
+        assert terminals['D1'][0] + terminals['D2'][0] == die[0] + die[2], (die, terminals)
+        transforms = [row['transformation'] for row in module['instances']]
+        assert transforms[0]['sX'] == -transforms[1]['sX'] and transforms[0]['sY'] == transforms[1]['sY']
+        assert any(rule['constraint'] == 'SymmetricBlocks' for rule in module['constraints'])
+
+    results['placements'].append(placement_case('placement-net-symmetry', [CAPABILITIES[9]], symmetry))
+
+    def clock(module, boxes, die, terminals):
+        assert any(rule['constraint'] == 'ClockPorts' and rule['ports'] == ['G'] for rule in module['constraints'])
+        assert len(boxes) == 2
+
+    results['placements'].append(placement_case('placement-clock', [CAPABILITIES[10]], clock))
+
+    parallel_source = PAIR.replace('M2 d2', 'M2 d1')
+    for merge in (True, False):
+        def compiler_effect(module, boxes, die, terminals, merge=merge):
+            assert len(boxes) == (1 if merge else 2), boxes
+        results['placements'].append(placement_case('placement-merge-' + str(merge).lower(), [
+            {'constraint': 'ConfigureCompiler', 'auto_constraint': False, 'merge_parallel_devices': merge},
+        ], compiler_effect, source=parallel_source, compiler_controls=False))
+
 (output / 'receipt.json').write_text(json.dumps(results, indent=2) + '\n')
 print(json.dumps(results, indent=2))

@@ -613,7 +613,8 @@ class FloorplanProject:
         flags = [True] * len(candidate) if enabled is None else list(enabled)
         if len(flags) != len(candidate) or any(type(value) is not bool for value in flags):
             raise ValueError('Constraint enabled states must match the constraint rows')
-        self._validate_constraints([constraint for constraint, flag in zip(candidate, flags) if flag])
+        self._validate_constraints([constraint for constraint, flag in zip(candidate, flags) if flag],
+                                   row_numbers=[i + 1 for i, flag in enumerate(flags) if flag])
         self.constraints, self.constraint_enabled = candidate, flags
 
     def add_constraint(self, constraint):
@@ -639,7 +640,8 @@ class FloorplanProject:
                 _multiplicity(device.parameters.get('M', 1), f'{device.name} M')
             else:
                 _scalar(device.value, f'{device.name} resistance')
-        self._validate_constraints(self.active_constraints)
+        self._validate_constraints(self.active_constraints,
+                                   row_numbers=[i + 1 for i, flag in enumerate(self._constraint_flags()) if flag])
 
     def _validate_netlist_identifiers(self):
         """Recheck public mutable fields at the ALIGN serialization boundary."""
@@ -672,9 +674,9 @@ class FloorplanProject:
             if not isinstance(parameters, list) or any(value not in _SIMULATION_PARAMETERS for value in parameters):
                 raise ValueError('Unsupported omitted simulation parameter names')
 
-    def _validate_constraints(self, constraints):
+    def _validate_constraints(self, constraints, *, row_numbers=None):
         from .constraints import validate_constraints
-        validate_constraints(self, constraints)
+        validate_constraints(self, constraints, row_numbers=row_numbers)
 
     def to_dict(self):
         if self.source_mode not in ('saved', 'live', 'linked'):
@@ -834,7 +836,26 @@ class FloorplanProject:
             lines.append(line)
         lines.append('.ends ' + self.top)
         netlist_text = '\n'.join(lines) + '\n'
-        constraint_text = json.dumps(self.active_constraints, indent=2, allow_nan=False) + '\n'
+        native_constraints = deepcopy(self.active_constraints)
+        for constraint in native_constraints:
+            # Unlike most native rules, PortLocation has no case-normalizing
+            # schema validator. Its C++ consumer compares port names exactly.
+            if constraint.get('constraint') == 'PortLocation':
+                constraint['ports'] = [port.upper() for port in constraint['ports']]
+            elif constraint.get('constraint') == 'NetConst':
+                constraint['nets'] = [net.upper() for net in constraint['nets']]
+                if constraint.get('shield') is not None:
+                    constraint['shield'] = constraint['shield'].upper()
+            elif constraint.get('constraint') == 'DoNotUseLib':
+                constraint['libraries'] = [name.upper() for name in constraint['libraries']]
+            elif constraint.get('constraint') == 'Route':
+                for entry in [constraint, *constraint.get('customize', [])]:
+                    for key in ('min_layer', 'max_layer'):
+                        if entry.get(key) is not None:
+                            entry[key] = entry[key].upper()
+                    if 'nets' in entry:
+                        entry['nets'] = [net.upper() for net in entry['nets']]
+        constraint_text = json.dumps(native_constraints, indent=2, allow_nan=False) + '\n'
         destination = Path(directory).expanduser().resolve() / self.top
         netlist = destination / (self.top + '.sp')
         constraints = destination / (self.top + '.const.json')

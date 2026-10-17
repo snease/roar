@@ -1,27 +1,20 @@
 """Typed editors and readable summaries for the supported ALIGN constraints."""
 
 from copy import deepcopy
+import json
+import math
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QListWidget, QPushButton, QTableWidget,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QLineEdit, QScrollArea,
 )
 
 from .model import FloorplanProject
+from .constraints import KINDS, COMPILER_DEFAULTS, PORT_LOCATIONS, HELP, capability_note, net_pins
 
 
-KINDS = {
-    "SymmetricBlocks": ("Symmetry", {"pairs", "direction"}),
-    "Order": ("Relative order", {"instances", "direction", "abut"}),
-    "Align": ("Align centers / edges", {"instances", "line"}),
-    "Floorplan": ("Rows / regions", {"regions", "order", "symmetrize"}),
-    "CompactPlacement": ("Packing", {"style"}),
-    "PlaceCloser": ("Place closer", {"instances"}),
-    "PowerPorts": ("Power ports", {"ports", "propagate"}),
-    "GroundPorts": ("Ground ports", {"ports", "propagate"}),
-}
 LINES = [("Horizontal centers (same y)", "h_center"),
          ("Vertical centers (same x)", "v_center"),
          ("Top edges", "h_top"), ("Bottom edges", "h_bottom"),
@@ -33,9 +26,13 @@ def editable_constraint(constraint):
     if not isinstance(kind, str) or kind not in KINDS or set(constraint) - KINDS[kind][1] - {"constraint"}:
         return False
     if any(key in constraint and type(constraint[key]) is not bool
-           for key in ("abut", "order", "symmetrize", "propagate")):
+           for key in ("abut", "order", "symmetrize", *COMPILER_DEFAULTS)):
         return False
-    for key in ("instances", "ports", "pairs", "regions"):
+    for key in ('max_width', 'max_height', 'halo_horizontal', 'halo_vertical',
+                'ratio_low', 'ratio_high', 'weight', 'distance', 'abs_distance'):
+        if key in constraint and (isinstance(constraint[key], bool) or not isinstance(constraint[key], (int, float)) or not math.isfinite(constraint[key])):
+            return False
+    for key in ("instances", "ports", "pairs", "regions", "pins1", "pins2"):
         if key not in constraint:
             continue
         values = constraint[key]
@@ -49,7 +46,7 @@ def editable_constraint(constraint):
             values = [name for group in values for name in group]
         if any(not isinstance(name, str) for name in values):
             return False
-    if any(key in constraint and not isinstance(constraint[key], str) for key in ("direction", "line", "style")):
+    if any(key in constraint and not isinstance(constraint[key], str) for key in ("direction", "line", "style", 'net1', 'net2', 'location')):
         return False
     enums = {
         "SymmetricBlocks": ("direction", {"H", "V"}, None),
@@ -67,9 +64,12 @@ def editable_constraint(constraint):
 def constraint_summary(constraint):
     """Return three human-readable table cells without changing source data."""
     kind = constraint.get("constraint")
-    title = KINDS[kind][0] if isinstance(kind, str) and kind in KINDS else f"Unsupported: {kind or 'unnamed'}"
+    title = KINDS[kind][0] if isinstance(kind, str) and kind in KINDS else str(kind or 'Unnamed constraint')
     if not editable_constraint(constraint):
-        return title, "Preserved as imported", "Unsupported settings preserved; remove or replace to change them"
+        fields = {k: v for k, v in constraint.items() if k != 'constraint'}
+        note = ('Imported fields preserved; no form supports these settings. Inspect Details or disable this row.'
+                if isinstance(kind, str) and kind in KINDS else capability_note(constraint))
+        return title, json.dumps(fields, ensure_ascii=False), note
     names = ", ".join(constraint.get("instances", constraint.get("ports", [])))
     if kind == "SymmetricBlocks":
         names = "; ".join(" ↔ ".join(pair) if len(pair) > 1 else f"{pair[0]} (on axis)" if pair else "Empty group"
@@ -90,10 +90,34 @@ def constraint_summary(constraint):
         settings = "Final compaction toward " + constraint.get("style", "left")
     elif kind == "PlaceCloser":
         settings = "Prefer nearby placement"
-    else:
+    elif kind in ('PowerPorts', 'GroundPorts', 'ClockPorts'):
         settings = "Propagate to child circuits" if constraint.get("propagate", True) else "This circuit only"
         if constraint.get("ports"):
-            settings += "; first grid port: " + constraint["ports"][0]
+            settings += ("; first grid port: " if kind != 'ClockPorts' else "; clock port: ") + constraint["ports"][0]
+    elif kind == 'SymmetricNets':
+        names = f"{constraint.get('net1', '?')} ↔ {constraint.get('net2', '?')}"
+        settings = 'Shared vertical axis' if constraint.get('direction') == 'V' else 'Shared horizontal axis'
+        settings += f"; {len(constraint.get('pins1', []))} matched pins"
+    elif kind == 'PortLocation':
+        settings = PORT_LOCATIONS.get(constraint.get('location'), 'Choose port region')
+    elif kind == 'Spread':
+        settings = f"{constraint.get('distance', '?')} nm, {constraint.get('direction', '?')}"
+    elif kind in ('BlockDistance', 'HorizontalDistance', 'VerticalDistance'):
+        names, settings = 'Whole circuit', f"{constraint.get('abs_distance', '?')} nm minimum gap"
+    elif kind == 'Boundary':
+        names = 'Whole circuit'
+        settings = '; '.join(f'{key.replace("_", " ")}: {value:g} µm' for key, value in constraint.items() if key != 'constraint') or 'ALIGN defaults'
+    elif kind == 'AspectRatio':
+        names = 'Whole circuit'
+        settings = f"{constraint.get('ratio_low', 0.1):g} ≤ width/height < {constraint.get('ratio_high', 10):g}; weight {constraint.get('weight', 1)}"
+    elif kind == 'AlignInOrder':
+        settings = f"{constraint.get('line', 'bottom')} alignment; {constraint.get('direction') or 'direction from edge'}"
+        settings += '; touching' if constraint.get('abut') else '; spacing allowed'
+    elif kind == 'ConfigureCompiler':
+        names = 'Whole circuit'
+        settings = '; '.join(f'{key.replace("_", " ")}: {"on" if value else "off"}' for key, value in constraint.items() if key != 'constraint') or 'ALIGN defaults'
+    else:
+        settings = capability_note(constraint)
     return title, names, settings
 
 
@@ -275,7 +299,7 @@ class ConstraintEditorDialog(QDialog):
     def __init__(self, project, constraint=None, selected_devices=(), parent=None):
         super().__init__(parent)
         if constraint is not None and not editable_constraint(constraint):
-            raise ValueError("Unsupported settings are preserved unchanged; remove or replace this constraint to change them.")
+            raise ValueError("These fields have no graphical form. Use Details to inspect them or disable the row.")
         self.setWindowTitle("Edit constraint" if constraint is not None else "Add constraint")
         self.setMinimumWidth(660)
         self.project = FloorplanProject.from_dict(project.to_dict())
@@ -291,7 +315,13 @@ class ConstraintEditorDialog(QDialog):
             self.kind.setEnabled(False)
         layout.addWidget(self.kind)
         self.content = QVBoxLayout()
-        layout.addLayout(self.content)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        holder = QWidget()
+        holder.setLayout(self.content)
+        scroll.setWidget(holder)
+        layout.addWidget(scroll)
+        self.resize(760, 650)
         self.error = QLabel()
         self.error.setTextFormat(Qt.TextFormat.PlainText)
         self.error.setWordWrap(True)
@@ -322,6 +352,15 @@ class ConstraintEditorDialog(QDialog):
         self.flags[key] = (flag, default)
         return flag
 
+    def _number_field(self, key, label, default=None, integer=False):
+        original = self.original.get(key, default)
+        field = QLineEdit('' if original is None else str(original))
+        if default is None:
+            field.setPlaceholderText('ALIGN default')
+        self.form.addRow(label, field)
+        self.numbers[key] = (field, integer, default)
+        return field
+
     def _build_form(self, *_args):
         while self.content.count():
             widget = self.content.takeAt(0).widget()
@@ -331,8 +370,15 @@ class ConstraintEditorDialog(QDialog):
         self.form = QFormLayout(page)
         self.content.addWidget(page)
         self.flags = {}
+        self.numbers = {}
         kind = self.kind.currentData()
         devices = [device.name for device in self.project.devices]
+        hint = QLabel(HELP.get(kind, ''))
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.PlainText)
+        self.form.addRow(hint)
+        native = QLabel(f'ALIGN constraint: {kind}')
+        self.form.addRow(native)
         if kind == "SymmetricBlocks":
             self.option = self._choice("Shared symmetry axis:", [("Vertical (left / right)", "V"), ("Horizontal (above / below)", "H")], self.original.get("direction", "V"))
             groups = self.original.get("pairs", [self.selected_devices[index:index + 2] for index in range(0, len(self.selected_devices), 2)])
@@ -349,8 +395,47 @@ class ConstraintEditorDialog(QDialog):
         elif kind == "CompactPlacement":
             self.option = self._choice("Final compaction:", [("Toward left", "left"), ("Toward center", "center"), ("Toward right", "right")], self.original.get("style", "left"))
             self.option.setToolTip("Final placement compaction; sets no fixed boundary or spacing.")
+        elif kind == 'Boundary':
+            for key, label in [('max_width', 'Maximum width (µm):'), ('max_height', 'Maximum height (µm):'),
+                               ('halo_horizontal', 'Left/right margin (µm):'), ('halo_vertical', 'Top/bottom margin (µm):')]:
+                self._number_field(key, label)
+        elif kind == 'AspectRatio':
+            self._number_field('ratio_low', 'Minimum width / height:', 0.1)
+            self._number_field('ratio_high', 'Maximum width / height:', 10)
+            self._number_field('weight', 'Weight:', 1, integer=True)
+        elif kind in ('BlockDistance', 'HorizontalDistance', 'VerticalDistance'):
+            self._number_field('abs_distance', 'Minimum gap (nm):', 0, integer=True)
+        elif kind == 'ConfigureCompiler':
+            labels = {
+                'is_digital': 'Treat this block as digital', 'auto_constraint': 'Infer placement constraints automatically',
+                'identify_array': 'Recognize repeated device arrays', 'fix_source_drain': 'Correct source/drain orientation automatically',
+                'remove_dummy_hierarchies': 'Remove single-instance hierarchies', 'remove_dummy_devices': 'Remove dummy devices',
+                'merge_series_devices': 'Merge series-connected devices', 'merge_parallel_devices': 'Merge parallel-connected devices',
+                'same_template': 'Infer shared templates automatically', 'propagate': 'Apply these settings to child circuits',
+            }
+            for key, default in COMPILER_DEFAULTS.items():
+                self._flag(labels[key], key, default)
+        elif kind == 'SymmetricNets':
+            pins = net_pins(self.project)
+            nets = sorted(pins)
+            self.net_choices, self.pin_editors = [], []
+            for index in (1, 2):
+                key = f'net{index}'
+                choice = self._choice(f'Net {index}:', [(n, n) for n in nets], self.original.get(key, nets[min(index - 1, len(nets) - 1)]) .upper())
+                editor = NamesEditor(pins.get(choice.currentData(), []))
+                editor.items.setMaximumHeight(110)
+                editor.set_names(self.original.get(f'pins{index}', []))
+                def changed(_index, choice=choice, editor=editor):
+                    editor.choice.clear()
+                    editor.choice.addItems(pins.get(choice.currentData(), []))
+                    editor.set_names([])
+                choice.currentIndexChanged.connect(changed)
+                self.net_choices.append(choice)
+                self.pin_editors.append(editor)
+                self.form.addRow(f'Matched pins on net {index} (in order):', editor)
+            self.option = self._choice('Shared symmetry axis:', [('Vertical (left / right)', 'V'), ('Horizontal (above / below)', 'H')], self.original.get('direction', 'V'))
         else:
-            ports = kind in ("PowerPorts", "GroundPorts")
+            ports = kind in ("PowerPorts", "GroundPorts", 'ClockPorts', 'PortLocation')
             key = "ports" if ports else "instances"
             self.names_editor = NamesEditor(self.project.ports if ports else devices)
             self.names_editor.set_names(self.original.get(key, [] if ports else self.selected_devices))
@@ -363,11 +448,21 @@ class ConstraintEditorDialog(QDialog):
             elif kind == "Align":
                 self.option = self._choice("Align:", LINES, self.original.get("line", "h_center"))
                 self.option.setToolTip("Selected centers or edges share a line.")
+            elif kind == 'AlignInOrder':
+                self.option = self._choice('Align:', [(v.title(), v) for v in ('top', 'bottom', 'left', 'right', 'center')], self.original.get('line', 'bottom'))
+                line = self.original.get('line', 'bottom')
+                self.direction_option = self._choice('Order:', [('Left to right', 'horizontal'), ('Top to bottom', 'vertical')], self.original.get('direction') or ('vertical' if line in ('left', 'right') else 'horizontal'))
+                self._flag('Devices touch (abut)', 'abut')
+            elif kind == 'Spread':
+                self.option = self._choice('Spacing direction:', [('Horizontal', 'horizontal'), ('Vertical', 'vertical')], self.original.get('direction', 'horizontal'))
+                self._number_field('distance', 'Minimum gap (nm):', 0, integer=True)
+            elif kind == 'PortLocation':
+                self.option = self._choice('Port region:', [(v, k) for k, v in PORT_LOCATIONS.items()], self.original.get('location', 'TC'))
             elif ports:
                 self._flag("Propagate port roles to child circuits", "propagate", True)
-                self.names_editor.setToolTip("ALIGN uses the first port for the top-level power or ground grid.")
+                self.names_editor.setToolTip("Clock ports are excluded from signal symmetry inference." if kind == 'ClockPorts' else "ALIGN uses the first port for the top-level power or ground grid.")
             else:
-                self.names_editor.setToolTip("Prefers nearby placement without a fixed distance.")
+                self.names_editor.setToolTip("Prefers nearby placement without a fixed distance." if kind == 'PlaceCloser' else HELP.get(kind, 'Select devices for this constraint.'))
 
     def value(self):
         kind = self.kind.currentData()
@@ -380,12 +475,40 @@ class ConstraintEditorDialog(QDialog):
         elif kind == "CompactPlacement":
             if "style" in self.original or self.option.currentData() != "left":
                 result["style"] = self.option.currentData()
+        elif kind == 'SymmetricNets':
+            for index in (1, 2):
+                key = f'net{index}'
+                selected = self.net_choices[index - 1].currentData()
+                result[key] = self.original[key] if self.original.get(key, '').upper() == selected else selected
+                result[f'pins{index}'] = self.pin_editors[index - 1].names()
+            result['direction'] = self.option.currentData()
+        elif kind in ('Boundary', 'AspectRatio', 'BlockDistance', 'HorizontalDistance', 'VerticalDistance', 'ConfigureCompiler'):
+            pass
         else:
-            result["ports" if kind in ("PowerPorts", "GroundPorts") else "instances"] = self.names_editor.names()
+            result["ports" if kind in ("PowerPorts", "GroundPorts", 'ClockPorts', 'PortLocation') else "instances"] = self.names_editor.names()
             if kind == "Order":
                 result["direction"] = self.option.currentData()
             elif kind == "Align":
                 result["line"] = self.option.currentData()
+            elif kind == 'AlignInOrder':
+                result['line'] = self.option.currentData()
+                result['direction'] = self.direction_option.currentData()
+            elif kind == 'Spread':
+                result['direction'] = self.option.currentData()
+            elif kind == 'PortLocation':
+                result['location'] = self.option.currentData()
+        for key, (field, integer, default) in self.numbers.items():
+            text = field.text().strip()
+            if not text and default is None:
+                result.pop(key, None)
+                continue
+            try:
+                value = float(text)
+                if not math.isfinite(value) or (integer and not value.is_integer()):
+                    raise ValueError
+            except ValueError:
+                raise ValueError(f'{key.replace("_", " ")} must be a finite {"integer" if integer else "number"}') from None
+            result[key] = int(value) if integer else value
         for key, (flag, default) in self.flags.items():
             if key in self.original or flag.isChecked() != default:
                 result[key] = flag.isChecked()
