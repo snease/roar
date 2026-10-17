@@ -53,14 +53,14 @@ def native(project, parent):
             'native_kinds': [item['const_name'] for item in mapped['constraints']]}
 
 for relative in ['ota/current_mirror_ota']:
-    source = args.repo / 'design/floorplan' / (relative + '.sp')
+    source = args.repo / 'examples/floorplan' / (relative + '.sp')
     project = FloorplanProject.from_netlist(source)
     project.set_constraints(json.loads(source.with_suffix('.const.json').read_text()))
     result = native(project, output / 'fixtures')
     result['source_sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
     results['cases'].append(result)
 
-companion = args.repo / 'design/floorplan/ota/cm_ota.roar.floorplan'
+companion = args.repo / 'examples/floorplan/ota/cm_ota.roar.floorplan'
 project = FloorplanProject.load(companion)
 assert Path(project.roar_project_path) == companion.with_name('cm_ota_sizes.roar')
 assert not project.unresolved_parameters

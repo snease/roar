@@ -54,7 +54,7 @@ class RunnerTests(unittest.TestCase):
         self.python.chmod(0o755)
         (self.base / 'mode').write_text('good')
         self.config = AlignConfig(str(self.python), str(self.base / 'backend'), str(self.base / 'runs'))
-        fixture = Path(__file__).resolve().parents[3] / 'design/floorplan/ota/cm_ota.roar.floorplan'
+        fixture = Path(__file__).resolve().parents[3] / 'examples/floorplan/ota/cm_ota.roar.floorplan'
         self.project = FloorplanProject.load(fixture)
         self.project.align_profile = PROFILE_ID
         self.runner = AlignRunner(self.config, self.base / 'project.floorplan')

@@ -65,8 +65,8 @@ blocks those actions rather than exporting its old value.
 ## Try a linked, parameterized OTA
 
 1. Click the header's layout button, then **Open floorplan…** and choose
-   [`cm_ota.roar.floorplan`](../design/floorplan/ota/cm_ota.roar.floorplan).
-   Its linked [`cm_ota_sizes.roar`](../design/floorplan/ota/cm_ota_sizes.roar)
+   [`cm_ota.roar.floorplan`](../examples/floorplan/ota/cm_ota.roar.floorplan).
+   Its linked [`cm_ota_sizes.roar`](../examples/floorplan/ota/cm_ota_sizes.roar)
    appears automatically. Open the companion.
 2. Inspect the **Parameters** tab. Each shared symbol lists its affected device
    fields, captured value and ROAR source. For example, `w1_2` is bound to
@@ -138,7 +138,7 @@ The OTA remains the included demonstration and native acceptance circuit.
 ## Create an OTA floorplan from a numeric netlist
 
 1. Click the layout button, then **New floorplan…**. Choose
-   [`current_mirror_ota.sp`](../design/floorplan/ota/current_mirror_ota.sp).
+   [`current_mirror_ota.sp`](../examples/floorplan/ota/current_mirror_ota.sp).
    The import dialog selects the only subcircuit automatically. Choose a circuit
    from the dropdown for files containing several. Units and width convention
    appear together in the same dialog; keep micrometres and width per finger for
@@ -239,7 +239,7 @@ import json
 from pathlib import Path
 from roar_api.floorplan import FloorplanProject
 
-example = Path("design/floorplan/ota/current_mirror_ota.sp")
+example = Path("examples/floorplan/ota/current_mirror_ota.sp")
 project = FloorplanProject.from_netlist(example)
 project.set_constraints(json.loads(example.with_suffix(".const.json").read_text()))
 project.set_mos_parameters("M1", width_um=1.05, length_um=0.15, nf=4)
@@ -264,7 +264,7 @@ from roar_api import Design
 
 project = FloorplanProject.from_netlist(
     "design/cm_ota.spice", dimension_unit="um", width_convention="total")
-project.roar_project_path = "design/floorplan/ota/cm_ota_sizes.roar"
+project.roar_project_path = "examples/floorplan/ota/cm_ota_sizes.roar"
 design = Design.load(project.roar_project_path)
 project.bind_parameter(design, "w1_2", "M1_2", "W",
                        dimension_unit="m", width_convention="total", source="linked")

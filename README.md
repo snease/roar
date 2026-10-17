@@ -17,8 +17,9 @@ evaluation/exports, and live GUI sessions. Install with `pip install -e .`
 (headless) or `pip install -e '.[gui]'` (desktop).
 
 The header's layout button opens the [floorplan constraint editor](docs/FLOORPLANNING.md)
-for sizing devices and exporting placement intent to ALIGN. OTA and common-source
-examples are included.
+for sizing devices and exporting placement intent to ALIGN. A runnable
+[OTA example](examples/floorplan/ota/README.md) includes the netlist, sizing snapshot,
+and saved floorplan project.
 
 ## Install
 
