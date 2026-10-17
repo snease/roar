@@ -1667,6 +1667,22 @@ class ROARApp(QMainWindow):
                 apply(getattr(lw, 'tech_splitter', None), d.get('lw_tech'))
 
     # ---- MENU ACTION CALLBACKS ----
+    def _floorplan_editor(self):
+        return getattr(getattr(self, 'header', None), '_floorplan_dialog', None)
+
+    def _confirm_floorplan_navigation(self, action, *, discard=True):
+        editor = self._floorplan_editor()
+        return editor is None or editor.confirm_unsaved(action, discard=discard)
+
+    def closeEvent(self, event):
+        if not self._confirm_floorplan_navigation("quit ROAR", discard=True):
+            event.ignore()
+            return
+        editor = self._floorplan_editor()
+        if editor is not None:
+            editor.placement_panel.shutdown()
+        super().closeEvent(event)
+
     def _capture_floorplan_design(self):
         """Read editor inputs without capturing graph or window state."""
         from roar_api import Design
@@ -1731,11 +1747,15 @@ class ROARApp(QMainWindow):
             return
 
         try:
+            floorplan = self._floorplan_editor()
+            if floorplan is not None and not floorplan.save_for_application():
+                return
             state = self.capture_app_state()
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2)
             self._record_design_document(filename)
-            QMessageBox.information(self, "Success", f"App state saved to:\n{filename}")
+            companion = f"\nFloorplan saved separately to:\n{floorplan.project_path}" if floorplan is not None and floorplan.project_path is not None else ""
+            QMessageBox.information(self, "Success", f"App state saved to:\n{filename}{companion}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save app state:\n{str(e)}")
 
@@ -1750,6 +1770,8 @@ class ROARApp(QMainWindow):
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 state = json.load(f)
+            if not self._confirm_floorplan_navigation("open another app state"):
+                return
             self.restore_app_state(state)
             self._record_design_document(filename)
             QMessageBox.information(self, "Success", f"App state loaded from:\n{filename}")

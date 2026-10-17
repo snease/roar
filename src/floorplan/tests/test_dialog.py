@@ -84,6 +84,7 @@ class FloorplanDialogTests(unittest.TestCase):
         self.dialog.set_project(FloorplanProject.from_text(NETLIST))
 
     def tearDown(self):
+        self.dialog._dirty = False  # Tests explicitly cover navigation prompts.
         self.dialog.close()
         self.parent.deleteLater()
         self.app.processEvents()
@@ -106,7 +107,7 @@ class FloorplanDialogTests(unittest.TestCase):
                 elif kind == "CompactPlacement":
                     editor.option.setCurrentIndex(editor.option.findData("center"))
                 else:
-                    editor.names_editor.set_names(["d", "s"] if kind in ("PowerPorts", "GroundPorts") else ["M2", "M1"])
+                    editor.names_editor.set_names(["d"] if kind == "PowerPorts" else ["s"] if kind == "GroundPorts" else ["M1", "M2"])
                 editor.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
             QTimer.singleShot(0, accept_constraint)
             self.dialog._add_constraint()
@@ -135,12 +136,13 @@ class FloorplanDialogTests(unittest.TestCase):
     def test_invalid_cell_and_unknown_mapping_do_not_mutate_project(self):
         original = self.dialog.project.to_dict()
         self.dialog.devices_table.item(0, 3).setText("7")
-        self.dialog.devices_table.item(1, 5).setText("3")
-        with self.assertRaisesRegex(ValueError, "even integer"):
+        self.dialog.devices_table.item(1, 5).setText("three")
+        with self.assertRaisesRegex(ValueError, "integer NF"):
             self.dialog._collect_project()
         self.assertEqual(self.dialog.project.to_dict(), original)
         self.dialog._render()
         self.dialog._read_roar()
+        original = self.dialog.project.to_dict()
         self.dialog.import_targets.setText("M1, NOT_A_DEVICE")
         with self.assertRaises(ValueError):
             self.dialog._apply_roar()
@@ -263,8 +265,8 @@ class FloorplanDialogTests(unittest.TestCase):
                 self.dialog._import_constraints()
             self.assertEqual(self.dialog.project.constraints, expected)
             current = self.dialog.project.to_dict()
-            self.assertEqual({key: value for key, value in current.items() if key != "constraints"},
-                             {key: value for key, value in previous.items() if key != "constraints"})
+            self.assertEqual({key: value for key, value in current.items() if key not in ("constraints", "constraint_enabled")},
+                             {key: value for key, value in previous.items() if key not in ("constraints", "constraint_enabled")})
         original = self.dialog.project
         QTimer.singleShot(0, lambda: QApplication.activeModalWidget().button(QMessageBox.StandardButton.Cancel).click())
         with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
@@ -315,7 +317,7 @@ class FloorplanDialogTests(unittest.TestCase):
         with patch.object(QFileDialog, "getSaveFileName", return_value=(str(target), "")):
             self.dialog._save_project()
         self.assertEqual(FloorplanProject.load(target).constraints, [opaque, extra])
-        with self.assertRaisesRegex(ValueError, "Unsupported"):
+        with self.assertRaisesRegex(ValueError, "[Uu]nsupported"):
             self.dialog._export_align()
 
     def test_typed_editor_roundtrips_native_defaults_optional_flags_and_order(self):
@@ -397,7 +399,12 @@ class FloorplanDialogTests(unittest.TestCase):
     def test_close_reopen_preserves_project_and_parent(self):
         self.dialog.show()
         self.dialog.devices_table.item(0, 3).setText("6")
-        self.dialog.close()
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Cancel):
+            self.dialog.close()
+        self.assertTrue(self.dialog.isVisible())
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Save), \
+             patch.object(QFileDialog, "getSaveFileName", return_value=(str(self.root / "close.roar.floorplan"), "")):
+            self.dialog.close()
         self.dialog.show()
         self.app.processEvents()
         self.assertEqual(self.dialog.devices_table.item(0, 3).text(), "6")
@@ -416,6 +423,7 @@ class FloorplanDialogTests(unittest.TestCase):
         self.design.save(first_design)
         self.design.save(second_design)
         project = FloorplanProject.from_text(NETLIST)
+        project.source_mode = "linked"
         first = self.root / "first.floorplan.json"
         second = self.root / "second.floorplan.json"
         project.roar_project_path = first_design
@@ -522,6 +530,7 @@ class FloorplanDialogTests(unittest.TestCase):
         original_running = self.design.to_state()
         project = FloorplanProject.from_text(SYMBOLIC)
         project.roar_project_path = saved_design
+        project.source_mode = "linked"
         project.set_parameter("nfs", 4)
         project.bind_parameter(self.design, "ws", "M1_2", "W", source="linked")
         sidecar = self.root / "bound.floorplan.json"
@@ -680,6 +689,7 @@ class FloorplanDialogTests(unittest.TestCase):
 
     def _bound_project(self):
         project = FloorplanProject.from_text(SYMBOLIC)
+        project.source_mode = "linked"
         project.set_parameter("nfs", 4)
         project.bind_parameter(self.design, "ws", "M1_2", "W", source="linked")
         return project
@@ -726,6 +736,7 @@ class FloorplanDialogTests(unittest.TestCase):
         dialog._ensure_current_source()
         self.assertEqual(dialog.project.devices[0].width_um, 8)
         self.assertIsNotNone(dialog.project.parameter_rows[0]["binding"])
+        dialog._dirty = False
         dialog.close()
         dialog.deleteLater()
 

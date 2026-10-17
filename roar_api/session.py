@@ -426,7 +426,10 @@ class Session:
     def close(self) -> None:
         _main_thread()
         if not self._closed and self._app is not None:
-            self._app.close()
+            if self._app.close() is False:
+                # The floorplan editor can cancel application close to protect
+                # unsaved work. Keep the window and Session usable in that case.
+                return
             if self._owns_window:
                 dialog = getattr(self._app.editor_window, "_iterative_solver_dialog", None)
                 if dialog is not None:

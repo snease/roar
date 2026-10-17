@@ -11,10 +11,11 @@ import os
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem,
+    QMessageBox, QPlainTextEdit, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
@@ -22,6 +23,18 @@ from .model import FloorplanProject, _scalar
 from .constraint_editor import ConstraintEditorDialog, constraint_summary, editable_constraint
 
 from .workspace import editor_signature, load_roar_design
+
+
+def _floorplan_example_directory():
+    design_directory = os.environ.get("ROAR_DESIGN")
+    if design_directory:
+        custom = Path(design_directory) / "floorplan"
+        if custom.is_dir():
+            return str(custom)
+    bundled = Path(__file__).resolve().parents[2] / "examples" / "floorplan"
+    if bundled.is_dir():
+        return str(bundled)
+    return str(Path(design_directory)) if design_directory and Path(design_directory).is_dir() else str(Path.home())
 
 
 def _refresh_source_bindings(project, design, origin):
@@ -49,7 +62,7 @@ def _source_switch_choice(parent, workspace, path):
     save = question.addButton("Save and Switch…", QMessageBox.ButtonRole.AcceptRole) if dirty else None
     switch = question.addButton("Discard and Switch" if dirty else "Switch to linked design", QMessageBox.ButtonRole.DestructiveRole)
     association = question.addButton("Change saved association", QMessageBox.ButtonRole.ActionRole)
-    frozen = question.addButton("Use saved floorplan sizes", QMessageBox.ButtonRole.ActionRole)
+    frozen = question.addButton("Use captured sizes (no updates)", QMessageBox.ButtonRole.ActionRole)
     question.addButton(QMessageBox.StandardButton.Cancel)
     question.setDefaultButton(save or switch)
     question.exec()
@@ -72,7 +85,9 @@ def _save_workspace(parent, workspace, protected_path=None):
 def _choose_source(parent, project, mode, path, workspace=None, snapshot_provider=None):
     """Preflight mappings before changing the active design or floorplan."""
     if mode == "saved":
-        return FloorplanProject.from_dict(project.to_dict()), None, None
+        candidate = FloorplanProject.from_dict(project.to_dict())
+        candidate.source_mode = "saved"
+        return candidate, None, None
     if mode == "live":
         provider = workspace.snapshot if workspace is not None else snapshot_provider
         if provider is None:
@@ -80,6 +95,7 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
         design = provider()
         candidate = _refresh_source_bindings(project, design, "live")
         candidate.roar_project_path = workspace.path if workspace is not None else None
+        candidate.source_mode = "live"
         return candidate, design, "live"
     if workspace is not None and workspace.path and Path(workspace.path).resolve() == Path(path).expanduser().resolve():
         return _choose_source(parent, project, "live", "", workspace, snapshot_provider)
@@ -87,6 +103,7 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
     if workspace is None:
         candidate = _refresh_source_bindings(project, design, "linked")
         candidate.roar_project_path = str(Path(path).expanduser().resolve())
+        candidate.source_mode = "linked"
         return candidate, design, "linked"
     if workspace is not None:
         current = workspace.snapshot()
@@ -116,6 +133,7 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
         design = workspace.snapshot()
         candidate = _refresh_source_bindings(project, design, "live")
         candidate.roar_project_path = workspace.path
+        candidate.source_mode = "live"
     return candidate, design, "live" if workspace is not None else "linked"
 
 
@@ -141,7 +159,7 @@ class OpenFloorplanDialog(QDialog):
         row.addWidget(browse)
         form.addRow("Floorplan (.roar.floorplan):", row)
         self.source_mode = QComboBox()
-        for label, key in (("Current ROAR design", "live"), ("Saved ROAR file", "linked"), ("Saved floorplan sizes", "saved")):
+        for label, key in (("Current ROAR design", "live"), ("Saved ROAR file", "linked"), ("Captured sizes (no updates)", "saved")):
             self.source_mode.addItem(label, key)
         form.addRow("Sizing source:", self.source_mode)
         row = QHBoxLayout()
@@ -172,7 +190,7 @@ class OpenFloorplanDialog(QDialog):
             self._update_status()
 
     def _browse_floorplan(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Choose Floorplan", self.floorplan_path.text(), "Floorplan (*.roar.floorplan *.floorplan.json *.json);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Floorplan", self.floorplan_path.text() or _floorplan_example_directory(), "Floorplan (*.roar.floorplan *.floorplan.json *.json);;All files (*)")
         if path:
             self.floorplan_path.setText(path)
             self._floorplan_changed()
@@ -207,16 +225,7 @@ class OpenFloorplanDialog(QDialog):
         if not self._manual_design:
             self.design_path.setText(self._suggested_design)
         if not self._manual_source:
-            mode = "saved"
-            if self._suggested_design and Path(self._suggested_design).is_file():
-                mode = "linked"
-            elif not self._suggested_design:
-                try:
-                    provider = self.workspace.snapshot if self.workspace is not None else self.snapshot_provider
-                    if provider and provider().get_instance_parameters():
-                        mode = "live"
-                except (ValueError, RuntimeError, OSError):
-                    pass
+            mode = self._candidate.source_mode if self._candidate else "saved"
             self.source_mode.setCurrentIndex(self.source_mode.findData(mode))
         self._update_status()
 
@@ -229,11 +238,11 @@ class OpenFloorplanDialog(QDialog):
         if not valid:
             message = getattr(self, "_load_error", "") or "Choose a floorplan."
         elif mode == "linked" and not Path(self.design_path.text().strip()).is_file():
-            message, valid = "ROAR file is missing. Browse to relink, or choose Saved floorplan sizes.", False
+            message, valid = "ROAR file is missing. Browse to relink, or choose Captured sizes (no updates).", False
         elif mode == "live" and self.workspace is None and self.snapshot_provider is None:
             message, valid = "The current ROAR design is unavailable.", False
         elif self._suggested_design and not Path(self._suggested_design).is_file():
-            message = "Associated ROAR file is missing; saved floorplan sizes are available."
+            message = "Associated ROAR file is missing; captured floorplan sizes are available."
         elif self._manual_design and self.design_path.text().strip() != self._suggested_design:
             message = "Association will change to the selected ROAR file."
         self.link_status.setText(message)
@@ -374,7 +383,7 @@ class FloorplanDialog(QDialog):
     def __init__(self, parent=None, snapshot_provider=None, *, placement_options=None, workspace=None, source_changed_signals=()):
         super().__init__(parent)
         self.setWindowTitle("ROAR Floorplan")
-        self.resize(980, 760)
+        self.resize(1080, 800)
         self.project = None
         self.project_path = None
         self.workspace = workspace
@@ -391,6 +400,8 @@ class FloorplanDialog(QDialog):
         self._source_origin = None
         self._dirty = False
         self._rendering = False
+        self._undo_states, self._redo_states = [], []
+        self._history_current = self._saved_state = None
         layout = QVBoxLayout(self)
         bar = QHBoxLayout()
         for title, action in (("New floorplan…", self._load_netlist),
@@ -403,10 +414,24 @@ class FloorplanDialog(QDialog):
                 button.setToolTip("Export a sized netlist and placement constraints together for ALIGN.")
             bar.addWidget(button)
         layout.addLayout(bar)
+        history_bar = QHBoxLayout()
+        self.undo_button = self._button("Undo", self._undo)
+        self.redo_button = self._button("Redo", self._redo)
+        history_bar.addWidget(self.undo_button)
+        history_bar.addWidget(self.redo_button)
+        history_bar.addStretch()
+        layout.addLayout(history_bar)
+        for label, key, handler in (("Undo", QKeySequence.StandardKey.Undo, self._undo),
+                                    ("Redo", QKeySequence.StandardKey.Redo, self._redo)):
+            action = QAction(label, self)
+            action.setShortcut(QKeySequence(key))
+            action.triggered.connect(lambda _checked=False, callback=handler: self._guard(callback))
+            self.addAction(action)
+        self._update_history_buttons()
         source_bar = QHBoxLayout()
         source_bar.addWidget(QLabel("Sizing source:"))
         self.source_mode = QComboBox()
-        for label, key in (("Current ROAR design", "live"), ("Saved ROAR file", "linked"), ("Saved floorplan sizes", "saved")):
+        for label, key in (("Current ROAR design", "live"), ("Saved ROAR file", "linked"), ("Captured sizes (no updates)", "saved")):
             self.source_mode.addItem(label, key)
         self.source_mode.setCurrentIndex(self.source_mode.findData("saved"))
         self.source_mode.activated.connect(self._source_selected)
@@ -431,7 +456,8 @@ class FloorplanDialog(QDialog):
         from .align_dialog import PlacementPanel
         self.placement_panel = PlacementPanel(
             self._collect_project, lambda: self.project_path, self._set_align_profile,
-            self, **dict({"before_generate": self._ensure_current_source}, **(placement_options or {})))
+            self, **dict({"before_generate": self._ensure_current_source,
+                          "run_options_setter": self._set_run_options}, **(placement_options or {})))
         self.tabs.addTab(self.placement_panel, "Placement")
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -458,23 +484,101 @@ class FloorplanDialog(QDialog):
 
     def _mark_dirty(self, *_args):
         if not self._rendering:
-            self._dirty = True
+            self._record_edit()
             if hasattr(self, "placement_panel"):
                 self.placement_panel.schedule_refresh()
+
+    def _editor_state(self):
+        if self.project is None:
+            return None
+        return {"project": self.project.to_dict(),
+                "cells": [[self.devices_table.item(row, column).text()
+                           for column in range(self.devices_table.columnCount())]
+                          for row in range(self.devices_table.rowCount())],
+                "source": self.roar_design.to_state() if self.roar_design is not None else None}
+
+    @staticmethod
+    def _document_state(state):
+        return (state["project"], state["cells"]) if state is not None else None
+
+    def _record_edit(self, *, automatic=False):
+        state = self._editor_state()
+        if state is None:
+            return
+        if self._document_state(state) != self._document_state(self._history_current):
+            if not automatic and self._history_current is not None:
+                self._undo_states.append(self._history_current)
+                self._undo_states = self._undo_states[-100:]
+                self._redo_states.clear()
+            self._history_current = state
+        self._dirty = self._document_state(state) != self._document_state(self._saved_state)
+        self._update_document_title()
+        self._update_history_buttons()
+
+    def _update_history_buttons(self):
+        self.undo_button.setEnabled(bool(self._undo_states))
+        self.redo_button.setEnabled(bool(self._redo_states))
+
+    def _restore_editor_state(self, state, *, refresh_source=True):
+        from roar_api import Design
+        self.project = FloorplanProject.from_dict(state["project"])
+        design = Design.from_state(state["source"]) if state["source"] is not None else None
+        self._set_source(design, self.project.source_mode if design is not None else None)
+        self._render()
+        self._rendering = True
+        try:
+            for row, values in enumerate(state["cells"]):
+                for column, value in enumerate(values):
+                    self.devices_table.item(row, column).setText(value)
+        finally:
+            self._rendering = False
+        self._history_current = self._editor_state()
+        self._dirty = self._document_state(self._history_current) != self._document_state(self._saved_state)
+        self._update_document_title()
+        self._update_history_buttons()
+        self.placement_panel.schedule_refresh()
+        if refresh_source and self._source_mode != "saved":
+            # Undo restores the user's mapping/override choices. Bound values
+            # still follow the latest source rather than an old history frame.
+            self._live_source_update()
+
+    def _undo(self):
+        if self._undo_states:
+            self._redo_states.append(self._editor_state())
+            self._restore_editor_state(self._undo_states.pop())
+            self.status.setText("Undid the last floorplan edit.")
+
+    def _redo(self):
+        if self._redo_states:
+            self._undo_states.append(self._editor_state())
+            self._restore_editor_state(self._redo_states.pop())
+            self.status.setText("Redid the floorplan edit.")
 
     def _set_align_profile(self, profile):
         candidate = self._collect_project()
         candidate.align_profile = profile
         self.project = candidate
-        self._dirty = True
+        self._record_edit()
+        self.placement_panel.schedule_refresh()
+
+    def _set_run_options(self, options):
+        candidate = self._collect_project()
+        candidate.run_options = dict(options)
+        self.project = candidate
+        self._record_edit()
         self.placement_panel.schedule_refresh()
 
     def closeEvent(self, event):
+        if not self.confirm_unsaved("close this floorplan", discard=True):
+            event.ignore()
+            return
         self._source_timer.stop()
         self.placement_panel.close_panel()
         super().closeEvent(event)
 
     def reject(self):
+        if not self.confirm_unsaved("close this floorplan", discard=True):
+            return
         self._source_timer.stop()
         self.placement_panel.close_panel()
         super().reject()
@@ -488,18 +592,26 @@ class FloorplanDialog(QDialog):
     def _build_devices_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        self.devices_table = QTableWidget(0, 6)
+        self.devices_table = QTableWidget(0, 9)
         self.devices_table.setHorizontalHeaderLabels(
-            ["Instance", "Kind", "Model", "W per finger (µm)", "L (µm)", "NF"])
+            ["Instance", "Kind", "Model", "W per finger (µm)", "L (µm)", "NF", "M", "Resistance (Ω)", "Effective W (µm)"])
         self.devices_table.setToolTip("Select rows to use their names as targets. Shared sizes are edited on Parameters.")
-        self.devices_table.horizontalHeaderItem(5).setToolTip("Even integer, at least 2.")
+        self.devices_table.horizontalHeaderItem(5).setToolTip("Number of fingers. The selected SKY130 placement generator requires even NF ≥ 2.")
+        self.devices_table.horizontalHeaderItem(6).setToolTip("Multiplicity: the number of parallel copies of this device.")
+        self.devices_table.horizontalHeaderItem(8).setToolTip("W per finger × NF × M. Read-only effective width of all parallel copies.")
         self.devices_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.devices_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.devices_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.devices_table.itemChanged.connect(self._mark_dirty)
+        self.devices_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.devices_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.devices_table.itemChanged.connect(self._device_edited)
         self.devices_table.itemSelectionChanged.connect(self._use_selection)
         layout.addWidget(self.devices_table)
-        box = QGroupBox("Copy ROAR sizes")
+        self.connectivity = QPlainTextEdit()
+        self.connectivity.setReadOnly(True)
+        self.connectivity.setMaximumHeight(105)
+        self.connectivity.setPlaceholderText("Select devices to inspect their terminals, nets and other connected devices.")
+        layout.addWidget(self.connectivity)
+        box = self.copy_sizes_group = QGroupBox("Copy ROAR sizes")
         form = QFormLayout(box)
         self.source_instance = QComboBox()
         form.addRow("ROAR instance:", self.source_instance)
@@ -565,6 +677,8 @@ class FloorplanDialog(QDialog):
         binding.addWidget(self.binding_instance)
         binding.addWidget(self.binding_attribute)
         binding.addWidget(self._button("Bind and capture value", self._bind_parameter))
+        self.unbind_button = self._button("Unbind; keep value", self._unbind_parameter)
+        binding.addWidget(self.unbind_button)
         form.addRow("ROAR instance.attribute:", binding)
         self.binding_unit = QComboBox()
         self.binding_unit.addItem("Metres (m)", "m")
@@ -606,6 +720,7 @@ class FloorplanDialog(QDialog):
         self.parameter_width.setEnabled("W" in row["roles"])
         self.binding_width.setEnabled("W" in row["roles"])
         binding = row["binding"]
+        self.unbind_button.setEnabled(bool(binding))
         if binding:
             self.binding_unit.setCurrentIndex(self.binding_unit.findData(row["dimension_unit"]))
             self.binding_width.setCurrentIndex(self.binding_width.findData(row["width_convention"]))
@@ -626,7 +741,7 @@ class FloorplanDialog(QDialog):
                                 width_convention=self.parameter_width.currentData())
         self.project = candidate
         self._render()
-        self._dirty = True
+        self._record_edit()
         self.status.setText(f"Updated shared symbol {symbol}.")
 
     def _import_parameters(self):
@@ -645,7 +760,7 @@ class FloorplanDialog(QDialog):
                 path, dimension_unit=unit, width_convention=width)
             self.project = candidate
             self._render()
-            self._dirty = True
+            self._record_edit()
             self.status.setText("Imported parameter values." + (
                 " Unused names: " + ", ".join(unused) if unused else ""))
 
@@ -668,19 +783,38 @@ class FloorplanDialog(QDialog):
         attribute = self.binding_attribute.currentData()
         unit = self.binding_unit.currentData()
         width = self.binding_width.currentData()
-        self._ensure_current_source()
         candidate = self._collect_project()
-        if self.roar_design is None:
+        # Read the current source without refreshing the mapping being replaced.
+        # A deleted source attribute must not prevent its own repair.
+        if self._source_mode == "live":
+            if self.snapshot_provider is None:
+                raise ValueError("The current ROAR design is unavailable.")
+            design = self.snapshot_provider()
+        elif self._source_mode == "linked":
+            design = load_roar_design(candidate.roar_project_path)
+        else:
             raise ValueError("Choose a ROAR sizing source first.")
         if not symbol or not attribute:
             raise ValueError("Choose a shared symbol and a resolved scalar ROAR attribute.")
         candidate.bind_parameter(
-            self.roar_design, symbol, instance, attribute,
+            design, symbol, instance, attribute,
             dimension_unit=unit, width_convention=width, source=self._source_origin)
         self.project = candidate
+        self._set_source(design, self._source_origin)
         self._render()
-        self._dirty = True
+        self._record_edit()
         self.status.setText(f"Captured {symbol} from the selected ROAR attribute.")
+
+    def _unbind_parameter(self):
+        candidate = self._collect_project()
+        symbol = self.parameter_symbol.currentText()
+        if not symbol:
+            return
+        candidate.unbind_parameter(symbol)
+        self.project = candidate
+        self._render()
+        self._record_edit()
+        self.status.setText(f"Unbound {symbol}; its captured value is now manual.")
 
     def _refresh_bindings(self):
         self._ensure_current_source()
@@ -704,6 +838,7 @@ class FloorplanDialog(QDialog):
     def _ensure_current_source(self):
         if self.project is None or self._source_mode == "saved":
             return
+        design = None
         try:
             candidate = self._collect_project()
             if self._source_mode == "live":
@@ -723,8 +858,12 @@ class FloorplanDialog(QDialog):
             self._set_source(design, origin)
             if changed:
                 self._render()
-                self._dirty = True
+                self._record_edit(automatic=True)
         except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
+            if design is not None:
+                # Keep the latest source choices available even if an old
+                # binding no longer resolves, so the designer can repair it.
+                self._set_source(design, origin)
             self._source_error = str(exc)
             self.snapshot_label.setText("Sizing source error: " + str(exc))
             raise
@@ -747,8 +886,14 @@ class FloorplanDialog(QDialog):
         controls.addWidget(self._button("Add constraint…", self._add_constraint))
         self.edit_constraint_button = self._button("Edit…", self._edit_constraint)
         self.remove_constraint_button = self._button("Remove", self._remove_constraint)
+        self.duplicate_constraint_button = self._button("Duplicate", self._duplicate_constraint)
+        self.toggle_constraint_button = self._button("Disable", self._toggle_constraint)
+        self.inspect_constraint_button = self._button("Details…", self._inspect_constraint)
         controls.addWidget(self.edit_constraint_button)
+        controls.addWidget(self.duplicate_constraint_button)
+        controls.addWidget(self.toggle_constraint_button)
         controls.addWidget(self.remove_constraint_button)
+        controls.addWidget(self.inspect_constraint_button)
         controls.addStretch()
         controls.addWidget(self._button("Check constraints", self._check_constraints))
         layout.addLayout(controls)
@@ -774,13 +919,20 @@ class FloorplanDialog(QDialog):
         selected = self.project is not None and 0 <= index < len(self.project.constraints)
         editable = selected and editable_constraint(self.project.constraints[index])
         self.edit_constraint_button.setEnabled(editable)
-        self.edit_constraint_button.setToolTip("" if editable else "Unsupported settings are preserved; remove or replace this row to change them.")
+        self.edit_constraint_button.setToolTip("" if editable else "No form is available for these fields. Details shows the preserved settings; disable the row to exclude it from ALIGN.")
         self.remove_constraint_button.setEnabled(selected)
+        self.duplicate_constraint_button.setEnabled(selected)
+        self.toggle_constraint_button.setEnabled(selected)
+        self.inspect_constraint_button.setEnabled(selected)
+        enabled = selected and self.project._constraint_flags()[index]
+        self.toggle_constraint_button.setText("Disable" if enabled else "Enable")
 
     def _render_constraints(self):
         self.constraints_table.setRowCount(len(self.project.constraints))
         for row, constraint in enumerate(self.project.constraints):
             for column, value in enumerate(constraint_summary(constraint)):
+                if column == 0 and not self.project._constraint_flags()[row]:
+                    value = "Disabled — " + value
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
                 self.constraints_table.setItem(row, column, item)
@@ -797,10 +949,11 @@ class FloorplanDialog(QDialog):
         options = ConstraintEditorDialog(candidate, selected_devices=self._selected_device_names(), parent=self)
         if options.exec() == QDialog.DialogCode.Accepted:
             candidate.constraints.append(options.constraint)
+            candidate.constraint_enabled.append(True)
             self.project = candidate
             self._render_constraints()
             self.constraints_table.selectRow(len(candidate.constraints) - 1)
-            self._dirty = True
+            self._record_edit()
             self.status.setText("Constraint added.")
         options.deleteLater()
 
@@ -809,13 +962,16 @@ class FloorplanDialog(QDialog):
         index = self.constraints_table.currentRow()
         if not 0 <= index < len(candidate.constraints):
             return
+        if not editable_constraint(candidate.constraints[index]):
+            self._inspect_constraint()
+            return
         options = ConstraintEditorDialog(candidate, candidate.constraints[index], parent=self)
         if options.exec() == QDialog.DialogCode.Accepted:
             candidate.constraints[index] = options.constraint
             self.project = candidate
             self._render_constraints()
             self.constraints_table.selectRow(index)
-            self._dirty = True
+            self._record_edit()
             self.status.setText("Constraint updated.")
         options.deleteLater()
 
@@ -826,13 +982,70 @@ class FloorplanDialog(QDialog):
             candidate.remove_constraint(index)
             self.project = candidate
             self._render_constraints()
-            self._dirty = True
+            self._record_edit()
             self.status.setText("Constraint removed.")
+
+    def _duplicate_constraint(self):
+        candidate = self._collect_project()
+        index = self.constraints_table.currentRow()
+        if 0 <= index < len(candidate.constraints):
+            from copy import deepcopy
+            candidate.constraints.insert(index + 1, deepcopy(candidate.constraints[index]))
+            candidate.constraint_enabled.insert(index + 1, candidate.constraint_enabled[index])
+            self.project = candidate
+            self._render_constraints()
+            self.constraints_table.selectRow(index + 1)
+            self._record_edit()
+
+    def _toggle_constraint(self):
+        candidate = self._collect_project()
+        index = self.constraints_table.currentRow()
+        if 0 <= index < len(candidate.constraints):
+            candidate.set_constraint_enabled(index, not candidate.constraint_enabled[index])
+            self.project = candidate
+            self._render_constraints()
+            self.constraints_table.selectRow(index)
+            self._record_edit()
+
+    def _inspect_constraint(self):
+        index = self.constraints_table.currentRow()
+        if self.project is None or not 0 <= index < len(self.project.constraints):
+            return
+        constraint = self.project.constraints[index]
+        detail = QDialog(self)
+        detail.setWindowTitle(f"Constraint {index + 1}: {constraint.get('constraint', 'Unknown')}")
+        detail.resize(640, 440)
+        layout = QVBoxLayout(detail)
+        enabled = self.project._constraint_flags()[index]
+        note = ("Enabled: included in ALIGN input." if enabled else "Disabled: saved in this floorplan, excluded from ALIGN input.")
+        if not editable_constraint(constraint):
+            note += " No form is available for this type or its additional fields. All imported fields are preserved below. Native ALIGN validation determines whether it can run."
+        label = QLabel(note)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        fields = QPlainTextEdit(json.dumps(constraint, indent=2))
+        fields.setReadOnly(True)
+        layout.addWidget(fields)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(detail.reject)
+        layout.addWidget(buttons)
+        detail.exec()
+        detail.deleteLater()
 
     def _check_constraints(self):
         candidate = self._collect_project()
-        candidate.set_constraints(candidate.constraints)
-        self.status.setText("Constraint fields valid; placement feasibility unchecked.")
+        candidate._validate_constraints(candidate.active_constraints,
+                                        row_numbers=[index + 1 for index, enabled in enumerate(candidate._constraint_flags()) if enabled])
+        message = "Enabled constraint fields and ordering checks passed."
+        if not self.placement_panel.config.python or not self.placement_panel.config.backend_path:
+            self.status.setText(message + " Configure ALIGN on Placement to run native checks; placement feasibility is checked during generation.")
+            return
+        try:
+            self.placement_panel.check_native_constraints(candidate)
+        except (ValueError, OSError, RuntimeError) as exc:
+            self.status.setText(message + " Native ALIGN checks are unavailable: " + str(exc))
+            return
+        self.status.setText(message + " Native ALIGN checks appear on Placement; placement feasibility is checked during generation.")
 
     @staticmethod
     def _names(text):
@@ -844,6 +1057,37 @@ class FloorplanDialog(QDialog):
         rows = sorted({index.row() for index in self.devices_table.selectedIndexes()})
         names = ", ".join(self.devices_table.item(row, 0).text() for row in rows)
         self.import_targets.setText(names)
+        lines = []
+        if self.project is not None:
+            for row in rows:
+                device = self.project.devices[row]
+                roles = ("D", "G", "S", "B") if device.kind == "mos" else ("1", "2")
+                lines.append(f"{device.name} ({device.model or device.kind})")
+                for terminal, net in zip(roles, device.terminals):
+                    peers = [f"{other.name}.{role}" for other in self.project.devices
+                             for role, node in zip(("D", "G", "S", "B") if other.kind == "mos" else ("1", "2"), other.terminals)
+                             if node.upper() == net.upper() and other.name != device.name]
+                    port = " [circuit port]" if net.upper() in {name.upper() for name in self.project.ports} else ""
+                    lines.append(f"  {terminal} → {net}{port}" + ("; also " + ", ".join(peers) if peers else ""))
+        self.connectivity.setPlainText("\n".join(lines))
+
+    def _device_edited(self, item):
+        if self._rendering:
+            return
+        row = item.row()
+        device = self.project.devices[row]
+        if device.kind == "mos":
+            try:
+                effective = float(self.devices_table.item(row, 3).text()) * int(self.devices_table.item(row, 5).text()) * _scalar(self.devices_table.item(row, 6).text(), "M")
+                value = f"{effective:g}"
+            except (ValueError, TypeError):
+                value = "Unresolved"
+            self._rendering = True
+            try:
+                self.devices_table.item(row, 8).setText(value)
+            finally:
+                self._rendering = False
+        self._mark_dirty()
 
     def _require_project(self):
         if self.project is None:
@@ -854,7 +1098,8 @@ class FloorplanDialog(QDialog):
         self._require_project()
         candidate = FloorplanProject.from_dict(self.project.to_dict())
         for row, device in enumerate(candidate.devices):
-            if device.kind != "mos":
+            if device.kind == "resistor":
+                candidate.set_resistance(device.name, self.devices_table.item(row, 7).text())
                 continue
             try:
                 width = device.width_um if "W" in device.symbols or device.width_um is None else float(self.devices_table.item(row, 3).text())
@@ -863,6 +1108,8 @@ class FloorplanDialog(QDialog):
             except (ValueError, AttributeError) as exc:
                 raise ValueError(f"{device.name}: enter numeric W/L and an integer NF.") from exc
             candidate.set_mos_parameters(device.name, width_um=width, length_um=length, nf=nf)
+            if "M" not in device.symbols:
+                candidate.set_mos_multiplicity(device.name, self.devices_table.item(row, 6).text())
         return candidate
 
     def _render(self):
@@ -872,25 +1119,32 @@ class FloorplanDialog(QDialog):
             project = self.project
             self._update_document_title()
             self.devices_table.setRowCount(len(project.devices))
+            self.devices_table.setColumnHidden(7, not any(device.kind == "resistor" for device in project.devices))
             for row, device in enumerate(project.devices):
                 values = [device.name, device.kind, device.model,
                           device.width_um if device.kind == "mos" else "—",
                           device.length_um if device.kind == "mos" else "—",
-                          device.nf if device.kind == "mos" else "—"]
+                          device.nf if device.kind == "mos" else "—",
+                          device.parameters.get("M", 1) if device.kind == "mos" else "—",
+                          device.value if device.kind == "resistor" else "—",
+                          (f"{device.width_um * device.nf * _scalar(device.parameters.get('M', 1), 'M'):g}"
+                           if device.kind == "mos" and device.width_um is not None and device.nf is not None and device.parameters.get("M", 1) is not None
+                           else "Unresolved" if device.kind == "mos" else "—")]
                 for column, value in enumerate(values):
                     text = "Unresolved" if value is None else str(value)
                     item = QTableWidgetItem(text)
-                    role = {3: "W", 4: "L", 5: "NF"}.get(column)
+                    role = {3: "W", 4: "L", 5: "NF", 6: "M"}.get(column)
                     controlled = role in device.symbols or (role is not None and value is None)
                     item.setToolTip(
                         f"Shared symbol {device.symbols[role]}; edit or bind it on Parameters."
                         if role in device.symbols else "Resolve the missing shared parameters first."
                         if controlled else text)
-                    if column < 3 or device.kind != "mos" or controlled:
+                    if not ((device.kind == "mos" and column in (3, 4, 5, 6) and not controlled) or (device.kind == "resistor" and column == 7)):
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self.devices_table.setItem(row, column, item)
             self._render_constraints()
             self.import_targets.clear()
+            self.connectivity.clear()
             self.parameter_symbol.clear()
             rows = project.parameter_rows
             self.parameters_table.setRowCount(len(rows))
@@ -900,9 +1154,11 @@ class FloorplanDialog(QDialog):
                 unit = row["dimension_unit"] if dimensional else "unitless"
                 if "W" in row["roles"]:
                     unit += "; " + row["width_convention"].replace("_", " ")
+                source = (f"Captured from {row['binding']['instance']}.{row['binding']['attribute']}; updates paused"
+                          if row["binding"] and self._source_mode == "saved" else row["source"])
                 values = [row["symbol"], ", ".join(row["usages"]),
                           "Unresolved" if row["value"] is None else str(row["value"]),
-                          unit, row["source"]]
+                          unit, source]
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(str(value))
                     item.setToolTip(str(value))
@@ -924,8 +1180,10 @@ class FloorplanDialog(QDialog):
         self.placement_panel.schedule_refresh()
 
     def _update_document_title(self):
+        if self.project is None:
+            return
         identity = f"{self.project.top} — {self.project_path.name}" if self.project_path else f"{self.project.top} (unsaved)"
-        self.setWindowTitle(f"{identity} — ROAR Floorplan")
+        self.setWindowTitle(f"{'* ' if self._dirty else ''}{identity} — ROAR Floorplan")
         self.setWindowFilePath(str(self.project_path or ""))
 
     def set_project(self, project, path=None, design=None, source_origin=None):
@@ -935,27 +1193,64 @@ class FloorplanDialog(QDialog):
         self._set_source(design, source_origin)
         self._render()
         self._dirty = False
+        self._undo_states.clear()
+        self._redo_states.clear()
+        self._history_current = self._saved_state = self._editor_state()
+        self._update_document_title()
+        self._update_history_buttons()
         self.status.clear()
 
-    def _discard_edits(self):
+    def confirm_unsaved(self, action="continue", *, discard=False):
+        """Return False when cancellation or a failed save must stop navigation."""
         if not self._dirty:
             return True
-        return QMessageBox.question(
-            self, "Replace floorplan project?", "Discard unsaved floorplan edits?",
-            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel) == QMessageBox.StandardButton.Discard
+        answer = QMessageBox.question(
+            self, "Unsaved floorplan edits", f"Save floorplan changes before you {action}?\nFloorplans are saved in a separate .roar.floorplan file.",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save)
+        if answer == QMessageBox.StandardButton.Save:
+            return self.save_for_application()
+        if answer == QMessageBox.StandardButton.Discard:
+            if discard:
+                if self._saved_state is not None:
+                    self._restore_editor_state(self._saved_state, refresh_source=False)
+                elif self.project_path is not None and self.project_path.is_file():
+                    self.set_project(FloorplanProject.load(self.project_path), self.project_path)
+                else:
+                    self.project = self.project_path = None
+                    self._set_source(None)
+                    self.devices_table.setRowCount(0)
+                    self.parameters_table.setRowCount(0)
+                    self.constraints_table.setRowCount(0)
+                    self.connectivity.clear()
+                    self.tabs.setEnabled(False)
+                    self._history_current = self._saved_state = None
+                    self._dirty = False
+                    self.setWindowTitle("ROAR Floorplan")
+                self._undo_states.clear()
+                self._redo_states.clear()
+                self._update_history_buttons()
+            return True
+        return False
+
+    def save_for_application(self):
+        """Save the companion before a GUI action claims all work was saved."""
+        if not self._dirty:
+            return True
+        try:
+            return bool(self._save_project())
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
+            self.status.setText(str(exc))
+            QMessageBox.warning(self, "Floorplan could not be saved", str(exc))
+            return False
+
+    def _discard_edits(self):
+        return self.confirm_unsaved("replace this floorplan")
 
     def _load_netlist(self):
         if not self._discard_edits():
             return
-        initial_directory = ""
-        design_directory = os.environ.get("ROAR_DESIGN")
-        if design_directory:
-            examples = Path(design_directory) / "floorplan"
-            if examples.is_dir():
-                initial_directory = str(examples)
-            elif Path(design_directory).is_dir():
-                initial_directory = design_directory
+        initial_directory = _floorplan_example_directory()
         path, _ = QFileDialog.getOpenFileName(self, "Choose circuit netlist", initial_directory, "SPICE (*.sp *.spi *.cir *.spice);;All files (*)")
         if not path:
             return
@@ -988,6 +1283,8 @@ class FloorplanDialog(QDialog):
         if project.unresolved_parameters:
             self.tabs.setCurrentWidget(self.parameters_table.parentWidget())
         self._dirty = True
+        self._saved_state = None
+        self._update_document_title()
 
     def _open_project(self):
         if not self._discard_edits():
@@ -997,6 +1294,9 @@ class FloorplanDialog(QDialog):
             self.set_project(options.project, options.floorplan_path.text(), options.design,
                              options.source_origin)
             self._dirty = self.project.to_dict() != options._candidate.to_dict()
+            if self._dirty:
+                self._saved_state = None
+            self._update_document_title()
         options.deleteLater()
 
     def _save_project(self, save_as=False):
@@ -1007,13 +1307,17 @@ class FloorplanDialog(QDialog):
             if path and not Path(path).suffix:
                 path += ".roar.floorplan"
         if path:
-            candidate.save(path)
+            with self.placement_panel.save_as_transaction(path):
+                candidate.save(path)
             self.project = candidate
             self.project_path = Path(path)
             self._dirty = False
+            self._history_current = self._saved_state = self._editor_state()
             self._update_document_title()
             self.status.setText(f"Saved {path}")
-            self.placement_panel.saved_as(self.project_path)
+            self.placement_panel.schedule_refresh()
+            return True
+        return False
 
     def _export_align(self):
         self._ensure_current_source()
@@ -1038,7 +1342,7 @@ class FloorplanDialog(QDialog):
             self.project, design, origin = result
             self._set_source(design, origin)
             self._render()
-            self._dirty = True
+            self._record_edit()
         except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
             self._source_error = str(exc)
             self.source_mode.setCurrentIndex(self.source_mode.findData(self._source_mode))
@@ -1053,8 +1357,11 @@ class FloorplanDialog(QDialog):
         selected_attr = self.binding_attribute.currentData()
         selected_source = self.source_instance.currentText()
         self.roar_design = design
+        self.copy_sizes_group.setEnabled(design is not None)
         self._source_origin = origin if design is not None else None
-        self._source_mode = self._source_origin or "saved"
+        self._source_mode = self._source_origin or (self.project.source_mode if self.project is not None else "saved")
+        if self.project is not None:
+            self.project.source_mode = self._source_mode
         self._source_error = ""
         self.source_mode.setCurrentIndex(self.source_mode.findData(self._source_mode))
         self.source_path.setText(str(self.project.roar_project_path or "") if self.project else "")
@@ -1066,6 +1373,8 @@ class FloorplanDialog(QDialog):
         self.snapshot_label.setText("")
         if design is None:
             self._source_timer.stop()
+            if self.project is not None and self._source_mode == "saved":
+                self.snapshot_label.setText("Captured sizes are fixed. Retained ROAR bindings update only after you select a ROAR sizing source.")
             return
         parameters = design.get_instance_parameters()
         enabled = {row["Instance"] for row in design.instances if not row.get("disabled")}
@@ -1104,7 +1413,7 @@ class FloorplanDialog(QDialog):
             width_convention=self.roar_width.currentData())
         self.project = candidate
         self._render()
-        self._dirty = True
+        self._record_edit()
         self.status.setText("Sizes applied.")
 
     def _import_constraints(self):
@@ -1125,7 +1434,7 @@ class FloorplanDialog(QDialog):
         # individually so opaque rows cannot block ordinary supported edits.
         for constraint in constraints:
             if editable_constraint(constraint):
-                candidate.set_constraints([constraint])
+                candidate._validate_constraints([constraint])
         question = QMessageBox(self)
         question.setWindowTitle("Load ALIGN constraints")
         question.setText(f"Load {len(constraints)} placement rules? Only constraints change; the circuit, sizes and ROAR design link stay the same.")
@@ -1137,7 +1446,9 @@ class FloorplanDialog(QDialog):
         if question.clickedButton() not in (add, replace):
             return
         candidate.constraints = (self.project.constraints + constraints if question.clickedButton() is add else constraints)
+        candidate.constraint_enabled = (self.project.constraint_enabled + [True] * len(constraints)
+                                        if question.clickedButton() is add else [True] * len(constraints))
         self.project = candidate
         self._render_constraints()
-        self._dirty = True
+        self._record_edit()
         self.status.setText(f"Loaded {len(constraints)} placement rules.")

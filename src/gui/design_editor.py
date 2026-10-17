@@ -2548,6 +2548,10 @@ class ROAREditorWindow(QWidget):
             try:
                 with open(file_path, "r") as file:
                     data = json.load(file)
+                app = self.top_level_app
+                if app is not None and hasattr(app, '_confirm_floorplan_navigation'):
+                    if not app._confirm_floorplan_navigation("open another ROAR design"):
+                        return
                 self.expression_editor.load_table_data(data.get("expression_editor", []),
                                                        data.get("expression_tabs"))
                 self.constraint_editor.load_table_data(data.get("constraint_editor", []))
