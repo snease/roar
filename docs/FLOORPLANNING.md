@@ -13,11 +13,27 @@ the headless installation, `pip install -e .`.
 
 ## A companion to the ROAR design
 
-The editable layout data lives in a separate `.floorplan.json` companion file.
+The editable layout data lives in a separate `.roar.floorplan` file.
 It contains the circuit template, chosen subcircuit, size values and bindings,
 placement constraints, and an optional link to a saved ROAR design. ROAR's
 existing `.roar` format is unchanged. Floorplan actions never write to that
-design file or replace the running ROAR workspace.
+design file or replace the running ROAR workspace. Existing `.floorplan.json`
+files still open.
+
+The usual workflow is **New floorplan…** or **Open floorplan…**, edit the sizes
+and constraints, **Save**, then **Export ALIGN inputs…** when ready for ALIGN.
+
+| Action | What it reads or writes |
+| --- | --- |
+| New floorplan… | Reads a circuit netlist to start a new floorplan. A ROAR design can optionally supply sizes. |
+| Open floorplan… | Restores a complete saved floorplan: circuit, sizes, source bindings and placement constraints. |
+| Save / Save as… | Writes that complete editable document as `.roar.floorplan`. |
+| Export ALIGN inputs… | Writes the sized circuit netlist and placement constraints together in ALIGN's required formats. |
+| Advanced: Load ALIGN constraints… | Reads only placement rules from an existing ALIGN constraint file. Choose whether to add them or replace the current rules; the circuit, sizes and ROAR link stay unchanged. |
+
+Constraints belong to the floorplan and are saved with it. A separate constraints
+file is only needed to exchange rules with ALIGN or another tool. There is one
+export action, which includes both the sized netlist and the constraints.
 
 **Open floorplan…** shows both file paths in one dialog. Choosing a floorplan
 fills in its linked ROAR design; you can browse for a different design. An
@@ -39,7 +55,7 @@ unavailable source from the editor.
 ## Try a linked, parameterized OTA
 
 1. Click the header's layout button, then **Open floorplan…** and choose
-   [`cm_ota.floorplan.json`](../design/floorplan/ota/cm_ota.floorplan.json).
+   [`cm_ota.roar.floorplan`](../design/floorplan/ota/cm_ota.roar.floorplan).
    Its linked [`cm_ota_sizes.roar`](../design/floorplan/ota/cm_ota_sizes.roar)
    appears automatically. Open the companion.
 2. Inspect the **Parameters** tab. Each shared symbol lists its affected device
@@ -54,7 +70,7 @@ unavailable source from the editor.
    fresh circuit directory with sized SPICE and native constraint JSON.
 
 This example embeds the actual [`design/cm_ota.spice`](../design/cm_ota.spice)
-template. To start from scratch instead, choose **New from netlist…**, select
+template. To start from scratch instead, choose **New floorplan…**, select
 that file, and choose micrometres and total width. Optionally select
 `cm_ota_sizes.roar` as the sizing source in the same dialog. The template loads
 with unresolved widths and finger counts; you can save that draft and author
@@ -65,7 +81,14 @@ The affected-device column exposes that relationship and preserves it exactly.
 
 ## Try the OTA or common-source example
 
-1. Click the layout button, then **New from netlist…**. Choose
+For a common-source floorplan with sizes and constraints already filled in,
+use **Open floorplan…** to open
+[`common_source.roar.floorplan`](../design/floorplan/common_source/common_source.roar.floorplan).
+No separate constraint file needs to be loaded.
+
+To practice creating a floorplan from a circuit netlist:
+
+1. Click the layout button, then **New floorplan…**. Choose
    [`current_mirror_ota.sp`](../design/floorplan/ota/current_mirror_ota.sp) or
    [`common_source.sp`](../design/floorplan/common_source/common_source.sp).
    The import dialog selects the only subcircuit automatically. Choose a circuit
@@ -76,10 +99,11 @@ The affected-device column exposes that relationship and preserves it exactly.
 2. Edit **W per finger (µm)**, **L (µm)** and **NF** on the Devices tab. Sizes
    are synthetic geometry examples, not optimized or simulation-qualified designs.
    NF must be an even integer of at least two for the SKY130 generator.
-3. On the Constraints tab, use **Import constraints…** to load the sibling
-   `.const.json`, or select an intent and enter device names. Separate names
-   with commas and symmetry pairs or rows with semicolons.
-4. Use **Validate / format JSON**, then **Save** to retain your work.
+3. On the **Constraints** tab, add a constraint and select its devices and
+   settings. Each constraint has its own readable row; select a row to edit
+   or remove it. For these examples, you can also expand **Advanced** and use
+   **Load ALIGN constraints…** to read the sibling `.const.json` file.
+4. Use **Save** to retain your work.
    The project includes the original netlist text, edited sizes and constraints;
    reopening does not depend on the original file still being present.
 5. **Export ALIGN inputs…** asks for a parent folder and creates a fresh
@@ -103,21 +127,25 @@ micrometre inputs.
 
 ## Placement intent
 
-The controls write the same native dictionaries shown in the JSON editor. Edit
-or remove entries directly in that list. See ALIGN's
+Each constraint appears as a row with its type, affected devices or ports, and
+settings. Add a constraint through its form, or select an existing row and edit
+it (double-clicking also opens the form). Changes are validated before applying;
+cancelling leaves the constraint unchanged. No JSON editing is needed.
+
+See ALIGN's
 [constraint reference](https://align-analoglayout.github.io/ALIGN-public/notes/const.html)
 for the underlying semantics.
 
 | Editor intent | Native ALIGN constraint | Meaning |
 | --- | --- | --- |
-| Symmetry | `SymmetricBlocks` | All semicolon-separated pairs share one horizontal or vertical axis. An additional singleton can sit on that axis. |
-| Relative order | `Order` | Left-to-right or top-to-bottom order; reverse the names for the opposite order. |
-| Align | `Align` | Align centers or edges along the selected horizontal or vertical line. |
-| Row | `Order` + `Align` | Order a horizontal row or vertical column and align its centers. |
-| Rows / regions | `Floorplan` | Describe regions as rows, optionally ordered and symmetric. Add `Align` separately when row centers must coincide. |
+| Symmetry | `SymmetricBlocks` | All pairs share one horizontal or vertical axis. An additional singleton can sit on that axis. |
+| Relative order | `Order` | Left-to-right or top-to-bottom order; reverse the device list for the opposite order. Optional abutment requests touching edges. This does not also align centers. |
+| Align centers / edges | `Align` | Align centers or edges along the selected horizontal or vertical line. |
+| Rows / regions | `Floorplan` | Regions run from top to bottom. Optionally order devices left to right within each row, or mirror them around one shared vertical axis. Add `Align` separately when row centers must coincide. |
 | Packing | `CompactPlacement` | Request left, right or centered packing for the entire circuit. |
+| Place closer | `PlaceCloser` | Encourage selected devices to be close together. |
+| Power ports / Ground ports | `PowerPorts` / `GroundPorts` | Identify supply ports, retaining their order and whether the assignment propagates into child circuits. |
 
-`PlaceCloser`, `PowerPorts` and `GroundPorts` are also accepted in the JSON editor.
 Symmetric pairs must have matching models and parameters. Centered packing is a
 placement preference, not a guarantee of exact centering in a fixed boundary.
 
@@ -170,7 +198,7 @@ example = Path("design/floorplan/ota/current_mirror_ota.sp")
 project = FloorplanProject.from_netlist(example)
 project.set_constraints(json.loads(example.with_suffix(".const.json").read_text()))
 project.set_mos_parameters("M1", width_um=1.05, length_um=0.15, nf=4)
-project.save("ota.floorplan.json")
+project.save("ota.roar.floorplan")
 netlist, constraints = project.export_align("floorplan-output")
 ```
 
@@ -196,7 +224,7 @@ design = Design.load(project.roar_project_path)
 project.bind_parameter(design, "w1_2", "M1_2", "W",
                        dimension_unit="m", width_convention="total", source="linked")
 project.set_parameter("nf1_2", 2)
-project.save("ota-draft.floorplan.json")  # remaining symbols can be assigned later
+project.save("ota-draft.roar.floorplan")  # remaining symbols can be assigned later
 ```
 
 `parameter_rows` lists values, units, provenance and affected fields.
@@ -220,12 +248,15 @@ ALIGN generates its own device geometry. Other extra parameters, arithmetic
 sizing expressions, hierarchy, includes and unsupported device kinds produce
 actionable errors. This adapter is a bounded layout export, not a SPICE simulator.
 
-The JSON controls support the subset listed above. Unsupported constraint
-dictionaries already present in project JSON can be saved and reopened for
-inspection; validation and export refuse them. This keeps project data intact
-while making the current compatibility boundary explicit.
-The **Import constraints…** action validates immediately and accepts supported
-types only.
+The constraint forms support the subset listed above. Unsupported constraints
+or settings already present in a saved floorplan remain visible and are
+preserved when saving. They cannot be edited through a form that does not
+understand them, and validation/export explains the unsupported setting.
+The advanced **Load ALIGN constraints…** action checks supported rules before
+changing the floorplan. Rules with unsupported types or settings are retained
+as clearly marked, read-only rows; they must be removed or replaced before
+export. A file in the wrong format, an invalid supported rule, or cancellation
+leaves the existing constraints intact.
 
 ## Checks
 
@@ -247,8 +278,8 @@ SKY130 ALIGN PDK directory containing `models.sp`:
     --repo /path/to/roar --pdk /path/to/ALIGN-pdk-sky130/SKY130_PDK
 ```
 
-This checks both numeric examples, the linked OTA companion, and
-ordinary/symmetric xschem rows through
+This checks both numeric examples, the saved OTA and common-source floorplans,
+and ordinary/symmetric xschem rows through
 ALIGN's parser, constraint verification and native placement translation. It
 prints a receipt and writes bundles and logs to a temporary directory. It does
 not run physical placement or routing.

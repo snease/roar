@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 try:
     from PyQt6.QtCore import QTimer, Qt
-    from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QWidget
+    from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QPushButton, QWidget
 except ImportError:
     QApplication = None
 
@@ -18,6 +18,7 @@ from roar_api.floorplan import FloorplanProject
 
 if QApplication is not None:
     from roar_api.floorplan.dialog import FloorplanDialog, NetlistImportDialog, OpenFloorplanDialog, load_roar_design
+    from roar_api.floorplan.constraint_editor import ConstraintEditorDialog, editable_constraint, constraint_summary
 
 
 NETLIST = """.subckt pair d g s b
@@ -56,20 +57,35 @@ class FloorplanDialogTests(unittest.TestCase):
         self.app.processEvents()
         self.directory.cleanup()
 
-    def test_controls_create_shared_axis_rows_alignment_and_packing(self):
-        self.dialog.constraint_instances.setText("M1, M2; M3, M4")
-        self.dialog._add_intent()
-        self.assertEqual(self.dialog.project.constraints[0]["pairs"], [["M1", "M2"], ["M3", "M4"]])
-        for kind, names in (("Relative order", "M1,M2"), ("Align", "M1,M2"),
-                            ("Row", "M1,M2"), ("Rows / regions", "M1,M2;M3,M4"),
-                            ("Packing", "")):
-            self.dialog.constraint_kind.setCurrentText(kind)
-            self.dialog.constraint_instances.setText(names)
-            self.dialog._add_intent()
+    def test_constraints_have_readable_rows_and_typed_add_for_every_kind(self):
+        for kind in ("SymmetricBlocks", "Order", "Align", "Floorplan", "CompactPlacement", "PlaceCloser", "PowerPorts", "GroundPorts"):
+            def accept_constraint(kind=kind):
+                editor = QApplication.activeModalWidget()
+                editor.kind.setCurrentIndex(editor.kind.findData(kind))
+                if kind == "SymmetricBlocks":
+                    for column, name in enumerate(("M1", "M2")):
+                        choice = editor.pairs_editor.table.cellWidget(0, column)
+                        choice.setCurrentIndex(choice.findData(name))
+                elif kind == "Floorplan":
+                    editor.regions_editor.devices.set_names(["M1", "M2"])
+                    editor.regions_editor.add_row(["M3", "M4"])
+                    editor.flags["order"][0].setChecked(True)
+                    editor.flags["symmetrize"][0].setChecked(True)
+                elif kind == "CompactPlacement":
+                    editor.option.setCurrentIndex(editor.option.findData("center"))
+                else:
+                    editor.names_editor.set_names(["d", "s"] if kind in ("PowerPorts", "GroundPorts") else ["M2", "M1"])
+                editor.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+            QTimer.singleShot(0, accept_constraint)
+            self.dialog._add_constraint()
+        self.assertEqual(self.dialog.constraints_table.rowCount(), 8)
+        self.assertEqual(self.dialog.project.constraints[0]["pairs"], [["M1", "M2"]])
+        self.assertEqual(self.dialog.project.constraints[3]["regions"], [["M1", "M2"], ["M3", "M4"]])
+        self.assertEqual(self.dialog.constraints_table.item(6, 0).text(), "Power ports")
+        self.assertIn("first grid port: d", self.dialog.constraints_table.item(6, 2).text())
+        self.assertFalse(hasattr(self.dialog, "constraints_json"))
+        self.assertFalse(hasattr(self.dialog, "_export_constraints"))
         self.dialog._collect_project().validate()
-        self.assertEqual(self.dialog.project.constraints[-1],
-                         {"constraint": "CompactPlacement", "style": "left"})
-        self.assertEqual(self.dialog.project.constraints[-2]["regions"], [["M1", "M2"], ["M3", "M4"]])
 
     def test_explicit_snapshot_mapping_and_total_width_conversion(self):
         original = self.design.to_state()
@@ -125,12 +141,9 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._load_netlist()
         self.assertEqual(picker.call_args.args[2], str(examples))
         self.assertEqual(self.dialog.project.devices[0].width_um, 4)
-        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(source), "")):
-            with self.assertRaisesRegex(ValueError, "cannot overwrite the source"):
-                self.dialog._export_constraints()
-        self.assertIn(".subckt", source.read_text())
-        self.dialog.constraint_instances.setText("M1, M2")
-        self.dialog._add_intent()
+        self.dialog.project.set_constraints([{
+            "constraint": "SymmetricBlocks", "pairs": [["M1", "M2"]], "direction": "V"}])
+        self.dialog._render_constraints()
         project_path = self.root / "saved.floorplan.json"
         with patch.object(QFileDialog, "getSaveFileName", return_value=(str(project_path), "")):
             self.dialog._save_project()
@@ -199,27 +212,150 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertIs(self.dialog.project, original)
         self.assertFalse(self.dialog._dirty)
 
-    def test_constraints_import_can_replace_invalid_editor_and_export(self):
-        native = [{"constraint": "Order", "instances": ["M2", "M1"], "direction": "left_to_right"}]
-        source = self.root / "constraints.json"
-        source.write_text(json.dumps(native))
-        self.dialog.constraints_json.setPlainText("unfinished JSON")
+    def test_load_align_constraints_add_replace_cancel_and_wrong_file_are_safe(self):
+        initial = {"constraint": "Order", "instances": ["M1", "M2"], "direction": "left_to_right", "abut": True}
+        loaded = [{"constraint": "PowerPorts", "ports": ["d", "s"], "propagate": False},
+                  {"constraint": "FutureRule", "opaque": {"preserve": [1, 2]}}]
+        self.dialog.project.constraints = [initial]
+        self.dialog._render_constraints()
+        source = self.root / "rules.const.json"
+        source.write_text(json.dumps(loaded))
+        for action, expected in (("Add to existing", [initial] + loaded), ("Replace existing", loaded)):
+            previous = self.dialog.project.to_dict()
+            def choose_action(action=action):
+                question = QApplication.activeModalWidget()
+                next(button for button in question.buttons() if button.text() == action).click()
+            QTimer.singleShot(0, choose_action)
+            with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+                self.dialog._import_constraints()
+            self.assertEqual(self.dialog.project.constraints, expected)
+            current = self.dialog.project.to_dict()
+            self.assertEqual({key: value for key, value in current.items() if key != "constraints"},
+                             {key: value for key, value in previous.items() if key != "constraints"})
+        original = self.dialog.project
+        QTimer.singleShot(0, lambda: QApplication.activeModalWidget().button(QMessageBox.StandardButton.Cancel).click())
         with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
             self.dialog._import_constraints()
-        target = self.root / "out.json"
-        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(target), "")):
-            self.dialog._export_constraints()
-        self.assertEqual(json.loads(target.read_text()), native)
+        self.assertIs(self.dialog.project, original)
+        sidecar = self.root / "whole.roar.floorplan"
+        self.dialog.project.save(sidecar)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(sidecar), "")):
+            with self.assertRaisesRegex(ValueError, "Use Open floorplan"):
+                self.dialog._import_constraints()
+        design = self.root / "source.roar"
+        self.design.save(design)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(design), "")):
+            with self.assertRaisesRegex(ValueError, "placement rules"):
+                self.dialog._import_constraints()
+        self.assertIs(self.dialog.project, original)
 
-    def test_unsupported_imported_constraint_survives_project_save(self):
-        self.dialog.constraints_json.setPlainText('[{"constraint": "FutureConstraint", "value": 1}]')
-        target = self.root / "future.floorplan.json"
+    def test_opaque_rows_survive_supported_edit_cancel_remove_and_save(self):
+        opaque = {"constraint": "FutureConstraint", "value": {"nested": [1, "keep"]}}
+        extra = {"constraint": "Order", "instances": ["M1", "M2"], "direction": "left_to_right", "new_flag": 3}
+        supported = {"constraint": "Order", "instances": ["M2", "M1"], "direction": "left_to_right", "abut": True}
+        self.dialog.project.constraints = [opaque, extra, supported]
+        self.dialog._render_constraints()
+        self.dialog.constraints_table.selectRow(0)
+        self.assertFalse(self.dialog.edit_constraint_button.isEnabled())
+        self.dialog.constraints_table.selectRow(1)
+        self.assertFalse(self.dialog.edit_constraint_button.isEnabled())
+        self.dialog.constraints_table.selectRow(2)
+        original = self.dialog.project.to_dict()
+        def cancel_edit():
+            editor = QApplication.activeModalWidget()
+            editor.option.setCurrentIndex(editor.option.findData("top_to_bottom"))
+            editor.reject()
+        QTimer.singleShot(0, cancel_edit)
+        self.dialog._edit_constraint()
+        self.assertEqual(self.dialog.project.to_dict(), original)
+        def accept_edit():
+            editor = QApplication.activeModalWidget()
+            editor.option.setCurrentIndex(editor.option.findData("top_to_bottom"))
+            editor.accept()
+        QTimer.singleShot(0, accept_edit)
+        self.dialog.constraints_table.cellDoubleClicked.emit(2, 0)
+        self.assertEqual(self.dialog.project.constraints[:2], [opaque, extra])
+        self.assertEqual(self.dialog.project.constraints[2], dict(supported, direction="top_to_bottom"))
+        self.dialog._remove_constraint()
+        self.assertEqual(self.dialog.project.constraints, [opaque, extra])
+        target = self.root / "preserved.roar.floorplan"
         with patch.object(QFileDialog, "getSaveFileName", return_value=(str(target), "")):
             self.dialog._save_project()
-        restored = FloorplanProject.load(target)
-        self.assertEqual(restored.constraints, [{"constraint": "FutureConstraint", "value": 1}])
+        self.assertEqual(FloorplanProject.load(target).constraints, [opaque, extra])
         with self.assertRaisesRegex(ValueError, "Unsupported"):
-            restored.validate()
+            self.dialog._export_align()
+
+    def test_typed_editor_roundtrips_native_defaults_optional_flags_and_order(self):
+        native = [
+            {"constraint": "SymmetricBlocks", "pairs": [["M2", "M1"], ["M3"]], "direction": "H"},
+            {"constraint": "Order", "instances": ["M2", "M1"], "direction": "top_to_bottom"},
+            {"constraint": "Order", "instances": ["M2", "M1"], "direction": "left_to_right", "abut": False},
+            {"constraint": "Align", "instances": ["M1", "M2"], "line": "v_right"},
+            {"constraint": "Floorplan", "regions": [["M2", "M1"], ["M3", "M4"]], "order": False, "symmetrize": True},
+            {"constraint": "CompactPlacement"},
+            {"constraint": "CompactPlacement", "style": "right"},
+            {"constraint": "PlaceCloser", "instances": ["M3", "M1"]},
+            {"constraint": "PowerPorts", "ports": ["s", "d"]},
+            {"constraint": "GroundPorts", "ports": ["b", "s"], "propagate": False},
+        ]
+        for constraint in native:
+            with self.subTest(constraint=constraint):
+                editor = ConstraintEditorDialog(self.dialog.project, constraint, parent=self.parent)
+                self.assertEqual(editor.value(), constraint)
+                editor.accept()
+                self.assertEqual(editor.result(), QDialog.DialogCode.Accepted)
+                self.assertEqual(editor.constraint, constraint)
+                editor.deleteLater()
+        for invalid in ({"constraint": "Order", "instances": ["M1", "M2"], "direction": "right_to_left"},
+                        {"constraint": "SymmetricBlocks", "pairs": [["M1", "M2"]]},
+                        {"constraint": ["opaque"], "keep": 1}):
+            self.assertFalse(editable_constraint(invalid))
+            self.assertIn("preserved", constraint_summary(invalid)[2])
+
+    def test_region_device_changes_and_order_are_explicit_without_json(self):
+        editor = ConstraintEditorDialog(self.dialog.project, parent=self.parent)
+        editor.kind.setCurrentIndex(editor.kind.findData("Floorplan"))
+        regions = editor.regions_editor
+        self.assertEqual(regions.regions(), [[]])
+        regions.devices.set_names(["M1", "M2"])
+        regions.add_row(["M3", "M4"])
+        regions.rows.setCurrentRow(0)
+        regions.devices.items.setCurrentRow(1)
+        regions.devices.move(-1)
+        self.assertEqual(regions.regions(), [["M2", "M1"], ["M3", "M4"]])
+        regions.move(1)
+        self.assertEqual(regions.regions(), [["M3", "M4"], ["M2", "M1"]])
+        editor.accept()
+        self.assertEqual(editor.result(), QDialog.DialogCode.Accepted)
+        editor.deleteLater()
+
+    def test_floorplan_names_filters_default_extension_and_source_protection(self):
+        labels = [button.text() for button in self.dialog.findChildren(QPushButton)]
+        self.assertIn("New floorplan…", labels)
+        self.assertIn("Open floorplan…", labels)
+        target = self.root / "no_extension"
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(target), "")) as picker:
+            self.dialog._save_project()
+        self.assertEqual(picker.call_args.args[2], "pair.roar.floorplan")
+        self.assertTrue(Path(str(target) + ".roar.floorplan").exists())
+        legacy = self.root / "legacy.floorplan.json"
+        self.dialog.project.save(legacy)
+        options = OpenFloorplanDialog(self.parent)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(legacy), "")) as picker:
+            options._browse_floorplan()
+        self.assertEqual(picker.call_args.args[1], "Choose Floorplan")
+        self.assertIn("*.roar.floorplan", picker.call_args.args[3])
+        self.assertIn("*.floorplan.json", picker.call_args.args[3])
+        options.accept()
+        self.assertEqual(options.result(), QDialog.DialogCode.Accepted)
+        options.deleteLater()
+        source = self.root / "source.roar"
+        self.design.save(source)
+        original = source.read_bytes()
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(source), "")):
+            with self.assertRaisesRegex(ValueError, "cannot overwrite a ROAR project"):
+                self.dialog._save_project(save_as=True)
+        self.assertEqual(source.read_bytes(), original)
 
     def test_close_reopen_preserves_project_and_parent(self):
         self.dialog.show()

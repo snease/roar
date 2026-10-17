@@ -16,10 +16,11 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMessageBox, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem,
-    QTextEdit, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 from .model import FloorplanProject
+from .constraint_editor import ConstraintEditorDialog, constraint_summary, editable_constraint
 
 
 def load_roar_design(path):
@@ -55,7 +56,7 @@ class OpenFloorplanDialog(QDialog):
         self.floorplan_path = QLineEdit()
         self.design_path = QLineEdit()
         for label, field, action in (
-                ("Floorplan (.floorplan.json):", self.floorplan_path, self._browse_floorplan),
+                ("Floorplan (.roar.floorplan):", self.floorplan_path, self._browse_floorplan),
                 ("ROAR design (.roar), optional:", self.design_path, self._browse_design)):
             row = QHBoxLayout()
             row.addWidget(field)
@@ -91,8 +92,8 @@ class OpenFloorplanDialog(QDialog):
 
     def _browse_floorplan(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Choose floorplan sidecar", self.floorplan_path.text(),
-            "Floorplan (*.floorplan.json *.json);;All files (*)")
+            self, "Choose Floorplan", self.floorplan_path.text(),
+            "Floorplan (*.roar.floorplan *.floorplan.json *.json);;All files (*)")
         if path:
             self.floorplan_path.setText(path)
             self._floorplan_changed()
@@ -300,12 +301,15 @@ class FloorplanDialog(QDialog):
         note.setWordWrap(True)
         layout.addWidget(note)
         bar = QHBoxLayout()
-        for title, action in (("New from netlist…", self._load_netlist),
+        for title, action in (("New floorplan…", self._load_netlist),
                               ("Open floorplan…", self._open_project),
                               ("Save", self._save_project),
                               ("Save as…", lambda: self._save_project(save_as=True)),
                               ("Export ALIGN inputs…", self._export_align)):
-            bar.addWidget(self._button(title, action))
+            button = self._button(title, action)
+            if title == "Export ALIGN inputs…":
+                button.setToolTip("Export a sized netlist and placement constraints together for ALIGN.")
+            bar.addWidget(button)
         layout.addLayout(bar)
         self.project_label = QLabel("Load a SPICE netlist or open a floorplan project.")
         self.project_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -568,58 +572,108 @@ class FloorplanDialog(QDialog):
     def _build_constraints_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        help_label = QLabel(
-            "Choose devices on the Devices tab, or type names in the desired order. "
-            "Add an intent below, or edit/import the native ALIGN JSON list. "
-            "Separate pairs or rows with semicolons (M1, M2; M3, M4). "
-            "Symmetry pairs share one axis; rows express intent, not fixed coordinates.")
-        help_label.setWordWrap(True)
-        layout.addWidget(help_label)
-        self.constraint_instances = QLineEdit()
-        self.constraint_instances.setPlaceholderText("Ordered instances, e.g. M1, M2, M3")
-        layout.addWidget(self.constraint_instances)
+        note = QLabel("Each row is one placement rule. Double-click a row to edit it. Unsupported settings stay saved unchanged; ALIGN export validates every rule.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.constraints_table = QTableWidget(0, 3)
+        self.constraints_table.setHorizontalHeaderLabels(["Constraint", "Devices / ports", "Settings"])
+        self.constraints_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.constraints_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.constraints_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.constraints_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.constraints_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.constraints_table.itemSelectionChanged.connect(self._constraint_selection)
+        self.constraints_table.cellDoubleClicked.connect(lambda _row, _column: self._guard(self._edit_constraint))
+        layout.addWidget(self.constraints_table)
         controls = QHBoxLayout()
-        self.constraint_kind = QComboBox()
-        self.constraint_kind.addItems(["Symmetry", "Relative order", "Align", "Row", "Rows / regions", "Packing"])
-        self.constraint_option = QComboBox()
-        self.constraint_kind.currentTextChanged.connect(self._constraint_options)
-        self._constraint_options()
-        controls.addWidget(self.constraint_kind)
-        controls.addWidget(self.constraint_option)
-        controls.addWidget(self._button("Add intent", self._add_intent))
+        controls.addWidget(self._button("Add constraint…", self._add_constraint))
+        self.edit_constraint_button = self._button("Edit…", self._edit_constraint)
+        self.remove_constraint_button = self._button("Remove", self._remove_constraint)
+        controls.addWidget(self.edit_constraint_button)
+        controls.addWidget(self.remove_constraint_button)
+        controls.addStretch()
+        controls.addWidget(self._button("Check constraints", self._check_constraints))
         layout.addLayout(controls)
-        self.constraints_json = QTextEdit()
-        self.constraints_json.setAcceptRichText(False)
-        self.constraints_json.setPlainText("[]")
-        self.constraints_json.textChanged.connect(self._mark_dirty)
-        layout.addWidget(self.constraints_json)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self._button("Validate / format JSON", self._validate_editor))
-        buttons.addWidget(self._button("Import constraints…", self._import_constraints))
-        buttons.addWidget(self._button("Export constraints…", self._export_constraints))
-        layout.addLayout(buttons)
+        advanced = QGroupBox("Advanced: ALIGN interchange")
+        advanced.setCheckable(True)
+        advanced.setChecked(False)
+        advanced_layout = QVBoxLayout(advanced)
+        advanced_content = QWidget()
+        advanced_content_layout = QVBoxLayout(advanced_content)
+        advanced_content_layout.setContentsMargins(0, 0, 0, 0)
+        explanation = QLabel("Load placement rules from another ALIGN project. This changes only constraints; the circuit, sizes and ROAR design link stay the same. Use Open floorplan to open a complete floorplan file.")
+        explanation.setWordWrap(True)
+        advanced_content_layout.addWidget(explanation)
+        advanced_content_layout.addWidget(self._button("Load ALIGN constraints…", self._import_constraints))
+        advanced_layout.addWidget(advanced_content)
+        advanced.toggled.connect(advanced_content.setVisible)
+        advanced_content.setVisible(False)
+        layout.addWidget(advanced)
         self.tabs.addTab(tab, "Constraints")
+        self._constraint_selection()
 
-    def _constraint_options(self, *_args):
-        options = {
-            "Symmetry": [("Vertical axis (left / right)", "V"),
-                         ("Horizontal axis (above / below)", "H")],
-            "Relative order": [("Left to right", "left_to_right"),
-                               ("Top to bottom", "top_to_bottom")],
-            "Align": [("Horizontal centers (same y)", "h_center"),
-                      ("Vertical centers (same x)", "v_center"),
-                      ("Bottom edges", "h_bottom"), ("Top edges", "h_top"),
-                      ("Left edges", "v_left"), ("Right edges", "v_right")],
-            "Row": [("Horizontal row", "horizontal"), ("Vertical column", "vertical")],
-            "Rows / regions": [("Ordered rows, top to bottom", "ordered"),
-                               ("Ordered symmetric rows", "symmetric"),
-                               ("Unordered regions", "unordered")],
-            "Packing": [("Pack left", "left"), ("Pack center", "center"),
-                        ("Pack right", "right")],
-        }
-        self.constraint_option.clear()
-        for label, value in options[self.constraint_kind.currentText()]:
-            self.constraint_option.addItem(label, value)
+    def _constraint_selection(self):
+        index = self.constraints_table.currentRow()
+        selected = self.project is not None and 0 <= index < len(self.project.constraints)
+        editable = selected and editable_constraint(self.project.constraints[index])
+        self.edit_constraint_button.setEnabled(editable)
+        self.edit_constraint_button.setToolTip("" if editable else "Unsupported settings are preserved; remove or replace this row to change them.")
+        self.remove_constraint_button.setEnabled(selected)
+
+    def _render_constraints(self):
+        self.constraints_table.setRowCount(len(self.project.constraints))
+        for row, constraint in enumerate(self.project.constraints):
+            for column, value in enumerate(constraint_summary(constraint)):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.constraints_table.setItem(row, column, item)
+        self._constraint_selection()
+
+    def _selected_device_names(self):
+        rows = sorted({index.row() for index in self.devices_table.selectedIndexes()})
+        return [self.devices_table.item(row, 0).text() for row in rows]
+
+    def _add_constraint(self):
+        candidate = self._collect_project()
+        options = ConstraintEditorDialog(candidate, selected_devices=self._selected_device_names(), parent=self)
+        if options.exec() == QDialog.DialogCode.Accepted:
+            candidate.constraints.append(options.constraint)
+            self.project = candidate
+            self._render_constraints()
+            self.constraints_table.selectRow(len(candidate.constraints) - 1)
+            self._dirty = True
+            self.status.setText("Constraint added.")
+        options.deleteLater()
+
+    def _edit_constraint(self):
+        candidate = self._collect_project()
+        index = self.constraints_table.currentRow()
+        if not 0 <= index < len(candidate.constraints):
+            return
+        options = ConstraintEditorDialog(candidate, candidate.constraints[index], parent=self)
+        if options.exec() == QDialog.DialogCode.Accepted:
+            candidate.constraints[index] = options.constraint
+            self.project = candidate
+            self._render_constraints()
+            self.constraints_table.selectRow(index)
+            self._dirty = True
+            self.status.setText("Constraint updated.")
+        options.deleteLater()
+
+    def _remove_constraint(self):
+        candidate = self._collect_project()
+        index = self.constraints_table.currentRow()
+        if 0 <= index < len(candidate.constraints):
+            candidate.remove_constraint(index)
+            self.project = candidate
+            self._render_constraints()
+            self._dirty = True
+            self.status.setText("Constraint removed.")
+
+    def _check_constraints(self):
+        candidate = self._collect_project()
+        candidate.set_constraints(candidate.constraints)
+        self.status.setText("Constraint fields are valid. Physical placement feasibility is not checked.")
 
     @staticmethod
     def _names(text):
@@ -630,14 +684,13 @@ class FloorplanDialog(QDialog):
             return
         rows = sorted({index.row() for index in self.devices_table.selectedIndexes()})
         names = ", ".join(self.devices_table.item(row, 0).text() for row in rows)
-        self.constraint_instances.setText(names)
         self.import_targets.setText(names)
 
     def _require_project(self):
         if self.project is None:
             raise ValueError("Load a netlist or open a floorplan project first.")
 
-    def _collect_project(self, read_constraints=True):
+    def _collect_project(self):
         """Validate a copy so a bad cell/JSON edit never partially changes state."""
         self._require_project()
         candidate = FloorplanProject.from_dict(self.project.to_dict())
@@ -651,16 +704,6 @@ class FloorplanDialog(QDialog):
             except (ValueError, AttributeError) as exc:
                 raise ValueError(f"{device.name}: enter numeric W/L and an integer NF.") from exc
             candidate.set_mos_parameters(device.name, width_um=width, length_um=length, nf=nf)
-        if read_constraints:
-            try:
-                constraints = json.loads(self.constraints_json.toPlainText())
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Constraint JSON: {exc}") from exc
-            if not isinstance(constraints, list) or any(not isinstance(item, dict) for item in constraints):
-                raise ValueError("Constraints must be a JSON list of native ALIGN dictionaries.")
-            # Project saving preserves imported constraints, including unsupported
-            # types. Full semantic validation belongs to Validate and Export.
-            candidate.constraints = constraints
         return candidate
 
     def _render(self):
@@ -689,8 +732,7 @@ class FloorplanDialog(QDialog):
                     if column < 3 or device.kind != "mos" or controlled:
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self.devices_table.setItem(row, column, item)
-            self.constraints_json.setPlainText(json.dumps(project.constraints, indent=2))
-            self.constraint_instances.clear()
+            self._render_constraints()
             self.import_targets.clear()
             self.parameter_symbol.clear()
             rows = project.parameter_rows
@@ -752,7 +794,7 @@ class FloorplanDialog(QDialog):
                 initial_directory = str(examples)
             elif Path(design_directory).is_dir():
                 initial_directory = design_directory
-        path, _ = QFileDialog.getOpenFileName(self, "Load SPICE netlist", initial_directory, "SPICE (*.sp *.spi *.cir *.spice);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose circuit netlist", initial_directory, "SPICE (*.sp *.spi *.cir *.spice);;All files (*)")
         if not path:
             return
         options = NetlistImportDialog(path, self, snapshot_available=self.snapshot_provider is not None)
@@ -793,7 +835,9 @@ class FloorplanDialog(QDialog):
         candidate = self._collect_project()
         path = str(self.project_path) if self.project_path and not save_as else ""
         if not path:
-            path, _ = QFileDialog.getSaveFileName(self, "Save floorplan sidecar", str(self.project_path or f"{candidate.top}.floorplan.json"), "Floorplan (*.floorplan.json);;JSON (*.json)")
+            path, _ = QFileDialog.getSaveFileName(self, "Save Floorplan", str(self.project_path or f"{candidate.top}.roar.floorplan"), "Floorplan (*.roar.floorplan);;Legacy floorplan (*.floorplan.json)")
+            if path and not Path(path).suffix:
+                path += ".roar.floorplan"
         if path:
             candidate.save(path)
             self.project = candidate
@@ -875,68 +919,37 @@ class FloorplanDialog(QDialog):
         self._dirty = True
         self.status.setText("Imported sizes into the floorplan project. The ROAR design is unchanged.")
 
-    def _add_intent(self):
-        candidate = self._collect_project()
-        groups = [self._names(group) for group in self.constraint_instances.text().split(";")]
-        names = groups[0]
-        kind = self.constraint_kind.currentText()
-        if kind not in ("Symmetry", "Rows / regions") and len(groups) > 1:
-            raise ValueError("Use one comma-separated device list for this intent.")
-        option = self.constraint_option.currentData()
-        additions = []
-        if kind == "Symmetry":
-            if any(len(group) not in (1, 2) for group in groups):
-                raise ValueError("Use two devices per symmetry pair; an additional one-device group can sit on the shared axis. Separate groups with semicolons.")
-            additions = [{"constraint": "SymmetricBlocks", "pairs": groups, "direction": option}]
-        elif kind == "Relative order":
-            additions = [{"constraint": "Order", "instances": names, "direction": option}]
-        elif kind == "Align":
-            additions = [{"constraint": "Align", "instances": names, "line": option}]
-        elif kind == "Row":
-            additions = [
-                {"constraint": "Order", "instances": names,
-                 "direction": "left_to_right" if option == "horizontal" else "top_to_bottom"},
-                {"constraint": "Align", "instances": names,
-                 "line": "h_center" if option == "horizontal" else "v_center"},
-            ]
-        elif kind == "Rows / regions":
-            additions = [{"constraint": "Floorplan", "regions": groups,
-                          "order": option != "unordered", "symmetrize": option == "symmetric"}]
-        else:
-            additions = [{"constraint": "CompactPlacement", "style": option}]
-        candidate.set_constraints(candidate.constraints + additions)
-        self.project = candidate
-        self._rendering = True
-        self.constraints_json.setPlainText(json.dumps(candidate.constraints, indent=2))
-        self._rendering = False
-        self._dirty = True
-        self.status.setText("Placement intent added. Edit the JSON list to revise or remove constraints.")
-
-    def _validate_editor(self):
-        candidate = self._collect_project()
-        candidate.validate()
-        self.project = candidate
-        self.constraints_json.setPlainText(json.dumps(candidate.constraints, indent=2))
-        self.status.setText("Sizes and supported constraint fields are valid. Physical feasibility is not checked.")
-
     def _import_constraints(self):
-        candidate = self._collect_project(read_constraints=False)
-        path, _ = QFileDialog.getOpenFileName(self, "Import native ALIGN constraint list", "", "JSON (*.json)")
-        if path:
-            candidate.set_constraints(json.loads(Path(path).read_text(encoding="utf-8")))
-            self.project = candidate
-            self.constraints_json.setPlainText(json.dumps(candidate.constraints, indent=2))
-            self.status.setText(f"Imported constraints from {path}")
-
-    def _export_constraints(self):
         candidate = self._collect_project()
-        candidate.validate()
-        path, _ = QFileDialog.getSaveFileName(self, "Export native ALIGN constraint list", f"{candidate.top}.const.json", "JSON (*.json)")
-        if path:
-            if candidate.source_path and Path(path).resolve() == Path(candidate.source_path).resolve():
-                raise ValueError("Constraint export cannot overwrite the source netlist.")
-            if Path(path).suffix.lower() == ".roar" or (
-                    candidate.roar_project_path and Path(path).resolve() == Path(candidate.roar_project_path)):
-                raise ValueError("Constraint export cannot overwrite a ROAR design.")
-            Path(path).write_text(json.dumps(candidate.constraints, indent=2) + "\n", encoding="utf-8")
-            self.status.setText(f"Exported {path}")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load ALIGN constraints", "", "ALIGN placement rules (*.const.json *.json);;All files (*)")
+        if not path:
+            return
+        try:
+            constraints = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise ValueError("Choose ALIGN placement rules (.const.json). No netlist, device sizes or ROAR design are loaded by this action.") from exc
+        if isinstance(constraints, dict) and "source_netlist" in constraints:
+            raise ValueError("This is a complete floorplan. Use Open floorplan to open it; Load ALIGN constraints expects placement rules (.const.json) only.")
+        if not isinstance(constraints, list) or any(not isinstance(item, dict) for item in constraints):
+            raise ValueError("Choose ALIGN placement rules (.const.json), not a ROAR design or netlist. This action loads only constraints.")
+        # Unknown records remain visible and saved. Validate supported records
+        # individually so opaque rows cannot block ordinary supported edits.
+        for constraint in constraints:
+            if editable_constraint(constraint):
+                candidate.set_constraints([constraint])
+        question = QMessageBox(self)
+        question.setWindowTitle("Load ALIGN constraints")
+        question.setText(f"Load {len(constraints)} placement rules? Only constraints change; the circuit, sizes and ROAR design link stay the same.")
+        add = question.addButton("Add to existing", QMessageBox.ButtonRole.AcceptRole)
+        replace = question.addButton("Replace existing", QMessageBox.ButtonRole.DestructiveRole)
+        question.addButton(QMessageBox.StandardButton.Cancel)
+        question.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        question.exec()
+        if question.clickedButton() not in (add, replace):
+            return
+        candidate.constraints = (self.project.constraints + constraints if question.clickedButton() is add else constraints)
+        self.project = candidate
+        self._render_constraints()
+        self._dirty = True
+        self.status.setText(f"Loaded {len(constraints)} ALIGN placement rules; circuit, sizes and ROAR link are unchanged.")
