@@ -791,6 +791,8 @@ except Exception:
 class ROARHeader(QWidget):
     def __init__(self, parent=None, top_level_app=None):
         super().__init__(parent)
+        self.top_level_app = top_level_app
+        self._floorplan_dialog = None
 
         # Set a taller fixed height for the header
         self.roar_teal = '#1C8091'
@@ -799,7 +801,7 @@ class ROARHeader(QWidget):
         # self.setAutoFillBackground(True)  # Ensures the background color applies
 
         # Apply stylesheet to enforce background color
-        self.setStyleSheet(f"background-color: {self.roar_teal};")
+        self.setStyleSheet(f"ROARHeader {{ background-color: {self.roar_teal}; }}")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         # Layout adjustments
@@ -861,6 +863,7 @@ class ROARHeader(QWidget):
             }
         """)
         self.layout_button.clicked.connect(self.on_layout_button_clicked)
+        self.layout_button.setToolTip("Floorplan: author sizes and placement intent")
 
         # Add widgets to layout
         layout.addWidget(self.graph_calc_icon)
@@ -871,12 +874,20 @@ class ROARHeader(QWidget):
         self.setLayout(layout)
 
     def on_layout_button_clicked(self):
-        """Show a popup when the layout button is clicked."""
-        msg_box = QMessageBox()
-        msg_box.setWindowTitle("Layout Integration")
-        msg_box.setText("Feature Coming Soon\n\nWhat would you like to see with layout integration?")
-        msg_box.setIcon(QMessageBox.Icon.Information)
-        msg_box.exec()
+        """Keep one parent-owned floorplan editor across close/reopen cycles."""
+        if self._floorplan_dialog is None:
+            from roar_api.floorplan.dialog import FloorplanDialog
+
+            def snapshot():
+                from roar_api import Design
+                if self.top_level_app is None:
+                    raise ValueError("No ROAR application is available to read sizes.")
+                return Design.from_state(self.top_level_app.capture_app_state())
+
+            self._floorplan_dialog = FloorplanDialog(self, snapshot_provider=snapshot)
+        self._floorplan_dialog.show()
+        self._floorplan_dialog.raise_()
+        self._floorplan_dialog.activateWindow()
 
 
 class CalculatorDialog(QDialog):

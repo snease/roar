@@ -16,6 +16,10 @@ See the [Python API guide](docs/PYTHON_API.md) for headless design editing,
 evaluation/exports, and live GUI sessions. Install with `pip install -e .`
 (headless) or `pip install -e '.[gui]'` (desktop).
 
+The header's layout button opens the [floorplan constraint editor](docs/FLOORPLANNING.md)
+for sizing devices and exporting placement intent to ALIGN. OTA and common-source
+examples are included.
+
 ## Install
 
 ```tcsh
