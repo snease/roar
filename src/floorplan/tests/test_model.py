@@ -30,7 +30,7 @@ class ProjectTests(unittest.TestCase):
             text = netlist.read_text()
             self.assertIn('M1 VOUT VIN VSS VSS sky130_fd_pr__nfet_01v8 W=1.5e-06 L=1.5e-07 nf=4', text)
             self.assertIn('X2 VOUT VIN VSS VSS sky130_fd_pr__nfet_01v8', text)
-            self.assertIn('RLOAD VDD VOUT 10k', text)
+            self.assertIn('RLOAD VDD VOUT 10000', text)
             self.assertEqual(json.loads(constraints.read_text()), [])
             restored = FloorplanProject.from_netlist(netlist)
             self.assertAlmostEqual(restored.devices[0].width_um, 1.5)
@@ -108,7 +108,7 @@ class ProjectTests(unittest.TestCase):
             self.assertEqual(restored.to_dict(), project.to_dict())
             self.assertEqual(restored.source_netlist, CIRCUIT)
             self.assertEqual(restored.devices[0].width_um, 3)
-            with self.assertRaisesRegex(ValueError, 'Unsupported native'):
+            with self.assertRaisesRegex(ValueError, 'unsupported native'):
                 restored.export_align(Path(directory) / 'export')
             self.assertFalse((Path(directory) / 'export').exists())
 
@@ -214,7 +214,7 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'controlled by shared parameter'):
             clone.set_mos_parameters('M1', 123, 0.8, 2)
         self.assertEqual(clone.to_dict(), before)
-        for invalid in (1, 3, 2.5, float('inf'), 0):
+        for invalid in (2.5, float('inf'), 0):
             with self.assertRaises(ValueError):
                 clone.set_parameter('fingers', invalid)
             self.assertEqual(clone.to_dict(), before)
@@ -238,7 +238,7 @@ class ProjectTests(unittest.TestCase):
         self.assertAlmostEqual(project.devices[0].length_um, 0.7)
         self.assertEqual(project.devices[0].nf, 4)
         before = project.to_dict()
-        invalid = Design().add_instance('M1_2', W=16e-6, L=0.5e-6, NF=3)
+        invalid = Design().add_instance('M1_2', W=16e-6, L=0.5e-6, NF=2.5)
         with self.assertRaises(ValueError):
             project.refresh_bindings(invalid, source='linked')
         self.assertEqual(project.to_dict(), before)
@@ -263,7 +263,7 @@ class ProjectTests(unittest.TestCase):
             self.assertIsNone(project.parameter_rows[0]['binding'])
             self.assertIn('sizes.sp', project.parameter_rows[0]['source'])
             before = project.to_dict()
-            for invalid in ('.param width=16u fingers=1', '.param width=16u\n.param WIDTH=8u',
+            for invalid in ('.param width=16u fingers=1.5', '.param width=16u\n.param WIDTH=8u',
                             ".param width='total / 2'", '.include others.sp'):
                 path.write_text(invalid)
                 with self.assertRaises(ValueError):
@@ -271,11 +271,10 @@ class ProjectTests(unittest.TestCase):
                 self.assertEqual(project.to_dict(), before)
         original = FloorplanProject.from_netlist(Path(__file__).resolve().parents[3] / 'design/cm_ota.spice',
                                                  dimension_unit='um', width_convention='total')
-        before = original.to_dict()
         params = Path(__file__).resolve().parents[3] / 'design/cm_ota/simulation/spice/cm_ota_params.sp'
-        with self.assertRaisesRegex(ValueError, 'NF must be an even integer'):
-            original.import_parameters(params, dimension_unit='um')
-        self.assertEqual(original.to_dict(), before)
+        original.import_parameters(params, dimension_unit='um')
+        self.assertEqual(original.devices[0].nf, 1)
+        self.assertEqual(FloorplanProject.from_dict(original.to_dict()).devices[0].nf, 1)
 
     def test_shared_total_width_tracks_manual_numeric_nf_without_competing_override(self):
         project = FloorplanProject.from_text(CIRCUIT.replace('W=2.2u', 'W=width'))
@@ -315,7 +314,8 @@ class ProjectTests(unittest.TestCase):
         project = self.project()
         v1 = project.to_dict()
         v1['version'] = 1
-        for key in ('parameters', 'overrides', 'roar_project_path', 'align_profile'):
+        for key in ('parameters', 'overrides', 'roar_project_path', 'align_profile',
+                    'source_mode', 'run_options', 'constraint_enabled'):
             v1.pop(key)
         self.assertEqual(FloorplanProject.from_dict(v1).devices[0].width_um, project.devices[0].width_um)
         with tempfile.TemporaryDirectory() as directory:
@@ -342,7 +342,8 @@ class ProjectTests(unittest.TestCase):
         project = self.project()
         legacy = project.to_dict()
         legacy['version'] = 2
-        legacy.pop('align_profile')
+        for key in ('align_profile', 'source_mode', 'run_options', 'constraint_enabled'):
+            legacy.pop(key)
         restored = FloorplanProject.from_dict(legacy)
         self.assertIsNone(restored.align_profile)
         self.assertEqual(restored.devices, project.devices)
@@ -350,7 +351,7 @@ class ProjectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = project.save(Path(directory) / 'ota.roar.floorplan')
             state = json.loads(path.read_text())
-            self.assertEqual(state['version'], 3)
+            self.assertEqual(state['version'], 4)
             self.assertEqual(FloorplanProject.load(path).align_profile, project.align_profile)
             self.assertEqual(FloorplanProject.load(path).devices, project.devices)
             for invalid in ('', '  ', 12, {}):
@@ -366,7 +367,7 @@ class ProjectTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     project.set_mos_parameters('M1', value, 0.5, 2)
                 self.assertEqual(project.devices[0].width_um, before)
-        for nf in (1, 3, 2.5, True, float('inf')):
+        for nf in (0, -1, 2.5, True, float('inf')):
             with self.assertRaises(ValueError):
                 project.set_mos_parameters('M1', 2, 0.5, nf)
 

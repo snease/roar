@@ -23,6 +23,19 @@ _NUMBER = re.compile(r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(meg|[tgkmunp
 _SIMULATION_PARAMETERS = {'AD', 'AS', 'PD', 'PS', 'NRD', 'NRS', 'SA', 'SB', 'SD'}
 _IDENTIFIER = re.compile(r'[A-Za-z_]\w*')
 _PARAMETER = re.compile(r"([A-Za-z_]\w*)\s*=\s*('[^']*'|[^\s'=]+)")
+# A deliberately bounded subset of ALIGN's NAME token. In particular, never
+# permit its comment/annotation introducers (;, $, //, *) or declaration prefix
+# (.). Bus indices, hierarchical names, ground 0, and ordinary SPICE punctuation
+# remain usable. Source text is retained separately and never executed.
+_NETLIST_IDENTIFIER = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.!<>\[\]/+\-]*', re.ASCII)
+
+
+def _netlist_identifier(value, label):
+    if (not isinstance(value, str) or not _NETLIST_IDENTIFIER.fullmatch(value)
+            or '//' in value):
+        raise ValueError(f'{label}: unsupported netlist identifier {value!r}; use letters, digits, underscores, '
+                         'bus indices, or ordinary net-name punctuation without comments or expressions')
+    return value
 
 
 def _assignments(section, label):
@@ -72,9 +85,32 @@ def _dimension(value, unit, label):
 
 def _fingers(value):
     number = _positive(value, 'NF')
-    if not number.is_integer() or number < 2 or int(number) % 2:
-        raise ValueError('NF must be an even integer of at least 2 for the SKY130 generator')
+    if not number.is_integer():
+        raise ValueError('NF must be a positive integer')
     return int(number)
+
+
+def _multiplicity(value, label='M'):
+    if isinstance(value, bool):
+        raise ValueError(f'{label} must be a positive integer')
+    number = _scalar(value, label)
+    if not number.is_integer():
+        raise ValueError(f'{label} must be a positive integer')
+    return int(number)
+
+
+def _run_options(options):
+    if not isinstance(options, dict) or set(options) - {'nvariants', 'placer_sa_iterations', 'seed', 'lambda_coeff'}:
+        raise ValueError('Unknown or malformed ALIGN run options')
+    for key, value in options.items():
+        if key == 'lambda_coeff':
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0.01 <= value <= 1000:
+                raise ValueError('lambda_coeff must be a finite number from 0.01 to 1000')
+        else:
+            lower, upper = (0, 2147483647) if key == 'seed' else (1, 100 if key == 'nvariants' else 1000000)
+            if type(value) is not int or not lower <= value <= upper:
+                raise ValueError(f'{key} must be an integer from {lower} to {upper}')
+    return deepcopy(options)
 
 
 def _convention(value):
@@ -188,21 +224,30 @@ class FloorplanProject:
             raise ValueError('Parameterized .subckt headers are unsupported; resolve parameters first')
         if not ports or len({p.upper() for p in ports}) != len(ports):
             raise ValueError('Circuit ports must be nonempty and unique')
+        for port in ports:
+            _netlist_identifier(port, 'Circuit port')
         if not selected_lines:
             raise ValueError('Selected circuit has no devices')
         for line in selected_lines:
             tokens = _split_tokens(line)
+            _netlist_identifier(tokens[0], 'Instance name')
             prefix = tokens[0][0].upper()
             if prefix not in ('M', 'X', 'R'):
                 raise ValueError(f'Unsupported selected circuit line: {line}')
             if prefix in ('M', 'X'):
                 if len(tokens) < 6 or any('=' in token for token in tokens[:6]) or tokens[5].upper() in blocks:
                     raise ValueError(f'{tokens[0]}: only flat four-terminal MOS devices are supported; hierarchy is unsupported')
+                for token in tokens[1:5]:
+                    _netlist_identifier(token, f'{tokens[0]} terminal')
+                _netlist_identifier(tokens[5], f'{tokens[0]} model')
                 # The shared tokenizer keeps quoted xschem expressions intact.
                 # Bound its parameter section without evaluating any expression.
                 _assignments(' '.join(tokens[6:]), tokens[0])
             elif len(tokens) != 4 or any('=' in token for token in tokens):
                 raise ValueError(f'{tokens[0]}: only two-terminal numeric resistors are supported')
+            else:
+                for token in tokens[1:3]:
+                    _netlist_identifier(token, f'{tokens[0]} terminal')
         # Feed only the validated selection to the shared parser. This also
         # normalizes xschem comment wrappers and indented continuations without
         # modifying the retained source text.
@@ -220,6 +265,9 @@ class FloorplanProject:
         project.omitted_parameters = {}
         project._roar_project_path = None
         project.align_profile = None
+        project.source_mode = 'saved'
+        project.run_options = {}
+        project.constraint_enabled = []
         for instance in circuit.instances:
             if isinstance(instance, MOSFETInstance):
                 params = {key.upper(): value.strip() for key, value in instance.parameters.items()}
@@ -306,6 +354,8 @@ class FloorplanProject:
                 raise ValueError(f"{row['symbol']}: one symbol cannot represent both a dimension and a count")
         for device in devices:
             if device.kind != 'mos':
+                if 'value' in overrides.get(device.name, {}):
+                    device.value = overrides[device.name]['value']
                 continue
             resolved = {}
             conventions = {}
@@ -324,10 +374,7 @@ class FloorplanProject:
                 elif role == 'NF':
                     resolved[role] = _fingers(value)
                 else:
-                    multiplier = _scalar(value, f'{device.name} M')
-                    if not multiplier.is_integer():
-                        raise ValueError(f'{device.name}: M must be a positive integer for the SKY130 generator')
-                    resolved[role] = int(multiplier)
+                    resolved[role] = _multiplicity(value, f'{device.name} M')
             changes = overrides.get(device.name, {})
             if 'nf' in changes:
                 resolved['NF'] = changes['nf']
@@ -337,7 +384,10 @@ class FloorplanProject:
             device.width_um, device.length_um, device.nf = width, resolved['L'], resolved['NF']
             device.parameters = {'M': resolved['M']} if 'M' in resolved else {}
             for key, value in changes.items():
-                setattr(device, key, value)
+                if key == 'multiplicity':
+                    device.parameters['M'] = value
+                else:
+                    setattr(device, key, value)
         return devices
 
     def _set_parameter_record(self, symbol, record, parameters):
@@ -417,6 +467,11 @@ class FloorplanProject:
         return info['value'], info.get('source', 'assigned')
 
     def bind_parameter(self, design, symbol, source_instance, attribute, dimension_unit='m', width_convention='total', source='live'):
+        """Replace one binding atomically without refreshing other bindings.
+
+        This also repairs a target whose former source row or attribute is gone.
+        Other captured values remain usable until an explicit refresh succeeds.
+        """
         if source not in ('live', 'linked'):
             raise ValueError('Binding source must be live or linked')
         value, origin = self._roar_value(design, source_instance, attribute)
@@ -424,6 +479,15 @@ class FloorplanProject:
         self._set_parameter_record(symbol, {'value': value, 'dimension_unit': dimension_unit,
             'width_convention': width_convention, 'source': f'ROAR {source}: {source_instance}.{attribute} ({origin})',
             'binding': {'instance': source_instance, 'attribute': attribute, 'source': source}}, parameters)
+        devices = self._rebuild(parameters)
+        self._parameters, self.devices = parameters, devices
+
+    def unbind_parameter(self, symbol):
+        """Keep the captured value as a manual value and remove its source link."""
+        symbol = self._symbol(symbol)
+        parameters = deepcopy(self._parameters)
+        parameters[symbol]['binding'] = None
+        parameters[symbol]['source'] = 'manual' if parameters[symbol]['value'] is not None else 'unresolved'
         devices = self._rebuild(parameters)
         self._parameters, self.devices = parameters, devices
 
@@ -467,6 +531,32 @@ class FloorplanProject:
         devices = self._rebuild(self._parameters, overrides)
         self._overrides, self.devices = overrides, devices
 
+    def set_mos_multiplicity(self, name, value):
+        device = self._device(name)
+        if device.kind != 'mos':
+            raise ValueError(f'{name} is not a MOS device')
+        if 'M' in device.symbols:
+            if value != device.parameters.get('M'):
+                raise ValueError(f'{name}.M is controlled by shared parameter {device.symbols["M"]}; edit or bind that parameter instead')
+            return
+        multiplicity = _multiplicity(value, f'{name} M')
+        if multiplicity == device.parameters.get('M', 1):
+            return
+        overrides = deepcopy(self._overrides)
+        overrides.setdefault(device.name, {})['multiplicity'] = multiplicity
+        devices = self._rebuild(self._parameters, overrides)
+        self._overrides, self.devices = overrides, devices
+
+    def set_resistance(self, name, value):
+        device = self._device(name)
+        if device.kind != 'resistor':
+            raise ValueError(f'{name} is not a resistor')
+        resistance = _scalar(value, f'{name} resistance')
+        overrides = deepcopy(self._overrides)
+        overrides.setdefault(device.name, {})['value'] = f'{resistance:.12g}'
+        devices = self._rebuild(self._parameters, overrides)
+        self._overrides, self.devices = overrides, devices
+
     def import_roar_parameters(self, design, source_instance, targets, dimension_unit='m', width_convention='total'):
         """Copy concrete assigned W/L/NF from one explicitly chosen ROAR row.
 
@@ -497,18 +587,46 @@ class FloorplanProject:
         for device in devices:
             self.set_mos_parameters(device.name, width, length, nf)
 
-    def set_constraints(self, constraints):
+    @property
+    def active_constraints(self):
+        return [constraint for constraint, enabled in zip(self.constraints, self._constraint_flags()) if enabled]
+
+    def _constraint_flags(self):
+        # Direct assignment to constraints is supported for importing native
+        # dictionaries. Explicit editor operations preserve flags via the API.
+        flags = self.constraint_enabled
+        if not isinstance(flags, list) or any(type(value) is not bool for value in flags):
+            raise ValueError('Constraint enabled states must be booleans')
+        return list(flags) if len(flags) == len(self.constraints) else [True] * len(self.constraints)
+
+    def set_constraint_enabled(self, index, enabled):
+        if type(enabled) is not bool:
+            raise ValueError('Constraint enabled state must be boolean')
+        flags = self._constraint_flags()
+        flags[index] = enabled
+        self.constraint_enabled = flags
+
+    def set_constraints(self, constraints, enabled=None):
         candidate = deepcopy(constraints)
-        self._validate_constraints(candidate)
-        self.constraints = candidate
+        if not isinstance(candidate, list) or any(not isinstance(c, dict) for c in candidate):
+            raise ValueError('Constraints must be a list of native ALIGN dictionaries')
+        flags = [True] * len(candidate) if enabled is None else list(enabled)
+        if len(flags) != len(candidate) or any(type(value) is not bool for value in flags):
+            raise ValueError('Constraint enabled states must match the constraint rows')
+        self._validate_constraints([constraint for constraint, flag in zip(candidate, flags) if flag])
+        self.constraints, self.constraint_enabled = candidate, flags
 
     def add_constraint(self, constraint):
-        self.set_constraints(self.constraints + [constraint])
+        self.set_constraints(self.constraints + [constraint], self._constraint_flags() + [True])
 
     def remove_constraint(self, index):
+        flags = self._constraint_flags()
         del self.constraints[index]
+        del flags[index]
+        self.constraint_enabled = flags
 
     def validate(self):
+        self._validate_netlist_identifiers()
         if self.unresolved_parameters:
             raise ValueError('Unresolved sizing parameters: ' + ', '.join(self.unresolved_parameters) + '; assign numeric values or bind ROAR fields before export')
         for device in self.devices:
@@ -518,103 +636,68 @@ class FloorplanProject:
                 _fingers(device.nf)
                 if device.parameters.get('M', 1) is None:
                     raise ValueError(f'{device.name}: unresolved M')
-        self._validate_constraints(self.constraints)
+                _multiplicity(device.parameters.get('M', 1), f'{device.name} M')
+            else:
+                _scalar(device.value, f'{device.name} resistance')
+        self._validate_constraints(self.active_constraints)
+
+    def _validate_netlist_identifiers(self):
+        """Recheck public mutable fields at the ALIGN serialization boundary."""
+        if not isinstance(self.top, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', self.top):
+            raise ValueError('Circuit name must contain letters, digits and underscores, starting with a letter or underscore')
+        if not isinstance(self.ports, list) or not self.ports:
+            raise ValueError('Circuit ports must be nonempty and unique')
+        for port in self.ports:
+            _netlist_identifier(port, 'Circuit port')
+        if len({port.upper() for port in self.ports}) != len(self.ports):
+            raise ValueError('Circuit ports must be nonempty and unique')
+        names = set()
+        for device in self.devices:
+            _netlist_identifier(device.name, 'Instance name')
+            if device.name.upper() in names:
+                raise ValueError('Duplicate device names')
+            names.add(device.name.upper())
+            if device.kind not in ('mos', 'resistor') or device.name[0].upper() not in ('MX' if device.kind == 'mos' else 'R'):
+                raise ValueError(f'{device.name}: unsupported device kind or instance prefix')
+            if not isinstance(device.terminals, (tuple, list)) or len(device.terminals) != (4 if device.kind == 'mos' else 2):
+                raise ValueError(f'{device.name}: wrong number of terminals')
+            for terminal in device.terminals:
+                _netlist_identifier(terminal, f'{device.name} terminal')
+            if device.kind == 'mos':
+                _netlist_identifier(device.model, f'{device.name} model')
+                if not isinstance(device.parameters, dict) or set(device.parameters) - {'M'}:
+                    raise ValueError(f'{device.name}: unsupported MOS export parameters')
+        for name, parameters in self.omitted_parameters.items():
+            _netlist_identifier(name, 'Omitted parameter instance')
+            if not isinstance(parameters, list) or any(value not in _SIMULATION_PARAMETERS for value in parameters):
+                raise ValueError('Unsupported omitted simulation parameter names')
 
     def _validate_constraints(self, constraints):
-        if not isinstance(constraints, list) or any(not isinstance(c, dict) for c in constraints):
-            raise ValueError('Constraints must be a list of native ALIGN dictionaries')
-        allowed = {
-            'SymmetricBlocks': {'pairs', 'direction'}, 'Order': {'instances', 'direction', 'abut'},
-            'Align': {'instances', 'line'}, 'Floorplan': {'regions', 'order', 'symmetrize'},
-            'CompactPlacement': {'style'}, 'PlaceCloser': {'instances'},
-            'PowerPorts': {'ports', 'propagate'}, 'GroundPorts': {'ports', 'propagate'}}
-
-        def ids(values, minimum=1):
-            if not isinstance(values, list) or len(values) < minimum or any(not isinstance(v, str) for v in values):
-                raise ValueError(f'Expected at least {minimum} instance names')
-            if len({v.upper() for v in values}) != len(values):
-                raise ValueError('An instance cannot repeat within one constraint')
-            return [self._device(value) for value in values]
-
-        def symmetric(pairs):
-            if not isinstance(pairs, list) or not pairs or any(not isinstance(p, list) or not 1 <= len(p) <= 2 for p in pairs):
-                raise ValueError('Symmetry requires nonempty pairs of one or two instances')
-            if len(pairs) == 1 and len(pairs[0]) != 2:
-                raise ValueError('A single symmetry group must contain two instances')
-            ids([name for pair in pairs for name in pair])
-            for pair in pairs:
-                devices = ids(pair)
-                if len(devices) == 2 and all(d.kind != 'mos' or (d.width_um is not None and d.length_um is not None and d.nf is not None and d.parameters.get('M', 1) is not None) for d in devices):
-                    # Compare the exact SI strings written to ALIGN, so harmless
-                    # arithmetic rounding during ROAR import cannot break a pair.
-                    signatures = [(d.kind, d.model.upper(),
-                                   f'{d.width_um * 1e-6:.12g}' if d.kind == 'mos' else None,
-                                   f'{d.length_um * 1e-6:.12g}' if d.kind == 'mos' else None, d.nf,
-                                   d.parameters.get('M', 1), _scalar(d.value, 'resistance') if d.kind == 'resistor' else None)
-                                  for d in devices]
-                    if signatures[0] != signatures[1]:
-                        raise ValueError(f'Symmetry pair {pair} must have matching models and parameters')
-
-        for constraint in constraints:
-            kind = constraint.get('constraint')
-            if not isinstance(kind, str) or kind not in allowed:
-                raise ValueError(f'Unsupported native constraint {kind!r}; it is preserved in project files')
-            unknown = set(constraint) - allowed[kind] - {'constraint'}
-            if unknown:
-                raise ValueError(f'{kind}: unsupported fields {", ".join(sorted(unknown))}')
-            for key in ('abut', 'order', 'symmetrize', 'propagate'):
-                if key in constraint and type(constraint[key]) is not bool:
-                    raise ValueError(f'{kind}.{key} must be boolean')
-            if kind == 'SymmetricBlocks':
-                if constraint.get('direction') not in ('H', 'V'):
-                    raise ValueError('Symmetry direction must be H or V')
-                symmetric(constraint.get('pairs'))
-            elif kind in ('Order', 'Align', 'PlaceCloser'):
-                ids(constraint.get('instances'), 2)
-                if kind == 'Order' and constraint.get('direction') not in ('left_to_right', 'top_to_bottom'):
-                    raise ValueError('Order direction must be left_to_right or top_to_bottom; reverse the instance list for the opposite direction')
-                if kind == 'Align' and constraint.get('line') not in ('h_top', 'h_bottom', 'h_center', 'v_left', 'v_right', 'v_center'):
-                    raise ValueError('Align needs an explicit h_top/h_bottom/h_center/v_left/v_right/v_center line')
-            elif kind == 'Floorplan':
-                rows = constraint.get('regions')
-                if not isinstance(rows, list) or not rows:
-                    raise ValueError('Floorplan needs nonempty rows in regions')
-                for row in rows:
-                    ids(row)
-                ids([name for row in rows for name in row])
-                if constraint.get('symmetrize'):
-                    pairs = []
-                    for row in rows:
-                        pairs.extend([[row[i], row[-1-i]] for i in range(len(row)//2)])
-                        if len(row) % 2:
-                            pairs.append([row[len(row)//2]])
-                    symmetric(pairs)
-            elif kind == 'CompactPlacement':
-                if constraint.get('style', 'left') not in ('left', 'right', 'center'):
-                    raise ValueError('CompactPlacement style must be left, right or center')
-            else:
-                ports = constraint.get('ports')
-                if not isinstance(ports, list) or not ports or any(not isinstance(p, str) or p.upper() not in {v.upper() for v in self.ports} for p in ports):
-                    raise ValueError(f'{kind} ports must name circuit ports')
-                if len({p.upper() for p in ports}) != len(ports):
-                    raise ValueError(f'{kind} ports must be unique')
+        from .constraints import validate_constraints
+        validate_constraints(self, constraints)
 
     def to_dict(self):
-        return {'version': 3, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
+        if self.source_mode not in ('saved', 'live', 'linked'):
+            raise ValueError('Sizing source mode must be saved, live, or linked')
+        return {'version': 4, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
                 'top': self.top, 'dimension_unit': self.dimension_unit, 'width_convention': self.width_convention,
                 'devices': [{'name': d.name, 'width_um': d.width_um, 'length_um': d.length_um, 'nf': d.nf}
                             for d in self.devices if d.kind == 'mos'], 'constraints': deepcopy(self.constraints),
                 'parameters': deepcopy(self._parameters), 'overrides': deepcopy(self._overrides),
-                'roar_project_path': self.roar_project_path, 'align_profile': self.align_profile}
+                'roar_project_path': self.roar_project_path, 'align_profile': self.align_profile,
+                'source_mode': self.source_mode, 'run_options': _run_options(self.run_options),
+                'constraint_enabled': self._constraint_flags()}
 
     @classmethod
     def from_dict(cls, state):
         expected = {'version', 'source_netlist', 'source_path', 'top', 'dimension_unit', 'width_convention', 'devices', 'constraints'}
-        if isinstance(state, dict) and state.get('version') in (2, 3):
+        if isinstance(state, dict) and state.get('version') in (2, 3, 4):
             expected |= {'parameters', 'overrides', 'roar_project_path'}
-        if isinstance(state, dict) and state.get('version') == 3:
+        if isinstance(state, dict) and state.get('version') in (3, 4):
             expected.add('align_profile')
-        if not isinstance(state, dict) or state.get('version') not in (1, 2, 3) or set(state) != expected:
+        if isinstance(state, dict) and state.get('version') == 4:
+            expected |= {'source_mode', 'run_options', 'constraint_enabled'}
+        if not isinstance(state, dict) or state.get('version') not in (1, 2, 3, 4) or set(state) != expected:
             raise ValueError('Unsupported or malformed floorplan project version/fields')
         project = cls.from_text(state['source_netlist'], state['top'], state['dimension_unit'], state['width_convention'])
         project.source_path = state['source_path']
@@ -622,7 +705,14 @@ class FloorplanProject:
         if profile is not None and (not isinstance(profile, str) or not profile.strip()):
             raise ValueError('ALIGN profile must be a nonempty profile name or null')
         project.align_profile = profile
-        if state['version'] in (2, 3):
+        # Legacy companions did not record source intent. Reopen their captured
+        # values safely; a designer can explicitly opt into refreshing a link.
+        source_mode = state.get('source_mode', 'saved')
+        if source_mode not in ('saved', 'live', 'linked'):
+            raise ValueError('Sizing source mode must be saved, live, or linked')
+        project.source_mode = source_mode
+        project.run_options = _run_options(state.get('run_options', {}))
+        if state['version'] in (2, 3, 4):
             link = state['roar_project_path']
             if link is not None and (not isinstance(link, str) or not Path(link).is_absolute()):
                 raise ValueError('In-memory ROAR project links must be absolute; use load() for relative sidecar links')
@@ -647,13 +737,24 @@ class FloorplanProject:
                 raise ValueError('Malformed saved numeric device overrides')
             for name, changes in overrides.items():
                 device = project._device(name)
-                if name != device.name or device.kind != 'mos' or not isinstance(changes, dict) or set(changes) - {'width_um', 'length_um', 'nf'}:
+                allowed = {'width_um', 'length_um', 'nf', 'multiplicity'} if device.kind == 'mos' else {'value'}
+                if name != device.name or not isinstance(changes, dict) or set(changes) - allowed:
                     raise ValueError('Malformed saved numeric device overrides')
                 for field_name, value in changes.items():
-                    role = {'width_um': 'W', 'length_um': 'L', 'nf': 'NF'}[field_name]
+                    if field_name == 'value':
+                        if not isinstance(value, str):
+                            raise ValueError('Saved resistance must be a numeric SPICE string')
+                        _scalar(value, f'{name} resistance')
+                        continue
+                    role = {'width_um': 'W', 'length_um': 'L', 'nf': 'NF', 'multiplicity': 'M'}[field_name]
                     if role in device.symbols:
                         raise ValueError(f'{name}.{role}: numeric override conflicts with a shared parameter')
-                    _fingers(value) if role == 'NF' else _positive(value, f'{name} {role}')
+                    if role == 'NF':
+                        _fingers(value)
+                    elif role == 'M':
+                        _multiplicity(value, f'{name} M')
+                    else:
+                        _positive(value, f'{name} {role}')
             project._overrides = deepcopy(overrides)
             project.devices = project._rebuild(parameters)
         sizes = state['devices']
@@ -664,7 +765,7 @@ class FloorplanProject:
             raise ValueError('Saved sizes do not match the source circuit instances')
         for row in sizes:
             device = project._device(row['name'])
-            if state['version'] in (2, 3):
+            if state['version'] in (2, 3, 4):
                 actual = {'name': device.name, 'width_um': device.width_um, 'length_um': device.length_um, 'nf': device.nf}
                 if row != actual:
                     raise ValueError(f'{device.name}: saved sizes conflict with source parameters or overrides')
@@ -674,6 +775,10 @@ class FloorplanProject:
         if not isinstance(constraints, list) or any(not isinstance(c, dict) for c in constraints):
             raise ValueError('Saved constraints must be native dictionaries')
         project.constraints = deepcopy(constraints)
+        flags = state.get('constraint_enabled', [True] * len(constraints))
+        if not isinstance(flags, list) or len(flags) != len(constraints) or any(type(value) is not bool for value in flags):
+            raise ValueError('Saved constraint enabled states must match the constraint rows')
+        project.constraint_enabled = list(flags)
         return project
 
     def save(self, path):
@@ -702,7 +807,7 @@ class FloorplanProject:
     def load(cls, path):
         path = Path(path).expanduser().resolve()
         state = json.loads(path.read_text(encoding='utf-8'))
-        if isinstance(state, dict) and state.get('version') in (2, 3) and state.get('roar_project_path'):
+        if isinstance(state, dict) and state.get('version') in (2, 3, 4) and state.get('roar_project_path'):
             state['roar_project_path'] = str((path.parent / state['roar_project_path']).resolve())
         return cls.from_dict(state)
 
@@ -725,11 +830,11 @@ class FloorplanProject:
                 for key, value in device.parameters.items():
                     line += f' {key}={value:.12g}'
             else:
-                line = f'{prefix} {device.value}'
+                line = f'{prefix} {_scalar(device.value, device.name + " resistance"):.12g}'
             lines.append(line)
         lines.append('.ends ' + self.top)
         netlist_text = '\n'.join(lines) + '\n'
-        constraint_text = json.dumps(self.constraints, indent=2, allow_nan=False) + '\n'
+        constraint_text = json.dumps(self.active_constraints, indent=2, allow_nan=False) + '\n'
         destination = Path(directory).expanduser().resolve() / self.top
         netlist = destination / (self.top + '.sp')
         constraints = destination / (self.top + '.const.json')
