@@ -37,12 +37,18 @@ def project_fingerprint(project):
 
 
 def validate_ota_project(project):
+    """Validate the selected technology; retain the legacy public function name."""
     if getattr(project, 'align_profile', None) != PROFILE_ID:
-        raise ValueError(f'Select the supported OTA profile: {PROFILE_ID}')
-    devices = project.devices
-    if len(devices) != PROFILE['mos_count'] or any(
-            d.kind != 'mos' or d.model.lower() not in PROFILE['models'] or len(d.terminals) != 4 for d in devices):
-        raise ValueError('This ALIGN profile supports the ten-MOS SKY130 OTA only')
+        raise ValueError(f'Select layout technology {PROFILE["technology"]} in ALIGN settings')
+    if not project.devices:
+        raise ValueError('The selected floorplan has no devices to place')
+    for device in project.devices:
+        if device.kind != 'mos':
+            raise ValueError(f'{device.name}: the selected ALIGN technology has no supported {device.kind} generator')
+        if device.model.lower() not in PROFILE['models']:
+            raise ValueError(f'{device.name}: unsupported device model {device.model!r} for the selected ALIGN technology')
+        if len(device.terminals) != 4:
+            raise ValueError(f'{device.name}: the selected ALIGN MOS generator requires four terminals')
 
 
 @dataclass(frozen=True)
@@ -349,6 +355,14 @@ class AlignRunner:
         self._launch(manifest, 'reopen')
         return self.poll(project)
 
+    def _process_alive(self, manifest):
+        active = manifest.get('active') or {}
+        if self._process is not None and self._process.pid == active.get('pid'):
+            # waitpid owns the authoritative state for our direct child. A
+            # transient /proc read must not declare a still-running worker dead.
+            return self._process.poll() is None
+        return _alive(manifest, self._run_dir)
+
     def poll(self, project=None):
         if self._run_dir is None:
             return None
@@ -357,20 +371,28 @@ class AlignRunner:
         progress = json.loads((self._run_dir / 'status.json').read_text()) if (self._run_dir / 'status.json').is_file() else {}
         if progress.get('token') != active.get('token'):
             progress = {'status': 'starting', 'url': None, 'error': None, 'token': active.get('token')}
-        alive = _alive(manifest, self._run_dir)
+        alive = self._process_alive(manifest)
         status = progress.get('status', 'starting')
-        if self._process is not None:
-            self._process.poll()  # reap exited children
         if active.get('stop_requested') and alive:
             status = 'stopping'
             if time.time() - active['stop_requested'] > 3:
                 self._signal(manifest, signal.SIGKILL)
         elif not alive and status in _ACTIVE:
-            code = self._process.returncode if self._process is not None else None
-            status = 'stopped' if active.get('stop_requested') else ('completed' if code == 0 else 'failed')
-            progress.update(status=status, url=None,
-                error=None if status in ('stopped', 'completed') else 'ALIGN process exited before completing; see align.log')
-            _write_json(self._run_dir / 'status.json', progress)
+            # The worker may have published its specific failure/stop between
+            # the initial status read and process exit. Never overwrite it.
+            latest = json.loads((self._run_dir / 'status.json').read_text())
+            if latest.get('token') == active.get('token') and latest.get('status') not in _ACTIVE:
+                progress, status = latest, latest.get('status')
+            else:
+                code = self._process.returncode if self._process is not None else None
+                status = 'stopped' if active.get('stop_requested') else ('completed' if code == 0 else 'failed')
+                if code is not None and code < 0:
+                    reason = 'ALIGN worker was terminated by ' + signal.Signals(-code).name
+                else:
+                    reason = 'ALIGN worker exited' + (f' with code {code}' if code is not None else '')
+                progress.update(status=status, url=None,
+                    error=None if status in ('stopped', 'completed') else f'{reason}. See {self._run_dir / "align.log"}')
+                _write_json(self._run_dir / 'status.json', progress)
         if status in {'serving', 'completed', 'stopped', 'failed'} and self._has_dump(self._run_dir):
             self._remember(manifest, placement=True)
         url = progress.get('url')
@@ -389,7 +411,7 @@ class AlignRunner:
                         self._has_dump(self._pointer(manifest).get('placement_dir', self._run_dir)))
 
     def _signal(self, manifest, sig):
-        if _alive(manifest, self._run_dir):
+        if self._process_alive(manifest):
             pid = manifest['active']['pid']
             try:
                 if os.getpgid(pid) == pid:
@@ -401,7 +423,7 @@ class AlignRunner:
         if self._run_dir is None:
             raise ValueError('No ALIGN run to stop')
         manifest = json.loads((self._run_dir / 'run.json').read_text())
-        if _alive(manifest, self._run_dir):
+        if self._process_alive(manifest):
             manifest['active']['stop_requested'] = time.time()
             _write_json(self._run_dir / 'run.json', manifest)
             self._signal(manifest, signal.SIGTERM)
@@ -414,7 +436,7 @@ class AlignRunner:
         self.stop()
         manifest = json.loads((self._run_dir / 'run.json').read_text())
         deadline = time.monotonic() + 0.5
-        while _alive(manifest, self._run_dir) and time.monotonic() < deadline:
+        while self._process_alive(manifest) and time.monotonic() < deadline:
             time.sleep(0.025)
         self._signal(manifest, signal.SIGKILL)
         if self._process is not None:

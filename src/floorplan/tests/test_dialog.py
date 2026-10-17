@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 try:
-    from PyQt6.QtCore import QSettings, QTimer, Qt
+    from PyQt6.QtCore import QSettings, QTimer, Qt, QObject, pyqtSignal
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QPushButton, QWidget
 except ImportError:
@@ -36,6 +36,33 @@ M1 d g s b nch W=ws L=0.15u nf=nfs
 M2 d g s b nch W=ws L=0.15u nf=nfs
 .ends shared
 """
+
+
+class FakeWorkspace:
+    def __init__(self, design, path=None, dirty=False):
+        self.design, self.path, self.dirty = design, str(path) if path else None, dirty
+        self.saves, self.switches = [], []
+        self.failure = None
+
+    def snapshot(self):
+        if self.failure:
+            raise RuntimeError(self.failure)
+        return Design.from_state(self.design.to_state())
+
+    def is_modified(self):
+        return self.dirty
+
+    def save(self, path):
+        self.design.save(path)
+        self.path, self.dirty = str(Path(path).resolve()), False
+        self.saves.append(self.path)
+        return self.snapshot()
+
+    def switch(self, path):
+        self.design = load_roar_design(path)
+        self.path, self.dirty = str(Path(path).resolve()), False
+        self.switches.append(self.path)
+        return self.snapshot()
 
 
 @unittest.skipIf(QApplication is None, "PyQt6 GUI extra is not installed")
@@ -98,7 +125,7 @@ class FloorplanDialogTests(unittest.TestCase):
         self.design.set_instance_attribute("M1_2", "W", 100e-6)
         self.dialog.import_targets.setText("M1, M2")
         self.dialog._apply_roar()
-        self.assertEqual([d.width_um for d in self.dialog.project.devices], [2, 2, 2, 2])
+        self.assertEqual([d.width_um for d in self.dialog.project.devices], [25, 25, 2, 2])
         self.assertEqual([d.nf for d in self.dialog.project.devices], [4, 4, 2, 2])
         for device in self.dialog.project.devices[:2]:
             self.assertAlmostEqual(device.length_um, 0.2)
@@ -119,17 +146,18 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._apply_roar()
         self.assertEqual(self.dialog.project.to_dict(), original)
 
-    def test_failed_refresh_invalidates_old_snapshot_and_errors_are_visible(self):
+    def test_failed_refresh_preserves_snapshot_and_errors_are_visible(self):
         self.dialog._read_roar()
         def fail():
             raise RuntimeError("ROAR snapshot is unavailable")
+        original = self.dialog.roar_design
         self.dialog.snapshot_provider = fail
         with patch.object(QMessageBox, "warning") as warning:
             self.dialog._guard(self.dialog._read_roar)
         warning.assert_called_once()
         self.assertIn("snapshot is unavailable", self.dialog.status.text())
-        self.assertIsNone(self.dialog.roar_design)
-        self.assertEqual(self.dialog.source_instance.count(), 0)
+        self.assertIs(self.dialog.roar_design, original)
+        self.assertIn("snapshot is unavailable", self.dialog.snapshot_label.text())
 
     def test_netlist_import_save_open_and_align_export_paths(self):
         source = self.root / "input.sp"
@@ -406,7 +434,7 @@ class FloorplanDialogTests(unittest.TestCase):
         options.floorplan_path.setText(str(second))
         options.floorplan_path.editingFinished.emit()
         self.assertEqual(options.design_path.text(), str(first_design))
-        self.assertIn("Using your ROAR choice", options.link_status.text())
+        self.assertIn("Association will change", options.link_status.text())
         QTimer.singleShot(0, lambda: options.buttons.button(QDialogButtonBox.StandardButton.Open).click())
         self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
         self.assertEqual(options.project.roar_project_path, str(first_design))
@@ -419,7 +447,7 @@ class FloorplanDialogTests(unittest.TestCase):
         sidecar = self.root / "missing.floorplan.json"
         project.save(sidecar)
         options = OpenFloorplanDialog(self.parent, sidecar)
-        self.assertTrue(options.without_design.isChecked())
+        self.assertEqual(options.source_mode.currentData(), "saved")
         self.assertIn("missing", options.link_status.text())
         self.assertTrue(options.buttons.button(QDialogButtonBox.StandardButton.Open).isEnabled())
         QTimer.singleShot(0, lambda: options.buttons.button(QDialogButtonBox.StandardButton.Open).click())
@@ -452,7 +480,8 @@ class FloorplanDialogTests(unittest.TestCase):
             modal.floorplan_path.editingFinished.emit()
             modal.buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
         QTimer.singleShot(0, cancel_open)
-        self.dialog._open_project()
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
+            self.dialog._open_project()
         self.assertIs(self.dialog.project, original_project)
         self.assertIs(self.dialog.roar_design, original_source)
 
@@ -483,7 +512,7 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._save_project()
         picker.assert_not_called()
 
-    def test_saved_source_open_keeps_captured_values_until_explicit_refresh(self):
+    def test_saved_source_open_refreshes_mappings_and_reloads_before_actions(self):
         saved_design = self.root / "sizes.roar"
         self.design.save(saved_design)
         original_running = self.design.to_state()
@@ -504,7 +533,7 @@ class FloorplanDialogTests(unittest.TestCase):
         QTimer.singleShot(0, open_saved)
         self.dialog._open_project()
         self.assertEqual(self.dialog._source_origin, "linked")
-        self.assertEqual(self.dialog.project.devices[0].width_um, 2)
+        self.assertEqual(self.dialog.project.devices[0].width_um, 5)
         self.dialog._refresh_bindings()
         self.assertEqual(self.dialog.project.devices[0].width_um, 5)
         self.assertEqual(self.design.to_state(), original_running)
@@ -513,8 +542,8 @@ class FloorplanDialogTests(unittest.TestCase):
         saved_design.unlink()
         with self.assertRaises(OSError):
             self.dialog._refresh_bindings()
-        self.assertIsNone(self.dialog.roar_design)
-        self.assertFalse(self.dialog.refresh_bindings_button.isEnabled())
+        self.assertIsNotNone(self.dialog.roar_design)
+        self.assertIn("Sizing source error", self.dialog.snapshot_label.text())
         self.assertEqual(self.dialog.project.to_dict(), before)
 
     def test_parameter_binding_uses_explicit_attribute_and_preserves_captured_source(self):
@@ -569,6 +598,189 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertEqual(self.dialog._source_origin, "linked")
         self.assertEqual(self.dialog.project.unresolved_parameters, ["ws", "nfs"])
         self.assertEqual(self.design.to_state(), original)
+
+    def _bound_project(self):
+        project = FloorplanProject.from_text(SYMBOLIC)
+        project.set_parameter("nfs", 4)
+        project.bind_parameter(self.design, "ws", "M1_2", "W", source="linked")
+        return project
+
+    def test_current_source_migrates_only_bindings_and_debounces_updates(self):
+        class Changes(QObject):
+            changed = pyqtSignal()
+        changes = Changes()
+        workspace = FakeWorkspace(self.design)
+        dialog = FloorplanDialog(self.parent, workspace=workspace, source_changed_signals=(changes.changed,),
+                                 placement_options={"settings": QSettings(str(self.root / "live.ini"), QSettings.Format.IniFormat), "config": AlignConfig("", "", str(self.root / "runs"))})
+        project = self._bound_project()
+        project.roar_project_path = str(self.root / "obsolete.roar")
+        dialog.set_project(project)
+        dialog._read_roar()
+        self.assertIsNone(dialog.project.roar_project_path)
+        self.assertEqual(dialog.project.parameter_rows[0]["binding"]["source"], "live")
+        self.assertIsNone(dialog.project.parameter_rows[1]["binding"])
+        dialog.show()
+        workspace.design.set_instance_attribute("M1_2", "W", 24e-6)
+        for _ in range(5):
+            changes.changed.emit()
+        QTest.qWait(380)
+        self.assertEqual(dialog.project.devices[0].width_um, 6)
+        self.assertEqual(dialog.project.parameter_rows[1]["value"], 4)
+        before = dialog.project.to_dict()
+        cached = dialog.roar_design
+        workspace.failure = "source temporarily unavailable"
+        changes.changed.emit()
+        with patch.object(QMessageBox, "warning") as popup:
+            QTest.qWait(380)
+        popup.assert_not_called()
+        self.assertEqual(dialog.project.to_dict(), before)
+        self.assertIs(dialog.roar_design, cached)
+        with self.assertRaisesRegex(RuntimeError, "temporarily unavailable"):
+            dialog._export_align()
+        workspace.failure = None
+        workspace.design.set_instance_attribute("M1_2", "W", 32e-6)
+        # Generate performs the same freshness guard, without waiting for debounce.
+        dialog.placement_panel._before_generate()
+        self.assertEqual(dialog.project.devices[0].width_um, 8)
+        dialog._activate_source("saved")
+        workspace.design.set_instance_attribute("M1_2", "W", 40e-6)
+        dialog._ensure_current_source()
+        self.assertEqual(dialog.project.devices[0].width_um, 8)
+        self.assertIsNotNone(dialog.project.parameter_rows[0]["binding"])
+        dialog.close()
+        dialog.deleteLater()
+
+    def test_reload_action_only_appears_for_saved_file_sources(self):
+        self.assertTrue(self.dialog.source_reload_button.isHidden())
+        self.dialog._read_roar()
+        self.assertTrue(self.dialog.source_reload_button.isHidden())
+        self.assertFalse(self.dialog.source_reload_button.isEnabled())
+        saved = self.root / "reload.roar"
+        self.design.save(saved)
+        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(saved), "")):
+            self.dialog._load_linked_roar()
+        self.assertFalse(self.dialog.source_reload_button.isHidden())
+        self.assertTrue(self.dialog.source_reload_button.isEnabled())
+        self.assertIs(self.dialog.refresh_bindings_button, self.dialog.source_reload_button)
+        self.assertEqual(len([button for button in self.dialog.findChildren(QPushButton) if button.text() == "Reload source"]), 1)
+        self.dialog._activate_source("saved")
+        self.assertTrue(self.dialog.source_reload_button.isHidden())
+        self.assertFalse(self.dialog.source_reload_button.isEnabled())
+
+    def test_open_same_association_uses_unsaved_live_design_without_switch(self):
+        design_path = self.root / "current.roar"
+        self.design.save(design_path)
+        workspace = FakeWorkspace(self.design, design_path, dirty=True)
+        project = self._bound_project()
+        project.roar_project_path = design_path
+        sidecar = self.root / "same.roar.floorplan"
+        project.save(sidecar)
+        workspace.design.set_instance_attribute("M1_2", "W", 28e-6)
+        options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
+        self.assertEqual(options.source_mode.currentData(), "linked")
+        with patch("roar_api.floorplan.dialog._source_switch_choice") as warning:
+            options.accept()
+        warning.assert_not_called()
+        self.assertEqual(options.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(options.project.devices[0].width_um, 7)
+        self.assertEqual(options.project.roar_project_path, str(design_path))
+        self.assertEqual(options.source_origin, "live")
+        self.assertEqual(workspace.switches, [])
+        options.deleteLater()
+
+    def test_open_conflict_cancel_save_cancel_discard_and_change_association(self):
+        linked = self.root / "linked.roar"
+        Design().add_instance("M1_2", W=20e-6, L=0.2e-6, NF=4).save(linked)
+        current = self.root / "current.roar"
+        self.design.save(current)
+        workspace = FakeWorkspace(self.design, current, dirty=True)
+        project = self._bound_project()
+        project.roar_project_path = linked
+        sidecar = self.root / "conflict.roar.floorplan"
+        project.save(sidecar)
+        original = workspace.design.to_state()
+        for choice in ("cancel", "save"):
+            options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
+            with patch("roar_api.floorplan.dialog._source_switch_choice", return_value=choice), patch.object(QFileDialog, "getSaveFileName", return_value=("", "")):
+                options.accept()
+            self.assertEqual(options.result(), QDialog.DialogCode.Rejected)
+            self.assertIsNone(options.project)
+            self.assertEqual(workspace.design.to_state(), original)
+            self.assertEqual(workspace.switches, [])
+            options.deleteLater()
+        before_target = linked.read_bytes()
+        options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
+        with patch("roar_api.floorplan.dialog._source_switch_choice", return_value="save"), patch.object(QFileDialog, "getSaveFileName", return_value=(str(linked), "")):
+            options.accept()
+        self.assertIn("different file", options.link_status.text())
+        self.assertEqual(linked.read_bytes(), before_target)
+        self.assertEqual(workspace.design.to_state(), original)
+        self.assertEqual(workspace.saves, [])
+        options.deleteLater()
+        options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
+        with patch("roar_api.floorplan.dialog._source_switch_choice", return_value="current"):
+            options.accept()
+        self.assertEqual(options.project.roar_project_path, str(current))
+        self.assertEqual(options.project.devices[0].width_um, 2)
+        self.assertTrue(workspace.is_modified())
+        options.deleteLater()
+        options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
+        with patch("roar_api.floorplan.dialog._source_switch_choice", return_value="switch"):
+            options.accept()
+        self.assertEqual(workspace.switches, [str(linked)])
+        self.assertEqual(options.project.devices[0].width_um, 5)
+        self.assertEqual(options.project.roar_project_path, str(linked))
+        self.assertEqual(options.source_origin, "live")
+        options.deleteLater()
+
+    def test_open_real_conflict_buttons_and_successful_save_switch(self):
+        linked = self.root / "target.roar"
+        Design().add_instance("M1_2", W=16e-6, L=0.2e-6, NF=4).save(linked)
+        current = self.root / "old.roar"
+        self.design.save(current)
+        workspace = FakeWorkspace(self.design, current, dirty=True)
+        project = self._bound_project()
+        project.roar_project_path = linked
+        sidecar = self.root / "modal.roar.floorplan"
+        project.save(sidecar)
+        options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
+        saved = self.root / "save-before-switch.roar"
+        def save_and_switch():
+            warning = QApplication.activeModalWidget()
+            labels = [button.text() for button in warning.buttons()]
+            self.assertIn("Discard and Switch", labels)
+            self.assertIn("Change saved association", labels)
+            next(button for button in warning.buttons() if button.text() == "Save and Switch…").click()
+        QTimer.singleShot(0, save_and_switch)
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(saved), "")):
+            options.accept()
+        self.assertEqual(options.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(workspace.saves, [str(saved)])
+        self.assertEqual(workspace.switches, [str(linked)])
+        self.assertEqual(load_roar_design(saved).get_instance_parameters()["M1_2"]["W"]["value"], 8e-6)
+        self.assertEqual(options.project.devices[0].width_um, 4)
+        options.deleteLater()
+
+    def test_open_binding_preflight_failure_does_not_switch_and_frozen_can_open(self):
+        other = self.root / "other.roar"
+        Design().add_instance("unrelated", W=8e-6).save(other)
+        project = self._bound_project()
+        project.roar_project_path = other
+        sidecar = self.root / "missing-mapping.roar.floorplan"
+        project.save(sidecar)
+        workspace = FakeWorkspace(self.design)
+        options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
+        with patch("roar_api.floorplan.dialog._source_switch_choice", return_value="switch"):
+            options.accept()
+        self.assertEqual(options.result(), QDialog.DialogCode.Rejected)
+        self.assertIn("M1_2", options.link_status.text())
+        self.assertEqual(workspace.switches, [])
+        options.source_mode.setCurrentIndex(options.source_mode.findData("saved"))
+        options.accept()
+        self.assertEqual(options.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(options.project.devices[0].width_um, 2)
+        self.assertEqual(options.project.roar_project_path, str(other))
+        options.deleteLater()
 
 
 if __name__ == "__main__":

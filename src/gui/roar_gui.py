@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QScrollBar, QFileDialog, QInputDialog, QComboBox, QSpinBox, QGridLayout, QSizePolicy,
     QMessageBox, QMenuBar, QMenu, QFileDialog, QStatusBar, QRadioButton, QTabBar, QAbstractItemView,
     QProgressDialog, QDialog)
-from PyQt6.QtCore import Qt, QSize, QObject, QEvent
+from PyQt6.QtCore import Qt, QSize, QObject, QEvent, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPalette, QAction, QColor, QPen, QKeySequence, QCursor
 # QShortcut historically lives in QtWidgets but some PyQt6 builds expose it in QtGui.
 # Import with a fallback so the module works across environments.
@@ -877,14 +877,18 @@ class ROARHeader(QWidget):
         """Keep one parent-owned floorplan editor across close/reopen cycles."""
         if self._floorplan_dialog is None:
             from roar_api.floorplan.dialog import FloorplanDialog
-
-            def snapshot():
-                from roar_api import Design
-                if self.top_level_app is None:
-                    raise ValueError("No ROAR application is available to read sizes.")
-                return Design.from_state(self.top_level_app.capture_app_state())
-
-            self._floorplan_dialog = FloorplanDialog(self, snapshot_provider=snapshot)
+            app = self.top_level_app
+            if app is None:
+                raise ValueError("No ROAR application is available to read sizes.")
+            workspace = app.floorplan_workspace()
+            model = app.editor_window.instance_table.tree.model()
+            self._floorplan_dialog = FloorplanDialog(
+                self, snapshot_provider=workspace.snapshot, workspace=workspace,
+                source_changed_signals=(model.dataChanged, model.rowsInserted,
+                                        model.rowsRemoved, model.modelReset,
+                                        app.editor_window.expression_editor.changed,
+                                        app.design_document_changed),
+                placement_options={"technology_provider": lambda: app.tech_dict})
         self._floorplan_dialog.show()
         self._floorplan_dialog.raise_()
         self._floorplan_dialog.activateWindow()
@@ -1079,6 +1083,8 @@ class CalculatorDialog(QDialog):
 
 
 class ROARApp(QMainWindow):
+    design_document_changed = pyqtSignal()
+
     def __init__(self, tech_dict=None):
         try:
             with open('/tmp/roar_debug.log', 'a', encoding='utf-8') as _fh:
@@ -1661,6 +1667,48 @@ class ROARApp(QMainWindow):
                 apply(getattr(lw, 'tech_splitter', None), d.get('lw_tech'))
 
     # ---- MENU ACTION CALLBACKS ----
+    def _capture_floorplan_design(self):
+        """Read editor inputs without capturing graph or window state."""
+        from roar_api import Design
+        state = self._capture_design_editor_state()
+        if not all(key in state for key in ("expression_editor", "constraint_editor", "instance_table")):
+            raise ValueError("The current ROAR design editor could not be read.")
+        return Design.from_state(state)
+
+    def _apply_floorplan_design(self, design):
+        """Replace editor inputs only; propagate errors for workspace rollback."""
+        state = design.to_state()["design_editor"]
+        previous_restoring = getattr(self, '_is_restoring_state', False)
+        self._is_restoring_state = True
+        try:
+            editor = self.editor_window
+            editor.expression_editor.load_table_data(state['expression_editor'], state.get('expression_tabs'))
+            editor.constraint_editor.load_table_data(state['constraint_editor'])
+            editor.instance_table.load_table_data(state['instance_table'])
+            editor._get_or_create_iterative_dialog().set_settings(state['iterative_solver'])
+            self._sync_all_instance_browser_tabs()
+        finally:
+            self._is_restoring_state = previous_restoring
+
+    def floorplan_workspace(self):
+        """Share document identity between the running design and floorplans."""
+        from roar_api.floorplan.workspace import DesignWorkspace
+        if not hasattr(self, '_floorplan_workspace'):
+            self._floorplan_workspace = DesignWorkspace(
+                capture_design=self._capture_floorplan_design,
+                capture_state=self.capture_app_state,
+                apply_design=self._apply_floorplan_design)
+        return self._floorplan_workspace
+
+    def _record_design_document(self, path):
+        try:
+            self.floorplan_workspace().record(path)
+        except (ValueError, TypeError):
+            # Preserve existing File actions for incomplete editor documents;
+            # the workspace rejects them as sizing sources until corrected.
+            pass
+        self.design_document_changed.emit()
+
     def new_file(self):
         """Handler for New File action."""
 
@@ -1686,6 +1734,7 @@ class ROARApp(QMainWindow):
             state = self.capture_app_state()
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2)
+            self._record_design_document(filename)
             QMessageBox.information(self, "Success", f"App state saved to:\n{filename}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save app state:\n{str(e)}")
@@ -1702,6 +1751,7 @@ class ROARApp(QMainWindow):
             with open(filename, 'r', encoding='utf-8') as f:
                 state = json.load(f)
             self.restore_app_state(state)
+            self._record_design_document(filename)
             QMessageBox.information(self, "Success", f"App state loaded from:\n{filename}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load app state:\n{str(e)}")

@@ -1,5 +1,6 @@
 """Executed as a file by the separate ALIGN Python; never imports ROAR/Qt."""
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -49,7 +50,20 @@ def main():
             # Only its HTTP hosting is adapted: local, no debugger/reloader.
             application = AppWithCallbacksAndState(tagged_bboxes=tagged_bboxes,
                 module_name=module_name, lambda_coeff=lambda_coeff)
-            server = make_server('127.0.0.1', port, application.app.server, threaded=True)
+            try:
+                server = make_server('127.0.0.1', port, application.app.server, threaded=True)
+            except OSError as error:
+                if error.errno in (errno.EPERM, errno.EACCES):
+                    raise RuntimeError('Placement was generated, but this environment blocks the local browser viewer. '
+                        'Run ROAR where loopback networking is permitted, then reopen the saved placement.') from error
+                raise RuntimeError(f'Placement was generated, but the browser viewer could not listen on '
+                    f'127.0.0.1:{port}: {error}. Select an available port or automatic port (0).') from error
+            except SystemExit as error:
+                if error.code in (None, 0):
+                    raise  # Preserve cancellation from our signal handler.
+                # Werkzeug exits on a bind failure such as an occupied port.
+                raise RuntimeError(f'Placement was generated, but the browser viewer could not bind '
+                    f'127.0.0.1:{port}. Select an available port or automatic port (0); see align.log.') from error
             try:
                 status('serving', url=f'http://127.0.0.1:{server.server_port}/')
                 server.serve_forever()

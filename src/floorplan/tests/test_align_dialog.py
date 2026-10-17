@@ -9,7 +9,7 @@ from unittest.mock import patch
 try:
     from PyQt6.QtCore import QSettings, QTimer, QUrl, Qt
     from PyQt6.QtTest import QTest
-    from PyQt6.QtWidgets import QApplication, QDialog, QWidget
+    from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QWidget
 except ImportError:
     QApplication = None
 
@@ -17,7 +17,7 @@ from roar_api.floorplan import FloorplanProject
 from roar_api.floorplan.align_runner import AlignConfig, PROFILE_ID, RunState, project_fingerprint
 
 if QApplication is not None:
-    from roar_api.floorplan.align_dialog import PlacementPanel, open_align_browser
+    from roar_api.floorplan.align_dialog import AlignSettingsDialog, PlacementPanel, open_align_browser
 
 
 class FakeRunner:
@@ -89,7 +89,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.path = self.root / "ota.roar.floorplan"
         netlist = ".subckt ota d g s b\n" + "".join(
-            f"M{i} d g s b sky130_fd_pr__nfet_01v8 W=2u L=0.15u nf=2\n" for i in range(1, 11)) + ".ends ota\n"
+            f"M{i} d g s b sky130_fd_pr__nfet_01v8 W=2u L=0.15u nf=2\n" for i in range(1, 3)) + ".ends ota\n"
         self.project = FloorplanProject.from_text(netlist)
         self.project.align_profile = PROFILE_ID
         self.owner = QWidget()
@@ -97,6 +97,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
         self.config = AlignConfig("/isolated/python", "/tested/backend", str(self.root / "runs"))
         self.runners, self.opened, self.profiles = [], [], []
+        self.technologies = {"SKY130A": {}, "IHP-SG13G2": {}}
         def factory(config, project_path=None):
             runner = FakeRunner(config, project_path)
             self.runners.append(runner)
@@ -106,6 +107,7 @@ class PlacementPanelTests(unittest.TestCase):
             self.project.align_profile = profile
         self.panel = PlacementPanel(lambda: self.project, lambda: self.path, set_profile, self.editor,
                                     settings=self.settings, config=self.config, runner_factory=factory,
+                                    technology_provider=lambda: self.technologies,
                                     browser_opener=lambda url: self.opened.append(url.toString()) or True)
         self.validate = patch.object(AlignConfig, "validate", return_value=None).start()
         self.panel.refresh()
@@ -172,17 +174,94 @@ class PlacementPanelTests(unittest.TestCase):
         self.project.align_profile = None
         self.panel.refresh()
         self.assertFalse(self.panel.generate_button.isEnabled())
-        self.assertIn("profile", self.panel.status.text())
+        self.assertIn("SKY130", self.panel.status.text())
         self.project.align_profile = PROFILE_ID
-        self.project.devices.pop()
+        original = self.project.devices[0].model
+        self.project.devices[0].model = "unsupported_model"
         self.panel.refresh()
         self.assertFalse(self.panel.generate_button.isEnabled())
-        self.project.devices.append(self.project.devices[-1])
+        self.project.devices[0].model = original
         self.validate.side_effect = ValueError("Select isolated ALIGN Python")
         self.panel._guard(self.panel.generate)
         self.assertIn("isolated ALIGN Python", self.panel.status.text())
         self.assertEqual(self.opened, [])
         self.assertEqual(self.runners[-1].starts, 0)
+
+    def test_library_technologies_show_backend_eligibility_and_legacy_profile_uses_sky130_label(self):
+        self.assertEqual(self.panel.profile_label.text(), "Layout technology: SKY130A")
+        self.assertNotIn(PROFILE_ID, self.panel.profile_label.text())
+        self.technologies["LocalProcess"] = {}
+        def inspect():
+            dialog = QApplication.activeModalWidget()
+            self.assertEqual(dialog.technology.currentText(), "SKY130A")
+            self.assertEqual(dialog.technology.currentData(), PROFILE_ID)
+            for name in ("IHP-SG13G2", "LocalProcess"):
+                index = dialog.technology.findText(f"{name} — no ALIGN backend")
+                self.assertGreaterEqual(index, 0)
+                item = dialog.technology.model().item(index)
+                self.assertFalse(item.isEnabled())
+                self.assertIn("sizing library", item.toolTip())
+            labels = " ".join(label.text() for label in dialog.findChildren(QLabel))
+            self.assertNotIn("OTA", labels)
+            self.assertNotIn("tested", labels.lower())
+            dialog.reject()
+        QTimer.singleShot(0, inspect)
+        self.panel.edit_settings()
+        self.assertEqual(self.settings.allKeys(), [])
+
+    def test_supported_technology_remains_available_without_a_library_provider(self):
+        dialog = AlignSettingsDialog(self.config, PROFILE_ID)
+        self.assertEqual(dialog.technology.currentText(), "SKY130A")
+        self.assertEqual(dialog.technology.currentData(), PROFILE_ID)
+        dialog.deleteLater()
+
+    def test_choosing_library_technology_persists_compatible_backend_id_and_machine_paths_only(self):
+        self.project.align_profile = None
+        def choose():
+            dialog = QApplication.activeModalWidget()
+            dialog.technology.setCurrentIndex(dialog.technology.findText("SKY130A"))
+            dialog.accept()
+        QTimer.singleShot(0, choose)
+        self.panel.edit_settings()
+        self.assertEqual(self.profiles, [PROFILE_ID])
+        self.assertEqual(self.project.align_profile, PROFILE_ID)
+        self.assertEqual(set(self.settings.allKeys()), {"python", "backend_path", "run_root"})
+        self.assertEqual(self.panel.profile_label.text(), "Layout technology: SKY130A")
+
+    def test_unsupported_or_unknown_backend_cannot_be_accepted_programmatically(self):
+        for profile, technologies, choice in (
+                (None, {"IHP-SG13G2": {}}, "unavailable:IHP-SG13G2"),
+                ("old-unavailable-profile", (), "old-unavailable-profile")):
+            dialog = AlignSettingsDialog(self.config, profile, technologies=technologies)
+            dialog.technology.setCurrentIndex(dialog.technology.findData(choice))
+            dialog.accept()
+            self.assertEqual(dialog.result(), QDialog.DialogCode.Rejected)
+            self.assertIsNone(dialog.config)
+            self.assertIn("No ALIGN backend", dialog.error.text())
+            dialog.deleteLater()
+
+    def test_before_generate_captures_current_sizes_once_and_failures_prevent_launch(self):
+        calls = []
+        def update():
+            calls.append(True)
+            self.project.set_mos_parameters("M1", 3, 0.15, 2)
+        self.panel._before_generate = update
+        self.panel.generate()
+        runner = self.runners[-1]
+        self.assertEqual(runner.state.fingerprint, project_fingerprint(self.project))
+        self.assertEqual(self.project.devices[0].width_um, 3)
+        self.panel.generate()  # Showing the active run must not change its input.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(runner.starts, 1)
+        self.panel.stop()
+        self.panel._poll()
+        def fail():
+            raise ValueError("ROAR M1.W has no current assigned value")
+        self.panel._before_generate = fail
+        self.panel._guard(self.panel.generate)
+        self.assertEqual(runner.starts, 1)
+        self.assertIn("no current assigned value", self.panel.status.text())
+        self.assertEqual(self.opened, [])
 
     def test_cancel_run_window_close_owner_close_and_shutdown_cleanup(self):
         self.panel.generate()

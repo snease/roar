@@ -2536,6 +2536,8 @@ class ROAREditorWindow(QWidget):
             }
             with open(file_path, "w") as file:
                 json.dump(data, file, indent=4)
+            if self.top_level_app is not None and hasattr(self.top_level_app, '_record_design_document'):
+                self.top_level_app._record_design_document(file_path)
             QMessageBox.information(self, "Success", "Data saved successfully!")
 
     def load_all_data(self, file_path=None, show_success_message=True):
@@ -2562,6 +2564,8 @@ class ROAREditorWindow(QWidget):
 
                 # Emit signal after loading data
                 self.on_expressions_changed()
+                if self.top_level_app is not None and hasattr(self.top_level_app, '_record_design_document'):
+                    self.top_level_app._record_design_document(file_path)
             except FileNotFoundError:
                 QMessageBox.critical(self, "Error", f"File not found: {file_path}")
             except json.JSONDecodeError:

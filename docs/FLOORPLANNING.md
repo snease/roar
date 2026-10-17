@@ -2,7 +2,7 @@
 
 The layout button in ROAR's header opens a floorplan editor for device sizes and
 high-level placement intent. It exports sized SPICE and native ALIGN constraint
-JSON. The optional **Placement** tab runs the OTA through ALIGN and opens ALIGN's
+JSON. The optional **Placement** tab runs the circuit through ALIGN and opens ALIGN's
 own placement explorer in a browser. ALIGN supplies both the placement engine
 and the explorer; ROAR manages the inputs, settings and run lifecycle.
 
@@ -17,9 +17,9 @@ WSL. The Python API works with the headless installation, `pip install -e .`.
 The editable layout data lives in a separate `.roar.floorplan` file.
 It contains the circuit template, chosen subcircuit, size values and bindings,
 placement constraints, and an optional link to a saved ROAR design. ROAR's
-existing `.roar` format is unchanged. Floorplan actions never write to that
-design file or replace the running ROAR workspace. Existing `.floorplan.json`
-files still open.
+existing `.roar` format is unchanged. Switching to an associated design requires
+an explicit choice when it conflicts with the current design. Existing
+`.floorplan.json` files still open.
 
 The usual workflow is **New floorplan…** or **Open floorplan…**, edit the sizes
 and constraints, **Save**, then **Export ALIGN inputs…** when ready for ALIGN.
@@ -36,11 +36,18 @@ Constraints belong to the floorplan and are saved with it. A separate constraint
 file is only needed to exchange rules with ALIGN or another tool. There is one
 export action, which includes both the sized netlist and the constraints.
 
-**Open floorplan…** shows both file paths in one dialog. Choosing a floorplan
-fills in its linked ROAR design; you can browse for a different design. An
-explicit design choice is retained when changing the floorplan, with the
-different saved link shown for comparison. Missing links can be repaired with
-Browse, or the floorplan can open using its saved sizes alone.
+**Open floorplan…** offers a sizing source: **Current ROAR design**, **Saved ROAR
+file**, or **Saved floorplan sizes**. An existing association is preferred;
+without one, the current design is used when available. Missing links can be
+repaired with Browse, or the floorplan can open using its saved sizes alone.
+
+If the associated design differs from the active design, a conflict dialog
+offers switching to the associated design, associating the floorplan with the
+current design, or cancelling. Unsaved design changes add **Save and Switch**
+and **Discard and Switch** choices. Cancelling or failing a save cancels the
+switch. An unnamed current design must be saved before making a persistent
+association. Switching changes the design editor's data; graph tabs and window
+layout stay in place.
 
 Links are saved relative to the companion file. Moving the two files together
 preserves their association, and **Save as…** rebases the link to the same design.
@@ -49,11 +56,11 @@ original file moves. Version 1 and 2 floorplan files still open; new saves use
 version 3, which adds an optional ALIGN profile name. Machine paths and run
 history are stored separately from the floorplan and the `.roar` design.
 
-Opening a floorplan restores its saved size snapshot. Loading or relinking a
-ROAR design supplies a source for subsequent assignments; it does not silently
-refresh the saved sizes. **Refresh bindings from this source** explicitly updates
-values from the selected source. Failed refreshes keep the previous sizes and clear the
-unavailable source from the editor.
+**Saved floorplan sizes** restores the captured sizes without a live source.
+**Current ROAR design** keeps explicitly bound parameters up to date with the
+design editor. Manual values are preserved. A live source is refreshed again
+before generating placement or exporting, so a missing or invalid binding
+blocks those actions rather than exporting its old value.
 
 ## Try a linked, parameterized OTA
 
@@ -87,9 +94,9 @@ The affected-device column exposes that relationship and preserves it exactly.
 ## Generate and inspect the OTA placement
 
 1. Open the linked OTA example above and select **Placement**. Its saved
-   `sky130-ota-vibeic-v1` profile supplies the repository's tested run defaults.
-2. Open **ALIGN settings…** and choose the Python executable from the separate
-   ALIGN environment, the tested backend's `SKY130_PDK` directory, and a run
+   backend profile selects **SKY130A** and supplies the repository's run defaults.
+2. Open **ALIGN settings…**, select a **Layout technology**, and choose the Python
+   executable from the separate ALIGN environment, the backend's `SKY130_PDK` directory, and a run
    directory. These paths are local preferences; they are not written into
    the floorplan or the linked ROAR design. Settings can be populated from
    `ROAR_ALIGN_PYTHON` and `ROAR_ALIGN_PDK_FIXED` when ROAR starts.
@@ -121,8 +128,12 @@ saved floorplan path. Saving an unsaved floorplan before running gives it a
 stable identity for reopening results. **Save as…** moves the current run's
 association to the new floorplan path without restarting ALIGN.
 
-Only the ten-MOS SKY130 OTA profile is enabled in this contribution.
-Common-source and other examples belong in a later stack layer.
+Technology choices come from ROAR's sizing library. A characterization library
+alone does not provide an ALIGN layout generator: technologies without a
+configured backend remain visible but unavailable for generation. The included
+backend supports four-terminal SKY130 1.8 V NMOS and PMOS models. Unsupported
+devices are reported by name; device count is not restricted to the OTA example.
+The OTA remains the included demonstration and native acceptance circuit.
 
 ## Create an OTA floorplan from a numeric netlist
 
@@ -190,12 +201,13 @@ export alone does not establish DRC, LVS, model-bin validity or generated geomet
 
 ## Bring sizes over from ROAR
 
-Use **Load / relink ROAR design…** for a saved design or **Read current ROAR sizes**
-for the running design. Both supply detached snapshots. The Parameters tab binds
+Use the **Sizing source** selector for the current design, a saved design, or
+the floorplan's captured sizes. The Parameters tab binds
 one netlist symbol to one explicitly chosen instance attribute, using ROAR's
 existing assigned scalar values. It records whether that binding came from the
 linked file or the running design, and preserves the captured value on save.
-Refreshing updates bindings for the selected source only. Missing assignments,
+Selecting the current design updates existing explicit bindings to that source;
+it does not infer device-name mappings. Missing assignments,
 disabled instances, nonfinite values and vectors are rejected; the editor does
 not evaluate sweeps or select a design point on your behalf.
 

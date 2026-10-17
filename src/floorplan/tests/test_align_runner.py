@@ -1,6 +1,10 @@
 """Headless lifecycle tests use a small child process, never import ALIGN/Qt."""
 import dataclasses
 import hashlib
+import errno
+import contextlib
+import io
+from types import SimpleNamespace
 import json
 import os
 from pathlib import Path
@@ -71,15 +75,53 @@ class RunnerTests(unittest.TestCase):
             time.sleep(.02)
         self.fail(f'Expected {status}: {state}; {runner.log_tail()}')
 
-    def test_only_explicit_supported_ota_profile_can_start(self):
+    def test_technology_gate_accepts_different_circuit_sizes_and_reports_unsupported_devices(self):
         self.project.align_profile = None
-        with self.assertRaisesRegex(ValueError, 'supported OTA profile'):
+        with self.assertRaisesRegex(ValueError, 'Select layout technology SKY130'):
             self.runner.start(self.project)
         self.project.align_profile = PROFILE_ID
         self.project.devices.pop()
-        with self.assertRaisesRegex(ValueError, 'ten-MOS SKY130 OTA only'):
+        validate_ota_project(self.project)
+        first = self.project.devices[0]
+        first.kind = 'resistor'
+        with self.assertRaisesRegex(ValueError, first.name + ': .*no supported resistor generator'):
             self.runner.start(self.project)
+        first.kind = 'mos'
+        first.model = 'unsupported_model'
+        with self.assertRaisesRegex(ValueError, first.name + ': unsupported device model'):
+            validate_ota_project(self.project)
         self.assertFalse(Path(self.config.run_root).exists())
+
+    def test_owned_live_process_does_not_fail_when_proc_observation_is_unavailable(self):
+        (self.base / 'mode').write_text('pending')
+        self.runner.start(self.project)
+        self.until(self.runner, 'generating')
+        with patch('roar_api.floorplan.align_runner._alive', return_value=False):
+            state = self.runner.poll(self.project)
+            self.assertEqual(state.status, 'generating')
+            self.assertTrue(state.can_stop)
+            self.runner.stop()
+            self.until(self.runner, 'stopped')
+
+    def test_worker_terminal_error_published_during_exit_is_preserved(self):
+        self.runner.start(self.project)
+        state = self.until(self.runner, 'serving')
+        self.runner.shutdown()
+        path = Path(state.run_dir) / 'status.json'
+        manifest = json.loads((Path(state.run_dir) / 'run.json').read_text())
+        manifest['active']['stop_requested'] = None
+        (Path(state.run_dir) / 'run.json').write_text(json.dumps(manifest))
+        token = manifest['active']['token']
+        path.write_text(json.dumps({'token': token, 'status': 'generating', 'error': None}))
+        def exit_after_status_read():
+            path.write_text(json.dumps({'token': token, 'status': 'failed', 'error': 'specific native diagnostic'}))
+            return 2
+        process = SimpleNamespace(pid=manifest['active']['pid'], returncode=2, poll=exit_after_status_read)
+        with patch.object(self.runner, '_process', process):
+            result = self.runner.poll(self.project)
+        self.assertEqual(result.status, 'failed')
+        self.assertEqual(result.error, 'specific native diagnostic')
+        self.assertEqual(json.loads(path.read_text())['error'], 'specific native diagnostic')
 
     def test_snapshot_isolated_command_readiness_cache_and_restart(self):
         before = self.project.to_dict()
@@ -213,6 +255,34 @@ class RunnerTests(unittest.TestCase):
         self.assertIsInstance(project_fingerprint(self.project), str)
         self.assertTrue(adopted.poll(self.project).stale)
         self.assertTrue(adopted.open_last(self.project).stale)
+
+
+class WorkerErrorTests(unittest.TestCase):
+    def test_loopback_permission_error_preserves_placement_and_explains_reopen(self):
+        from roar_api.floorplan import _align_worker
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run.json'
+            token = 'test-activation'
+            path.write_text(json.dumps({'active': {'token': token, 'mode': 'generate', 'backend_path': directory, 'port': 0},
+                'generation_config': {'profile': PROFILE}, 'input_dir': directory, 'top': 'test'}))
+            placer = SimpleNamespace()
+            def schematic2layout(**kwargs):
+                placer.run_gui(tagged_bboxes={}, module_name='TEST', lambda_coeff=1, port=0)
+            modules = {
+                'align': SimpleNamespace(__version__=PROFILE['align_version'], schematic2layout=schematic2layout),
+                'dash': SimpleNamespace(__version__='2.18.2'),
+                'align.pnr': SimpleNamespace(placer=placer),
+                'align.gui.mockup': SimpleNamespace(AppWithCallbacksAndState=lambda **kwargs: SimpleNamespace(app=SimpleNamespace(server=object()))),
+                'werkzeug.serving': SimpleNamespace(make_server=lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError(errno.EPERM, 'Operation not permitted'))),
+            }
+            with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', token]), \
+                    patch.object(_align_worker.signal, 'signal'), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(_align_worker.main(), 1)
+            status = json.loads(path.with_name('status.json').read_text())
+            self.assertEqual(status['status'], 'failed')
+            self.assertIn('Placement was generated', status['error'])
+            self.assertIn('loopback networking', status['error'])
+            self.assertIn('reopen the saved placement', status['error'])
 
 
 class ConfigTests(unittest.TestCase):

@@ -11,7 +11,7 @@ import math
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -22,60 +22,141 @@ from PyQt6.QtWidgets import (
 from .model import FloorplanProject
 from .constraint_editor import ConstraintEditorDialog, constraint_summary, editable_constraint
 
+from .workspace import editor_signature, load_roar_design
 
-def load_roar_design(path):
-    """Load an actual ROAR editor file without changing the running app."""
-    from roar_api import Design
-    if not str(path).strip():
-        raise ValueError("Choose a saved ROAR design path, or continue without a ROAR source.")
-    state = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
-    editor = state.get("design_editor", state) if isinstance(state, dict) else None
-    tables = ("instance_table", "expression_editor", "constraint_editor")
-    if not isinstance(editor, dict) or not any(key in editor for key in tables):
-        raise ValueError("Choose a ROAR design (.roar), not a floorplan sidecar or netlist.")
-    for key in tables:
-        if key in editor and (not isinstance(editor[key], list) or
-                              any(not isinstance(row, dict) for row in editor[key])):
-            raise ValueError(f"Invalid ROAR design: {key} must be an editor table.")
-    return Design.load(path)
+
+def _refresh_source_bindings(project, design, origin):
+    """Migrate only explicit mappings, leaving manual values untouched."""
+    candidate = FloorplanProject.from_dict(project.to_dict())
+    for row in project.parameter_rows:
+        binding = row["binding"]
+        if binding:
+            candidate.bind_parameter(
+                design, row["symbol"], binding["instance"], binding["attribute"],
+                dimension_unit=row["dimension_unit"],
+                width_convention=row["width_convention"], source=origin)
+    return candidate
+
+
+def _source_switch_choice(parent, workspace, path):
+    question = QMessageBox(parent)
+    question.setWindowTitle("Switch ROAR design?")
+    dirty = workspace.is_modified()
+    question.setText("The current ROAR design has unsaved changes." if dirty else
+                     "The selected floorplan uses a different ROAR design.")
+    question.setInformativeText(
+        f"Current design: {workspace.path or 'Unsaved design'}\nLinked design: {path}\n"
+        "Change saved association uses the current design for this floorplan.")
+    save = question.addButton("Save and Switch…", QMessageBox.ButtonRole.AcceptRole) if dirty else None
+    switch = question.addButton("Discard and Switch" if dirty else "Switch to linked design", QMessageBox.ButtonRole.DestructiveRole)
+    association = question.addButton("Change saved association", QMessageBox.ButtonRole.ActionRole)
+    frozen = question.addButton("Use saved floorplan sizes", QMessageBox.ButtonRole.ActionRole)
+    question.addButton(QMessageBox.StandardButton.Cancel)
+    question.setDefaultButton(save or switch)
+    question.exec()
+    clicked = question.clickedButton()
+    return "save" if save is not None and clicked is save else "switch" if clicked is switch else "current" if clicked is association else "saved" if clicked is frozen else "cancel"
+
+
+def _save_workspace(parent, workspace, protected_path=None):
+    path, _ = QFileDialog.getSaveFileName(parent, "Save current ROAR design", str(workspace.path or "design.roar"), "ROAR design (*.roar)")
+    if not path:
+        return False
+    if not Path(path).suffix:
+        path += ".roar"
+    if protected_path and Path(path).expanduser().resolve() == Path(protected_path).expanduser().resolve():
+        raise ValueError("Save the current design to a different file; this path is the linked design you are switching to.")
+    workspace.save(path)
+    return True
+
+
+def _choose_source(parent, project, mode, path, workspace=None, snapshot_provider=None):
+    """Preflight mappings before changing the active design or floorplan."""
+    if mode == "saved":
+        return FloorplanProject.from_dict(project.to_dict()), None, None
+    if mode == "live":
+        provider = workspace.snapshot if workspace is not None else snapshot_provider
+        if provider is None:
+            raise ValueError("The current ROAR design is unavailable.")
+        design = provider()
+        candidate = _refresh_source_bindings(project, design, "live")
+        candidate.roar_project_path = workspace.path if workspace is not None else None
+        return candidate, design, "live"
+    if workspace is not None and workspace.path and Path(workspace.path).resolve() == Path(path).expanduser().resolve():
+        return _choose_source(parent, project, "live", "", workspace, snapshot_provider)
+    design = load_roar_design(path)
+    if workspace is None:
+        candidate = _refresh_source_bindings(project, design, "linked")
+        candidate.roar_project_path = str(Path(path).expanduser().resolve())
+        return candidate, design, "linked"
+    if workspace is not None:
+        current = workspace.snapshot()
+        differs = editor_signature(current) != editor_signature(design)
+        same_path = workspace.path and Path(workspace.path).resolve() == Path(path).expanduser().resolve()
+        from roar_api import Design
+        has_current = editor_signature(current) != editor_signature(Design())
+        choice = "switch"
+        if differs and has_current:
+            choice = _source_switch_choice(parent, workspace, path)
+            if choice == "cancel":
+                return None
+            if choice == "saved":
+                return _choose_source(parent, project, "saved", path, workspace, snapshot_provider)
+            if choice == "current":
+                # Validate mappings before asking to save an unnamed design.
+                _refresh_source_bindings(project, current, "live")
+                if not workspace.path and not _save_workspace(parent, workspace, path):
+                    return None
+                return _choose_source(parent, project, "live", "", workspace, snapshot_provider)
+        # Validate selected target mappings before any save or design switch.
+        _refresh_source_bindings(project, design, "live")
+        if choice == "save" and not _save_workspace(parent, workspace, path):
+            return None
+        if differs or not same_path:
+            workspace.switch(path)
+        design = workspace.snapshot()
+        candidate = _refresh_source_bindings(project, design, "live")
+        candidate.roar_project_path = workspace.path
+    return candidate, design, "live" if workspace is not None else "linked"
 
 
 class OpenFloorplanDialog(QDialog):
-    """Choose a sidecar and an independent, optional saved design source."""
+    """Choose a floorplan and the source that supplies its bound sizes."""
 
-    def __init__(self, parent=None, floorplan_path=None):
+    def __init__(self, parent=None, floorplan_path=None, *, workspace=None, snapshot_provider=None):
         super().__init__(parent)
+        self.workspace, self.snapshot_provider = workspace, snapshot_provider
         self.setWindowTitle("Open floorplan")
         self.setMinimumWidth(650)
-        self.project = self.design = None
+        self.project = self.design = self.source_origin = None
         self._candidate = None
         self._suggested_design = ""
-        self._manual_design = False
+        self._manual_design = self._manual_source = False
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self.floorplan_path = QLineEdit()
-        self.design_path = QLineEdit()
-        for label, field, action in (
-                ("Floorplan (.roar.floorplan):", self.floorplan_path, self._browse_floorplan),
-                ("ROAR design (.roar), optional:", self.design_path, self._browse_design)):
-            row = QHBoxLayout()
-            row.addWidget(field)
-            browse = QPushButton("Browse…")
-            browse.clicked.connect(action)
-            row.addWidget(browse)
-            form.addRow(label, row)
+        self.floorplan_path, self.design_path = QLineEdit(), QLineEdit()
+        row = QHBoxLayout()
+        row.addWidget(self.floorplan_path)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse_floorplan)
+        row.addWidget(browse)
+        form.addRow("Floorplan (.roar.floorplan):", row)
+        self.source_mode = QComboBox()
+        for label, key in (("Current ROAR design", "live"), ("Saved ROAR file", "linked"), ("Saved floorplan sizes", "saved")):
+            self.source_mode.addItem(label, key)
+        form.addRow("Sizing source:", self.source_mode)
+        row = QHBoxLayout()
+        row.addWidget(self.design_path)
+        self.browse_design = QPushButton("Browse…")
+        self.browse_design.clicked.connect(self._browse_design)
+        row.addWidget(self.browse_design)
+        form.addRow("ROAR design (.roar):", row)
         layout.addLayout(form)
-        self.without_design = QCheckBox("Open without loading a ROAR design")
-        layout.addWidget(self.without_design)
         self.link_status = QLabel()
         self.link_status.setTextFormat(Qt.TextFormat.PlainText)
         self.link_status.setWordWrap(True)
         layout.addWidget(self.link_status)
-        note = QLabel("Saved floorplan sizes stay as saved. Refresh bindings explicitly to read new source values.")
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        self.buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
@@ -83,7 +164,8 @@ class OpenFloorplanDialog(QDialog):
         self.floorplan_path.editingFinished.connect(self._floorplan_changed)
         self.design_path.textEdited.connect(self._design_edited)
         self.design_path.textChanged.connect(self._update_status)
-        self.without_design.toggled.connect(self._update_status)
+        self.source_mode.activated.connect(self._source_edited)
+        self.source_mode.currentIndexChanged.connect(self._update_status)
         if floorplan_path:
             self.floorplan_path.setText(str(floorplan_path))
             self._floorplan_changed()
@@ -91,72 +173,83 @@ class OpenFloorplanDialog(QDialog):
             self._update_status()
 
     def _browse_floorplan(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Choose Floorplan", self.floorplan_path.text(),
-            "Floorplan (*.roar.floorplan *.floorplan.json *.json);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Floorplan", self.floorplan_path.text(), "Floorplan (*.roar.floorplan *.floorplan.json *.json);;All files (*)")
         if path:
             self.floorplan_path.setText(path)
             self._floorplan_changed()
 
     def _browse_design(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Choose saved ROAR design", self.design_path.text(),
-            "ROAR design (*.roar *.json);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose saved ROAR design", self.design_path.text(), "ROAR design (*.roar *.json);;All files (*)")
         if path:
-            self._manual_design = True
             self.design_path.setText(path)
-            self.without_design.setChecked(False)
+            self._design_edited()
 
     def _design_edited(self, *_args):
-        self._manual_design = True
+        self._manual_design = self._manual_source = True
+        self.source_mode.setCurrentIndex(self.source_mode.findData("linked"))
+        self._update_status()
+
+    def _source_edited(self, *_args):
+        self._manual_source = True
         self._update_status()
 
     def _invalidate_floorplan(self, *_args):
         self._candidate = None
-        self._load_error = "Finish entering the floorplan path to inspect its saved ROAR link."
+        self._load_error = "Finish entering the floorplan path."
         self._update_status()
 
     def _floorplan_changed(self, *_args):
-        self._candidate = None
-        self._load_error = ""
-        path = self.floorplan_path.text().strip()
-        if path:
-            try:
-                self._candidate = FloorplanProject.load(path)
-            except (ValueError, TypeError, KeyError, OSError) as exc:
-                self._load_error = str(exc)
+        self._candidate, self._load_error = None, ""
+        try:
+            self._candidate = FloorplanProject.load(self.floorplan_path.text().strip())
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            self._load_error = str(exc)
         self._suggested_design = str(self._candidate.roar_project_path or "") if self._candidate else ""
         if not self._manual_design:
             self.design_path.setText(self._suggested_design)
-            self.without_design.setChecked(bool(
-                self._suggested_design and not Path(self._suggested_design).is_file()))
+        if not self._manual_source:
+            mode = "saved"
+            if self._suggested_design and Path(self._suggested_design).is_file():
+                mode = "linked"
+            elif not self._suggested_design:
+                try:
+                    provider = self.workspace.snapshot if self.workspace is not None else self.snapshot_provider
+                    if provider and provider().get_instance_parameters():
+                        mode = "live"
+                except (ValueError, RuntimeError, OSError):
+                    pass
+            self.source_mode.setCurrentIndex(self.source_mode.findData(mode))
         self._update_status()
 
     def _update_status(self, *_args):
-        path = self.design_path.text().strip()
+        mode = self.source_mode.currentData()
+        self.design_path.setEnabled(mode == "linked")
+        self.browse_design.setEnabled(mode == "linked")
+        message = ""
         valid = self._candidate is not None
         if not valid:
-            message = getattr(self, "_load_error", "") or "Choose a floorplan sidecar."
-        elif self._manual_design and path != self._suggested_design:
-            message = "Using your ROAR choice. This floorplan links to: " + (self._suggested_design or "no saved design") + "."
-        else:
-            message = "ROAR path suggested by the selected floorplan." if path else "Standalone floorplan; no ROAR design is linked."
-        if valid and path and not Path(path).expanduser().is_file():
-            message += " Linked ROAR design is missing. Browse to relink, or open saved sizes without a ROAR design."
-            valid = self.without_design.isChecked()
+            message = getattr(self, "_load_error", "") or "Choose a floorplan."
+        elif mode == "linked" and not Path(self.design_path.text().strip()).is_file():
+            message, valid = "ROAR file is missing. Browse to relink, or choose Saved floorplan sizes.", False
+        elif mode == "live" and self.workspace is None and self.snapshot_provider is None:
+            message, valid = "The current ROAR design is unavailable.", False
+        elif self._suggested_design and not Path(self._suggested_design).is_file():
+            message = "Associated ROAR file is missing; saved floorplan sizes are available."
+        elif self._manual_design and self.design_path.text().strip() != self._suggested_design:
+            message = "Association will change to the selected ROAR file."
         self.link_status.setText(message)
         self.buttons.button(QDialogButtonBox.StandardButton.Open).setEnabled(valid)
 
     def accept(self):
         try:
             candidate = FloorplanProject.load(self.floorplan_path.text().strip())
-            path = self.design_path.text().strip()
-            design = None if self.without_design.isChecked() or not path else load_roar_design(path)
-            candidate.roar_project_path = str(Path(path).expanduser().resolve()) if path else None
-        except (ValueError, TypeError, KeyError, OSError) as exc:
+            result = _choose_source(self, candidate, self.source_mode.currentData(), self.design_path.text().strip(), self.workspace, self.snapshot_provider)
+            if result is None:
+                return
+            self.project, self.design, self.source_origin = result
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
             self.link_status.setText(str(exc))
             return
-        self.project, self.design = candidate, design
         super().accept()
 
 
@@ -193,7 +286,7 @@ class NetlistImportDialog(QDialog):
         self.source_mode.addItem("No ROAR design", "none")
         self.source_mode.addItem("Saved ROAR design (.roar)", "linked")
         if snapshot_available:
-            self.source_mode.addItem("Current running ROAR snapshot", "live")
+            self.source_mode.addItem("Current ROAR design", "live")
         form.addRow("Optional sizing source:", self.source_mode)
         self.design_path = QLineEdit()
         self.design_path.setPlaceholderText("Saved ROAR design path")
@@ -283,13 +376,22 @@ class ParameterImportDialog(QDialog):
 class FloorplanDialog(QDialog):
     """A persistent editor; ``snapshot_provider`` returns a detached Design."""
 
-    def __init__(self, parent=None, snapshot_provider=None, *, placement_options=None):
+    def __init__(self, parent=None, snapshot_provider=None, *, placement_options=None, workspace=None, source_changed_signals=()):
         super().__init__(parent)
         self.setWindowTitle("ROAR Floorplan")
         self.resize(980, 760)
         self.project = None
         self.project_path = None
-        self.snapshot_provider = snapshot_provider
+        self.workspace = workspace
+        self.snapshot_provider = workspace.snapshot if workspace is not None else snapshot_provider
+        self._source_error = ""
+        self._source_mode = "saved"
+        self._source_timer = QTimer(self)
+        self._source_timer.setSingleShot(True)
+        self._source_timer.setInterval(300)
+        self._source_timer.timeout.connect(self._live_source_update)
+        for signal in source_changed_signals:
+            signal.connect(self._schedule_source_update)
         self.roar_design = None
         self._source_origin = None
         self._dirty = False
@@ -297,7 +399,7 @@ class FloorplanDialog(QDialog):
         layout = QVBoxLayout(self)
         note = QLabel(
             "Edit device sizes and placement rules. Export ALIGN inputs or use the "
-            "Placement tab to generate an OTA placement.")
+            "Placement tab to generate a placement with a supported technology library.")
         note.setWordWrap(True)
         layout.addWidget(note)
         bar = QHBoxLayout()
@@ -315,13 +417,25 @@ class FloorplanDialog(QDialog):
         self.project_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.project_label)
         source_bar = QHBoxLayout()
-        source_bar.addWidget(self._button("Load / relink ROAR design…", self._load_linked_roar))
-        source_bar.addWidget(self._button("Read current ROAR sizes", self._read_roar))
-        self.snapshot_label = QLabel("No ROAR source loaded.")
+        source_bar.addWidget(QLabel("Sizing source:"))
+        self.source_mode = QComboBox()
+        for label, key in (("Current ROAR design", "live"), ("Saved ROAR file", "linked"), ("Saved floorplan sizes", "saved")):
+            self.source_mode.addItem(label, key)
+        self.source_mode.setCurrentIndex(self.source_mode.findData("saved"))
+        self.source_mode.activated.connect(self._source_selected)
+        source_bar.addWidget(self.source_mode)
+        self.source_path = QLineEdit()
+        self.source_path.setReadOnly(True)
+        source_bar.addWidget(self.source_path, 1)
+        source_bar.addWidget(self._button("Browse…", self._load_linked_roar))
+        self.source_reload_button = self._button("Reload source", self._refresh_bindings)
+        self.source_reload_button.setVisible(False)
+        source_bar.addWidget(self.source_reload_button)
+        layout.addLayout(source_bar)
+        self.snapshot_label = QLabel()
         self.snapshot_label.setTextFormat(Qt.TextFormat.PlainText)
         self.snapshot_label.setWordWrap(True)
-        source_bar.addWidget(self.snapshot_label, 1)
-        layout.addLayout(source_bar)
+        layout.addWidget(self.snapshot_label)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
         self._build_devices_tab()
@@ -330,7 +444,7 @@ class FloorplanDialog(QDialog):
         from .align_dialog import PlacementPanel
         self.placement_panel = PlacementPanel(
             self._collect_project, lambda: self.project_path, self._set_align_profile,
-            self, **(placement_options or {}))
+            self, **dict({"before_generate": self._ensure_current_source}, **(placement_options or {})))
         self.tabs.addTab(self.placement_panel, "Placement")
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -369,15 +483,19 @@ class FloorplanDialog(QDialog):
         self.placement_panel.schedule_refresh()
 
     def closeEvent(self, event):
+        self._source_timer.stop()
         self.placement_panel.close_panel()
         super().closeEvent(event)
 
     def reject(self):
+        self._source_timer.stop()
         self.placement_panel.close_panel()
         super().reject()
 
     def showEvent(self, event):
         self.placement_panel.resume()
+        if self._source_mode == "live":
+            self._source_timer.start()
         super().showEvent(event)
 
     def _build_devices_tab(self):
@@ -478,10 +596,10 @@ class FloorplanDialog(QDialog):
         form.addRow("Source W/L units and W meaning:", interpretation)
         layout.addLayout(form)
         refresh = QHBoxLayout()
-        self.refresh_bindings_button = self._button("Refresh bindings from this source", self._refresh_bindings)
+        # Retain the alias for callers; the header owns the single reload action.
+        self.refresh_bindings_button = self.source_reload_button
         self.refresh_bindings_button.setEnabled(False)
-        refresh.addWidget(self.refresh_bindings_button)
-        note = QLabel("Opening or relinking keeps captured values. Binding and refreshing update matching source bindings explicitly.")
+        note = QLabel("Bindings follow the selected sizing source. Manual values stay unchanged.")
         note.setWordWrap(True)
         refresh.addWidget(note, 1)
         layout.addLayout(refresh)
@@ -558,6 +676,7 @@ class FloorplanDialog(QDialog):
                 self.binding_attribute.addItem(f"{name} = {value}", name)
 
     def _bind_parameter(self):
+        self._ensure_current_source()
         candidate = self._collect_project()
         if self.roar_design is None:
             raise ValueError("Load a saved ROAR design or explicitly read the current ROAR sizes first.")
@@ -575,25 +694,51 @@ class FloorplanDialog(QDialog):
         self.status.setText(f"Captured {symbol} from the selected ROAR attribute.")
 
     def _refresh_bindings(self):
-        candidate = self._collect_project()
-        origin = self._source_origin
-        if origin is None:
-            raise ValueError("Load the linked ROAR design or read the current ROAR sizes before refreshing.")
-        self._set_source(None)
-        if origin == "linked":
-            if not candidate.roar_project_path:
-                raise ValueError("Browse to a saved ROAR design before refreshing linked bindings.")
-            design = load_roar_design(candidate.roar_project_path)
-        else:
-            if self.snapshot_provider is None:
-                raise ValueError("The current ROAR design is unavailable; read a saved ROAR design instead.")
-            design = self.snapshot_provider()
-        candidate.refresh_bindings(design, source=origin)
-        self.project = candidate
-        self._set_source(design, origin)
-        self._render()
-        self._dirty = True
-        self.status.setText(f"Refreshed {origin} bindings; captured values changed only in this floorplan.")
+        self._ensure_current_source()
+
+    def _schedule_source_update(self, *args):
+        if self._source_mode != "live" or self.project is None or not self.isVisible():
+            return
+        if len(args) >= 3 and args[2]:
+            ignored = {int(role) for role in (Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.DecorationRole, Qt.ItemDataRole.ToolTipRole, Qt.ItemDataRole.FontRole, Qt.ItemDataRole.TextAlignmentRole, Qt.ItemDataRole.SizeHintRole)}
+            if set(args[2]) <= ignored:
+                return
+        self._source_timer.start()
+
+    def _live_source_update(self):
+        try:
+            self._ensure_current_source()
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+            # Source error is inline; repeated edits must not open popup storms.
+            pass
+
+    def _ensure_current_source(self):
+        if self.project is None or self._source_mode == "saved":
+            return
+        try:
+            candidate = self._collect_project()
+            if self._source_mode == "live":
+                if self.snapshot_provider is None:
+                    raise ValueError("The current ROAR design is unavailable.")
+                if self.workspace is not None and candidate.roar_project_path and self.workspace.path != candidate.roar_project_path:
+                    raise ValueError("The active ROAR design changed. Select a sizing source to continue.")
+                design = self.snapshot_provider()
+                origin = "live"
+            else:
+                design = load_roar_design(candidate.roar_project_path)
+                origin = "linked"
+            candidate = _refresh_source_bindings(candidate, design, origin)
+            changed = candidate.to_dict() != self.project.to_dict()
+            self.project = candidate
+            self._source_error = ""
+            self._set_source(design, origin)
+            if changed:
+                self._render()
+                self._dirty = True
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
+            self._source_error = str(exc)
+            self.snapshot_label.setText("Sizing source error: " + str(exc))
+            raise
 
     def _build_constraints_tab(self):
         tab = QWidget()
@@ -846,6 +991,12 @@ class FloorplanDialog(QDialog):
             project.roar_project_path = design_path
         elif origin == "live":
             design = self.snapshot_provider()
+            project.roar_project_path = self.workspace.path if self.workspace is not None else None
+        if origin == "linked" and self.workspace is not None:
+            result = _choose_source(self, project, "linked", design_path, self.workspace, self.snapshot_provider)
+            if result is None:
+                return
+            project, design, origin = result
         self.set_project(project, design=design, source_origin=origin if design is not None else None)
         if project.unresolved_parameters:
             self.tabs.setCurrentWidget(self.parameters_table.parentWidget())
@@ -854,11 +1005,11 @@ class FloorplanDialog(QDialog):
     def _open_project(self):
         if not self._discard_edits():
             return
-        options = OpenFloorplanDialog(self)
+        options = OpenFloorplanDialog(self, workspace=self.workspace, snapshot_provider=self.snapshot_provider)
         if options.exec() == QDialog.DialogCode.Accepted:
             self.set_project(options.project, options.floorplan_path.text(), options.design,
-                             "linked" if options.design is not None else None)
-            self._dirty = self.project.roar_project_path != options._candidate.roar_project_path
+                             options.source_origin)
+            self._dirty = self.project.to_dict() != options._candidate.to_dict()
         options.deleteLater()
 
     def _save_project(self, save_as=False):
@@ -878,6 +1029,7 @@ class FloorplanDialog(QDialog):
             self.placement_panel.saved_as(self.project_path)
 
     def _export_align(self):
+        self._ensure_current_source()
         candidate = self._collect_project()
         candidate.validate()
         directory = QFileDialog.getExistingDirectory(self, "Choose parent folder for fresh ALIGN input directory")
@@ -888,58 +1040,78 @@ class FloorplanDialog(QDialog):
                 f"Exported {netlist} and {constraints}. Inputs validated; PDK generators "
                 "and physical layout have not been checked.")
 
+    def _source_selected(self, *_args):
+        self._guard(lambda: self._activate_source(self.source_mode.currentData()))
+
+    def _activate_source(self, mode, path=None):
+        candidate = self._collect_project()
+        try:
+            result = _choose_source(self, candidate, mode, path or candidate.roar_project_path or "", self.workspace, self.snapshot_provider)
+            if result is None:
+                self.source_mode.setCurrentIndex(self.source_mode.findData(self._source_mode))
+                return
+            self.project, design, origin = result
+            self._set_source(design, origin)
+            self._render()
+            self._dirty = True
+        except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
+            self._source_error = str(exc)
+            self.source_mode.setCurrentIndex(self.source_mode.findData(self._source_mode))
+            self.snapshot_label.setText("Sizing source error: " + str(exc))
+            raise
+
     def _read_roar(self):
-        self._set_source(None)
-        if self.snapshot_provider is None:
-            raise ValueError("A running ROAR design is required to read sizes.")
-        snapshot = self.snapshot_provider()
-        parameters = snapshot.get_instance_parameters()
-        if not parameters:
-            raise ValueError("The ROAR design has no instance parameters. Assign W, L and NF first.")
-        self._set_source(snapshot, "live")
-        self.status.setText("Choose a source and explicit selected-circuit targets before applying sizes.")
+        self._activate_source("live")
 
     def _set_source(self, design, origin=None):
+        selected_instance = self.binding_instance.currentText()
+        selected_attr = self.binding_attribute.currentData()
+        selected_source = self.source_instance.currentText()
         self.roar_design = design
         self._source_origin = origin if design is not None else None
+        self._source_mode = self._source_origin or "saved"
+        self._source_error = ""
+        self.source_mode.setCurrentIndex(self.source_mode.findData(self._source_mode))
+        self.source_path.setText(str(self.project.roar_project_path or "") if self.project else "")
         self.source_instance.clear()
         self.binding_instance.clear()
         self.binding_attribute.clear()
-        self.refresh_bindings_button.setEnabled(design is not None)
+        self.source_reload_button.setVisible(self._source_mode == "linked")
+        self.source_reload_button.setEnabled(self._source_mode == "linked")
+        self.snapshot_label.setText("")
         if design is None:
-            link = self.project.roar_project_path if self.project is not None else None
-            self.snapshot_label.setText("No ROAR source loaded." + (f" Linked file: {link}" if link else ""))
+            self._source_timer.stop()
             return
         parameters = design.get_instance_parameters()
         enabled = {row["Instance"] for row in design.instances if not row.get("disabled")}
-        parameters = {name: attrs for name, attrs in parameters.items() if name in enabled}
-        self.source_instance.addItems(list(parameters))
-        self.binding_instance.addItems(list(parameters))
-        label = f"Saved ROAR design snapshot: {self.project.roar_project_path}" if origin == "linked" else "Current running ROAR snapshot"
-        self.snapshot_label.setText(label + "; refresh is explicit.")
+        names = [name for name in parameters if name in enabled]
+        self.source_instance.addItems(names)
+        self.binding_instance.addItems(names)
+        if selected_instance in names:
+            self.binding_instance.setCurrentText(selected_instance)
+        if selected_source in names:
+            self.source_instance.setCurrentText(selected_source)
         self._binding_attributes()
+        if selected_attr is not None:
+            index = self.binding_attribute.findData(selected_attr)
+            if index >= 0:
+                self.binding_attribute.setCurrentIndex(index)
 
     def _load_linked_roar(self):
         self._require_project()
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load / relink saved ROAR design", str(self.project.roar_project_path or ""),
-            "ROAR design (*.roar *.json);;All files (*)")
-        if not path:
-            return
-        self._set_source(None)
-        design = load_roar_design(path)
-        candidate = self._collect_project()
-        candidate.roar_project_path = path
-        self.project = candidate
-        self._set_source(design, "linked")
-        self._render()
-        self._dirty = True
-        self.status.setText("Linked the saved ROAR design. Captured sizes remain unchanged until you bind or refresh.")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose saved ROAR design", str(self.project.roar_project_path or ""), "ROAR design (*.roar *.json);;All files (*)")
+        if path:
+            self._activate_source("linked", path)
 
     def _apply_roar(self):
+        targets_text = self.import_targets.text()
+        source_name = self.source_instance.currentText()
+        self._ensure_current_source()
+        self.import_targets.setText(targets_text)
+        self.source_instance.setCurrentText(source_name)
         candidate = self._collect_project()
         if self.roar_design is None:
-            raise ValueError("Read current ROAR sizes first.")
+            raise ValueError("Choose a ROAR design in Sizing source first.")
         targets = self._names(self.import_targets.text())
         candidate.import_roar_parameters(
             self.roar_design, self.source_instance.currentText(), targets,

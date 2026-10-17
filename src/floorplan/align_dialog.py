@@ -1,4 +1,4 @@
-"""Qt controls for isolated, managed ALIGN runs of the supported OTA profile."""
+"""Qt controls for isolated, managed ALIGN placement runs."""
 
 import os
 from pathlib import Path
@@ -52,26 +52,36 @@ def _label(text=""):
 class AlignSettingsDialog(QDialog):
     """Machine paths remain local; only the profile ID belongs to a floorplan."""
 
-    def __init__(self, config, profile, parent=None):
+    def __init__(self, config, profile, parent=None, *, technologies=()):
         super().__init__(parent)
         self.setWindowTitle("ALIGN placement settings")
         self.setMinimumWidth(660)
         self.config = None
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self.profile = QComboBox()
-        self.profile.addItem("No placement profile", None)
-        self.profile.addItem(f"SKY130 OTA — {PROFILE_ID}", PROFILE_ID)
+        self.technology = QComboBox()
+        # Keep the persisted backend ID independent from its library label.
+        self.profile = self.technology
+        self.technology.addItem("None", None)
+        for name in sorted(set(technologies) | {PROFILE["technology"]}, key=str.casefold):
+            supported = name == PROFILE["technology"]
+            label = name if supported else f"{name} — no ALIGN backend"
+            self.technology.addItem(label, PROFILE_ID if supported else f"unavailable:{name}")
+            item = self.technology.model().item(self.technology.count() - 1)
+            if not supported:
+                item.setEnabled(False)
+                item.setToolTip(f"{name} is a ROAR sizing library. No ALIGN backend is configured for it.")
         if profile and profile != PROFILE_ID:
-            self.profile.addItem(f"Unavailable profile: {profile}", profile)
-        self.profile.setCurrentIndex(max(0, self.profile.findData(profile)))
-        form.addRow("Floorplan profile:", self.profile)
+            self.technology.addItem(f"Unavailable backend: {profile}", profile)
+            self.technology.model().item(self.technology.count() - 1).setEnabled(False)
+        self.technology.setCurrentIndex(max(0, self.technology.findData(profile)))
+        form.addRow("Layout technology:", self.technology)
         self.python = QLineEdit(str(config.python))
         self.backend = QLineEdit(str(config.backend_path))
         self.run_root = QLineEdit(str(config.run_root))
         for title, field, directory in (
                 ("Isolated ALIGN Python:", self.python, False),
-                ("Tested backend folder:", self.backend, True),
+                ("ALIGN backend folder:", self.backend, True),
                 ("Placement runs folder:", self.run_root, True)):
             row = QHBoxLayout()
             row.addWidget(field)
@@ -81,12 +91,12 @@ class AlignSettingsDialog(QDialog):
             form.addRow(title, row)
         layout.addLayout(form)
         layout.addWidget(_label(
-            "Only the SKY130 OTA profile is supported. Python, backend and run folders "
-            "are saved on this machine; the floorplan stores only its profile ID. "
-            "ALIGN runs separately from ROAR."))
+            "Technologies come from the ROAR sizing library. Placement also requires an "
+            "ALIGN backend; unavailable technologies are shown above. Python, backend and "
+            "run folders are saved on this machine. ALIGN runs separately from ROAR."))
         defaults = PROFILE["run_defaults"]
         layout.addWidget(_label(
-            f"Profile defaults: seed {defaults['seed']}, {defaults['placer_sa_iterations']} placement iterations, "
+            f"Placement defaults: seed {defaults['seed']}, {defaults['placer_sa_iterations']} placement iterations, "
             f"{defaults['nvariants']} alternatives."))
         self.error = _label()
         layout.addWidget(self.error)
@@ -105,6 +115,8 @@ class AlignSettingsDialog(QDialog):
 
     def accept(self):
         try:
+            if not self.technology.model().item(self.technology.currentIndex()).isEnabled():
+                raise ValueError("No ALIGN backend is configured for the selected technology.")
             config = AlignConfig(python=self.python.text().strip(),
                                  backend_path=self.backend.text().strip(),
                                  run_root=self.run_root.text().strip())
@@ -170,11 +182,14 @@ class PlacementPanel(QWidget):
 
     def __init__(self, project_provider, path_provider, profile_setter, parent=None,
                  *, settings=None, runner_factory=AlignRunner,
-                 browser_opener=None, config=None, validator=validate_ota_project):
+                 browser_opener=None, config=None, validator=validate_ota_project,
+                 technology_provider=None, before_generate=None):
         super().__init__(parent)
         self._project_provider = project_provider
         self._path_provider = path_provider
         self._profile_setter = profile_setter
+        self._technology_provider = technology_provider
+        self._before_generate = before_generate
         self._runner_factory = runner_factory
         self._validator = validator
         self._browser_opener = browser_opener or open_align_browser
@@ -206,7 +221,7 @@ class PlacementPanel(QWidget):
         self.profile_label = _label()
         layout.addWidget(self.profile_label)
         layout.addWidget(_label(
-            "Generate placement with the tested OTA profile, then inspect it in ALIGN's "
+            "Generate placement for the selected technology, then inspect it in ALIGN's "
             "browser viewer. ROAR stays available while ALIGN runs. Saved runs use the "
             "floorplan input captured when generation started."))
         buttons = QHBoxLayout()
@@ -220,7 +235,7 @@ class PlacementPanel(QWidget):
         self.settings_button.clicked.connect(lambda: self._guard(self.edit_settings))
         buttons.addWidget(self.settings_button)
         layout.addLayout(buttons)
-        self.status = _label("Open an OTA floorplan to generate placement.")
+        self.status = _label("Open a floorplan to generate placement.")
         layout.addWidget(self.status)
         self.last_label = _label()
         layout.addWidget(self.last_label)
@@ -239,7 +254,7 @@ class PlacementPanel(QWidget):
         try:
             action()
         except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
-            message = str(exc) + " Check ALIGN settings and the selected floorplan profile."
+            message = str(exc) + " Check ALIGN settings and the selected layout technology."
             self.status.setText(message)
             if self._view is not None and self._view.isVisible():
                 self._view.status.setText(message)
@@ -272,9 +287,9 @@ class PlacementPanel(QWidget):
             self.last_label.setText("Current edits cannot be validated. Existing placement uses the captured run input.")
             return
         self._input_error = ""
-        self.profile_label.setText("Placement profile: " + (
-            PROFILE["label"] if project.align_profile == PROFILE_ID else
-            project.align_profile or "None — select the OTA profile in ALIGN settings"))
+        self.profile_label.setText("Layout technology: " + (
+            PROFILE["technology"] if project.align_profile == PROFILE_ID else
+            ("Unavailable backend" if project.align_profile else "None — select a technology in ALIGN settings")))
         self.profile_label.setToolTip(project.align_profile or "")
         error = ""
         try:
@@ -301,7 +316,7 @@ class PlacementPanel(QWidget):
         if error and not self._active():
             self.status.setText(error)
         elif self._state is None:
-            self.status.setText("Ready to generate placement with the selected OTA profile.")
+            self.status.setText("Ready to generate placement with the selected layout technology.")
 
     def _show_view(self):
         if self._view is None:
@@ -315,6 +330,8 @@ class PlacementPanel(QWidget):
             self._managed = True
             self._show_view()
             return
+        if self._before_generate is not None:
+            self._before_generate()
         project = self._project_provider()
         self._validator(project)
         project.validate()
@@ -400,7 +417,9 @@ class PlacementPanel(QWidget):
             self._show_view()
             return
         project = self._project_provider()
-        options = AlignSettingsDialog(self.config, project.align_profile, self._owner)
+        technologies = self._technology_provider() if self._technology_provider is not None else ()
+        options = AlignSettingsDialog(self.config, project.align_profile, self._owner,
+                                      technologies=technologies)
         if options.exec() == QDialog.DialogCode.Accepted:
             self._profile_setter(options.profile.currentData())
             self.config = options.config
