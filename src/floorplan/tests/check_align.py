@@ -52,7 +52,7 @@ def native(project, parent):
             'bundle': str(netlist.parent), 'native_constraints': len(mapped['constraints']),
             'native_kinds': [item['const_name'] for item in mapped['constraints']]}
 
-for relative in ['ota/current_mirror_ota', 'common_source/common_source']:
+for relative in ['ota/current_mirror_ota']:
     source = args.repo / 'design/floorplan' / (relative + '.sp')
     project = FloorplanProject.from_netlist(source)
     project.set_constraints(json.loads(source.with_suffix('.const.json').read_text()))
@@ -66,12 +66,6 @@ assert Path(project.roar_project_path) == companion.with_name('cm_ota_sizes.roar
 assert not project.unresolved_parameters
 result = native(project, output / 'companion')
 result['source_sha256'] = hashlib.sha256(companion.read_bytes()).hexdigest()
-results['cases'].append(result)
-
-common_source = args.repo / 'design/floorplan/common_source/common_source.roar.floorplan'
-project = FloorplanProject.load(common_source)
-result = native(project, output / 'companion')
-result['source_sha256'] = hashlib.sha256(common_source.read_bytes()).hexdigest()
 results['cases'].append(result)
 
 base = '.subckt XSCHEM d g s b\nXM1 d g s b sky130_fd_pr__nfet_01v8 W=2.2 L=0.5 NF=2\nXM2 d g s b sky130_fd_pr__nfet_01v8 W=2.2 L=0.5 NF=2\n.ends XSCHEM\n'

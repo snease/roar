@@ -79,29 +79,21 @@ constraints before assigning all values. Export waits for complete, valid sizes.
 The source template makes `XM10` refer to `nf1_2`, while `XM9` refers to `nf9_10`.
 The affected-device column exposes that relationship and preserves it exactly.
 
-## Try the OTA or common-source example
-
-For a common-source floorplan with sizes and constraints already filled in,
-use **Open floorplan…** to open
-[`common_source.roar.floorplan`](../design/floorplan/common_source/common_source.roar.floorplan).
-No separate constraint file needs to be loaded.
-
-To practice creating a floorplan from a circuit netlist:
+## Create an OTA floorplan from a numeric netlist
 
 1. Click the layout button, then **New floorplan…**. Choose
-   [`current_mirror_ota.sp`](../design/floorplan/ota/current_mirror_ota.sp) or
-   [`common_source.sp`](../design/floorplan/common_source/common_source.sp).
+   [`current_mirror_ota.sp`](../design/floorplan/ota/current_mirror_ota.sp).
    The import dialog selects the only subcircuit automatically. Choose a circuit
    from the dropdown for files containing several. Units and width convention
    appear together in the same dialog; keep micrometres and width per finger for
-   these examples. Their explicit SPICE suffixes take precedence over the unit
+   this example. Its explicit SPICE suffixes take precedence over the unit
    selector.
 2. Edit **W per finger (µm)**, **L (µm)** and **NF** on the Devices tab. Sizes
    are synthetic geometry examples, not optimized or simulation-qualified designs.
    NF must be an even integer of at least two for the SKY130 generator.
 3. On the **Constraints** tab, add a constraint and select its devices and
    settings. Each constraint has its own readable row; select a row to edit
-   or remove it. For these examples, you can also expand **Advanced** and use
+   or remove it. For this example, you can also expand **Advanced** and use
    **Load ALIGN constraints…** to read the sibling `.const.json` file.
 4. Use **Save** to retain your work.
    The project includes the original netlist text, edited sizes and constraints;
@@ -112,11 +104,8 @@ To practice creating a floorplan from a circuit netlist:
    another parent folder for a new revision.
 
 The OTA contains ten MOS devices. Its example constraints pair devices around a
-shared vertical axis and align each pair's horizontal centers. The common-source
-example contains one MOS device and a resistor, with the resistor above the MOS.
-Its generic resistor is useful for input/export testing; physical layout requires
-a compatible resistor primitive in the selected ALIGN PDK. The tested SKY130
-backend does not currently provide that complete path.
+shared vertical axis and align each pair's horizontal centers. Common-source
+and other circuit examples are deferred to a later contribution.
 
 The import unit selector applies only to numbers without a suffix: with
 micrometres selected, `L=0.5` means 0.5 µm. Select metres for a netlist that writes
@@ -278,7 +267,7 @@ SKY130 ALIGN PDK directory containing `models.sp`:
     --repo /path/to/roar --pdk /path/to/ALIGN-pdk-sky130/SKY130_PDK
 ```
 
-This checks both numeric examples, the saved OTA and common-source floorplans,
+This checks the numeric OTA example, the saved OTA floorplan,
 and ordinary/symmetric xschem rows through
 ALIGN's parser, constraint verification and native placement translation. It
 prints a receipt and writes bundles and logs to a temporary directory. It does

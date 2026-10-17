@@ -1,7 +1,0 @@
-[
-  {"constraint": "PowerPorts", "ports": ["VDD"]},
-  {"constraint": "GroundPorts", "ports": ["VSS"]},
-  {"constraint": "Order", "instances": ["RLOAD", "M1"], "direction": "top_to_bottom"},
-  {"constraint": "Align", "instances": ["RLOAD", "M1"], "line": "v_center"},
-  {"constraint": "CompactPlacement", "style": "center"}
-]
