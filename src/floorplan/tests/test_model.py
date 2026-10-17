@@ -311,11 +311,11 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'resolve arithmetic expressions'):
             FloorplanProject.from_text(CIRCUIT.replace('W=2.2u', "W='width / 2'"))
 
-    def test_v1_backward_read_and_v2_companion_link_rebasing(self):
+    def test_v1_backward_read_and_companion_link_rebasing(self):
         project = self.project()
         v1 = project.to_dict()
         v1['version'] = 1
-        for key in ('parameters', 'overrides', 'roar_project_path'):
+        for key in ('parameters', 'overrides', 'roar_project_path', 'align_profile'):
             v1.pop(key)
         self.assertEqual(FloorplanProject.from_dict(v1).devices[0].width_um, project.devices[0].width_um)
         with tempfile.TemporaryDirectory() as directory:
@@ -337,6 +337,26 @@ class ProjectTests(unittest.TestCase):
             self.assertEqual(roar.read_text(), 'unchanged ROAR bytes')
             roar.unlink()
             self.assertEqual(FloorplanProject.load(second).roar_project_path, str(roar.resolve()))
+
+    def test_v3_profile_is_portable_and_v2_still_opens_without_one(self):
+        project = self.project()
+        legacy = project.to_dict()
+        legacy['version'] = 2
+        legacy.pop('align_profile')
+        restored = FloorplanProject.from_dict(legacy)
+        self.assertIsNone(restored.align_profile)
+        self.assertEqual(restored.devices, project.devices)
+        project.align_profile = 'sky130-ota-vibeic-v1'
+        with tempfile.TemporaryDirectory() as directory:
+            path = project.save(Path(directory) / 'ota.roar.floorplan')
+            state = json.loads(path.read_text())
+            self.assertEqual(state['version'], 3)
+            self.assertEqual(FloorplanProject.load(path).align_profile, project.align_profile)
+            self.assertEqual(FloorplanProject.load(path).devices, project.devices)
+            for invalid in ('', '  ', 12, {}):
+                state['align_profile'] = invalid
+                with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, 'ALIGN profile'):
+                    FloorplanProject.from_dict(state)
 
     def test_invalid_dimensions_and_fingers_rejected_atomically(self):
         project = self.project()

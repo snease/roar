@@ -283,7 +283,7 @@ class ParameterImportDialog(QDialog):
 class FloorplanDialog(QDialog):
     """A persistent editor; ``snapshot_provider`` returns a detached Design."""
 
-    def __init__(self, parent=None, snapshot_provider=None):
+    def __init__(self, parent=None, snapshot_provider=None, *, placement_options=None):
         super().__init__(parent)
         self.setWindowTitle("ROAR Floorplan")
         self.resize(980, 760)
@@ -296,8 +296,8 @@ class FloorplanDialog(QDialog):
         self._rendering = False
         layout = QVBoxLayout(self)
         note = QLabel(
-            "Author device sizes and placement intent, then export ALIGN inputs. "
-            "This editor does not place devices or generate a physical layout.")
+            "Edit device sizes and placement rules. Export ALIGN inputs or use the "
+            "Placement tab to generate an OTA placement.")
         note.setWordWrap(True)
         layout.addWidget(note)
         bar = QHBoxLayout()
@@ -327,6 +327,11 @@ class FloorplanDialog(QDialog):
         self._build_devices_tab()
         self._build_parameters_tab()
         self._build_constraints_tab()
+        from .align_dialog import PlacementPanel
+        self.placement_panel = PlacementPanel(
+            self._collect_project, lambda: self.project_path, self._set_align_profile,
+            self, **(placement_options or {}))
+        self.tabs.addTab(self.placement_panel, "Placement")
         self.status = QLabel("")
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
@@ -353,6 +358,27 @@ class FloorplanDialog(QDialog):
     def _mark_dirty(self, *_args):
         if not self._rendering:
             self._dirty = True
+            if hasattr(self, "placement_panel"):
+                self.placement_panel.schedule_refresh()
+
+    def _set_align_profile(self, profile):
+        candidate = self._collect_project()
+        candidate.align_profile = profile
+        self.project = candidate
+        self._dirty = True
+        self.placement_panel.schedule_refresh()
+
+    def closeEvent(self, event):
+        self.placement_panel.close_panel()
+        super().closeEvent(event)
+
+    def reject(self):
+        self.placement_panel.close_panel()
+        super().reject()
+
+    def showEvent(self, event):
+        self.placement_panel.resume()
+        super().showEvent(event)
 
     def _build_devices_tab(self):
         tab = QWidget()
@@ -628,6 +654,8 @@ class FloorplanDialog(QDialog):
                 item.setToolTip(value)
                 self.constraints_table.setItem(row, column, item)
         self._constraint_selection()
+        if hasattr(self, "placement_panel"):
+            self.placement_panel.schedule_refresh()
 
     def _selected_device_names(self):
         rows = sorted({index.row() for index in self.devices_table.selectedIndexes()})
@@ -765,8 +793,10 @@ class FloorplanDialog(QDialog):
         finally:
             self._rendering = False
         self._parameter_selected()
+        self.placement_panel.schedule_refresh()
 
     def set_project(self, project, path=None, design=None, source_origin=None):
+        self.placement_panel.project_changed()
         self.project = project
         self.project_path = Path(path) if path else None
         self._set_source(design, source_origin)
@@ -845,6 +875,7 @@ class FloorplanDialog(QDialog):
             self._dirty = False
             self.project_label.setText(f"Circuit: {candidate.top}  •  {len(candidate.devices)} devices  •  {path}")
             self.status.setText(f"Saved {path}")
+            self.placement_panel.saved_as(self.project_path)
 
     def _export_align(self):
         candidate = self._collect_project()

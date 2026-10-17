@@ -219,6 +219,7 @@ class FloorplanProject:
         project._sizing, project._parameters, project._overrides = {}, {}, {}
         project.omitted_parameters = {}
         project._roar_project_path = None
+        project.align_profile = None
         for instance in circuit.instances:
             if isinstance(instance, MOSFETInstance):
                 params = {key.upper(): value.strip() for key, value in instance.parameters.items()}
@@ -599,23 +600,29 @@ class FloorplanProject:
                     raise ValueError(f'{kind} ports must be unique')
 
     def to_dict(self):
-        return {'version': 2, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
+        return {'version': 3, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
                 'top': self.top, 'dimension_unit': self.dimension_unit, 'width_convention': self.width_convention,
                 'devices': [{'name': d.name, 'width_um': d.width_um, 'length_um': d.length_um, 'nf': d.nf}
                             for d in self.devices if d.kind == 'mos'], 'constraints': deepcopy(self.constraints),
                 'parameters': deepcopy(self._parameters), 'overrides': deepcopy(self._overrides),
-                'roar_project_path': self.roar_project_path}
+                'roar_project_path': self.roar_project_path, 'align_profile': self.align_profile}
 
     @classmethod
     def from_dict(cls, state):
         expected = {'version', 'source_netlist', 'source_path', 'top', 'dimension_unit', 'width_convention', 'devices', 'constraints'}
-        if isinstance(state, dict) and state.get('version') == 2:
+        if isinstance(state, dict) and state.get('version') in (2, 3):
             expected |= {'parameters', 'overrides', 'roar_project_path'}
-        if not isinstance(state, dict) or state.get('version') not in (1, 2) or set(state) != expected:
+        if isinstance(state, dict) and state.get('version') == 3:
+            expected.add('align_profile')
+        if not isinstance(state, dict) or state.get('version') not in (1, 2, 3) or set(state) != expected:
             raise ValueError('Unsupported or malformed floorplan project version/fields')
         project = cls.from_text(state['source_netlist'], state['top'], state['dimension_unit'], state['width_convention'])
         project.source_path = state['source_path']
-        if state['version'] == 2:
+        profile = state.get('align_profile')
+        if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+            raise ValueError('ALIGN profile must be a nonempty profile name or null')
+        project.align_profile = profile
+        if state['version'] in (2, 3):
             link = state['roar_project_path']
             if link is not None and (not isinstance(link, str) or not Path(link).is_absolute()):
                 raise ValueError('In-memory ROAR project links must be absolute; use load() for relative sidecar links')
@@ -657,7 +664,7 @@ class FloorplanProject:
             raise ValueError('Saved sizes do not match the source circuit instances')
         for row in sizes:
             device = project._device(row['name'])
-            if state['version'] == 2:
+            if state['version'] in (2, 3):
                 actual = {'name': device.name, 'width_um': device.width_um, 'length_um': device.length_um, 'nf': device.nf}
                 if row != actual:
                     raise ValueError(f'{device.name}: saved sizes conflict with source parameters or overrides')
@@ -695,7 +702,7 @@ class FloorplanProject:
     def load(cls, path):
         path = Path(path).expanduser().resolve()
         state = json.loads(path.read_text(encoding='utf-8'))
-        if isinstance(state, dict) and state.get('version') == 2 and state.get('roar_project_path'):
+        if isinstance(state, dict) and state.get('version') in (2, 3) and state.get('roar_project_path'):
             state['roar_project_path'] = str((path.parent / state['roar_project_path']).resolve())
         return cls.from_dict(state)
 

@@ -20,3 +20,6 @@ roar = "roar_api.__main__:main"
 packages = ["roar_api", "roar_api._legacy", "roar_api.floorplan"]
 py-modules = ["parse_netlist"]
 package-dir = {"" = "src", "roar_api" = "roar_api", "roar_api._legacy" = "src/gui", "roar_api.floorplan" = "src/floorplan"}
+
+[tool.setuptools.package-data]
+"roar_api.floorplan" = ["align_profile.json"]

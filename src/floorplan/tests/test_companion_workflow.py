@@ -149,7 +149,7 @@ class CompanionWorkflowTests(unittest.TestCase):
         numeric = FloorplanProject.from_text(
             ".subckt OLD d g s b\nM1 d g s b sky130_fd_pr__nfet_01v8 W=1.1u L=.5u NF=2\n.ends OLD\n")
         legacy = numeric.to_dict()
-        for key in ("parameters", "overrides", "roar_project_path"):
+        for key in ("parameters", "overrides", "roar_project_path", "align_profile"):
             del legacy[key]
         legacy["version"] = 1
         self.assertEqual(FloorplanProject.from_dict(legacy).devices, numeric.devices)

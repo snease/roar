@@ -2,14 +2,15 @@
 
 The layout button in ROAR's header opens a floorplan editor for device sizes and
 high-level placement intent. It exports sized SPICE and native ALIGN constraint
-JSON. ALIGN supplies the placement engine; this first integration covers input
-authoring and export. Running ALIGN and displaying its placement results are
-planned as separate follow-up contributions.
+JSON. The optional **Placement** tab runs the OTA through ALIGN and opens ALIGN's
+own placement explorer in a browser. ALIGN supplies both the placement engine
+and the explorer; ROAR manages the inputs, settings and run lifecycle.
 
 The editor uses ROAR's existing Qt interface and netlist parser. Install ROAR
 with `pip install -e '.[gui]'`, then launch it normally. ALIGN, Xschem, Magic and
-a PDK are not required to author or export a project. The Python API works with
-the headless installation, `pip install -e .`.
+a PDK are not required to author or export a project. Generating placement needs
+a separate ALIGN installation and the tested SKY130 ALIGN backend on Linux or
+WSL. The Python API works with the headless installation, `pip install -e .`.
 
 ## A companion to the ROAR design
 
@@ -44,7 +45,9 @@ Browse, or the floorplan can open using its saved sizes alone.
 Links are saved relative to the companion file. Moving the two files together
 preserves their association, and **Save as…** rebases the link to the same design.
 The original netlist text is embedded, so it remains available even if its
-original file moves. Version 1 floorplan files still open; new saves use version 2.
+original file moves. Version 1 and 2 floorplan files still open; new saves use
+version 3, which adds an optional ALIGN profile name. Machine paths and run
+history are stored separately from the floorplan and the `.roar` design.
 
 Opening a floorplan restores its saved size snapshot. Loading or relinking a
 ROAR design supplies a source for subsequent assignments; it does not silently
@@ -66,8 +69,10 @@ unavailable source from the editor.
    instance attribute. Manual assignment replaces that parameter's binding.
    Clearing its value makes it unresolved again. Shared symbols update all
    their device references together.
-4. Use **Save** or **Save as…**, then **Export ALIGN inputs…**. Export creates a
-   fresh circuit directory with sized SPICE and native constraint JSON.
+4. Use **Save** or **Save as…**, then the **Placement** tab to generate and
+   inspect an OTA placement. To run ALIGN manually elsewhere, **Export ALIGN
+   inputs…** creates a fresh circuit directory with sized SPICE and native
+   constraint JSON.
 
 This example embeds the actual [`design/cm_ota.spice`](../design/cm_ota.spice)
 template. To start from scratch instead, choose **New floorplan…**, select
@@ -78,6 +83,46 @@ constraints before assigning all values. Export waits for complete, valid sizes.
 
 The source template makes `XM10` refer to `nf1_2`, while `XM9` refers to `nf9_10`.
 The affected-device column exposes that relationship and preserves it exactly.
+
+## Generate and inspect the OTA placement
+
+1. Open the linked OTA example above and select **Placement**. Its saved
+   `sky130-ota-vibeic-v1` profile supplies the repository's tested run defaults.
+2. Open **ALIGN settings…** and choose the Python executable from the separate
+   ALIGN environment, the tested backend's `SKY130_PDK` directory, and a run
+   directory. These paths are local preferences; they are not written into
+   the floorplan or the linked ROAR design. Settings can be populated from
+   `ROAR_ALIGN_PYTHON` and `ROAR_ALIGN_PDK_FIXED` when ROAR starts.
+3. Choose **Generate placement and open ALIGN**. ROAR captures the current
+   sizes and constraints, exports them into a new run directory, and runs ALIGN
+   in a separate process. Progress and logs remain available while ROAR stays
+   responsive. The browser opens after the local explorer responds.
+4. Explore the generated candidates, hierarchy, pins and nets in ALIGN's
+   existing interface. The run stops before routing; this is placement
+   exploration, not a DRC/LVS-qualified layout flow.
+5. After changing sizes or constraints in ROAR, generate a new placement to
+   apply them. **Open last placement** reopens captured results without
+   recompiling the current floorplan. A stale indicator identifies results
+   that differ from the current document.
+
+The repository profile is
+[`align_profile.json`](../src/floorplan/align_profile.json): ALIGN 0.9.8, Dash 2,
+the tested `vibeic/ALIGN-pdk-sky130` backend revision, four requested candidates,
+100 placement iterations and seed zero. These are demonstration defaults;
+ALIGN may return fewer distinct candidates. The profile checks the backend
+files that determine MOS geometry. The generic `ROAR_ALIGN_PDK` variable is not
+used because it can refer to a backend with different geometry behavior.
+
+The explorer is served on the local machine with its debugger disabled.
+Closing a browser tab does not stop ALIGN; use the run controls or close the
+floorplan editor. Captured inputs and generated artifacts remain available
+after stopping, including across ROAR restarts. Runs are associated with the
+saved floorplan path. Saving an unsaved floorplan before running gives it a
+stable identity for reopening results. **Save as…** moves the current run's
+association to the new floorplan path without restarting ALIGN.
+
+Only the ten-MOS SKY130 OTA profile is enabled in this contribution.
+Common-source and other examples belong in a later stack layer.
 
 ## Create an OTA floorplan from a numeric netlist
 
@@ -104,8 +149,7 @@ The affected-device column exposes that relationship and preserves it exactly.
    another parent folder for a new revision.
 
 The OTA contains ten MOS devices. Its example constraints pair devices around a
-shared vertical axis and align each pair's horizontal centers. Common-source
-and other circuit examples are deferred to a later contribution.
+shared vertical axis and align each pair's horizontal centers.
 
 The import unit selector applies only to numbers without a suffix: with
 micrometres selected, `L=0.5` means 0.5 µm. Select metres for a netlist that writes
@@ -256,8 +300,10 @@ QT_QPA_PLATFORM=offscreen python -m unittest discover -s src/floorplan/tests -v
 ```
 
 The tests cover topology, unit conversion, explicit ROAR mappings, persistence,
-export collisions, invalid input and Qt editing flows. GUI tests skip when PyQt6
-is absent. The core package does not import Qt or ALIGN.
+export collisions, invalid input and Qt editing flows. Placement tests cover
+process ownership, cancellation, saved-result reopening, stale inputs, settings
+and browser handoff using isolated subprocesses and mocked browser opening.
+GUI tests skip when PyQt6 is absent. The core package does not import Qt or ALIGN.
 
 For an independent compatibility check, use a separately installed ALIGN and a
 SKY130 ALIGN PDK directory containing `models.sp`:

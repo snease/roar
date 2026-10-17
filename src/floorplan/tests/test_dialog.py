@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 try:
-    from PyQt6.QtCore import QTimer, Qt
+    from PyQt6.QtCore import QSettings, QTimer, Qt
+    from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QPushButton, QWidget
 except ImportError:
     QApplication = None
@@ -19,6 +20,7 @@ from roar_api.floorplan import FloorplanProject
 if QApplication is not None:
     from roar_api.floorplan.dialog import FloorplanDialog, NetlistImportDialog, OpenFloorplanDialog, load_roar_design
     from roar_api.floorplan.constraint_editor import ConstraintEditorDialog, editable_constraint, constraint_summary
+    from roar_api.floorplan.align_runner import AlignConfig
 
 
 NETLIST = """.subckt pair d g s b
@@ -48,7 +50,10 @@ class FloorplanDialogTests(unittest.TestCase):
         self.parent = QWidget()
         self.design = Design().add_instance("M1_2", W=8e-6, L=0.2e-6, NF=4)
         self.dialog = FloorplanDialog(
-            self.parent, lambda: Design.from_state(self.design.to_state()))
+            self.parent, lambda: Design.from_state(self.design.to_state()),
+            placement_options={
+                "settings": QSettings(str(self.root / "align.ini"), QSettings.Format.IniFormat),
+                "config": AlignConfig("", "", str(self.root / "align-runs"))})
         self.dialog.set_project(FloorplanProject.from_text(NETLIST))
 
     def tearDown(self):
@@ -365,6 +370,13 @@ class FloorplanDialogTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.dialog.devices_table.item(0, 3).text(), "6")
         self.assertIs(self.dialog.parent(), self.parent)
+
+    def test_escape_uses_the_floorplan_placement_cleanup_policy(self):
+        self.dialog.show()
+        with patch.object(self.dialog.placement_panel, "close_panel") as cleanup:
+            QTest.keyClick(self.dialog, Qt.Key.Key_Escape)
+        cleanup.assert_called_once()
+        self.assertFalse(self.dialog.isVisible())
 
     def test_open_dialog_follows_suggestions_but_preserves_explicit_override(self):
         first_design = self.root / "first.roar"
