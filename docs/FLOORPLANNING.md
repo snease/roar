@@ -37,8 +37,8 @@ file is only needed to exchange rules with ALIGN or another tool. There is one
 export action, which includes both the sized netlist and the constraints.
 
 **Open floorplan…** offers a sizing source: **Current ROAR design**, **Saved ROAR
-file**, or **Saved floorplan sizes**. An existing association is preferred;
-without one, the current design is used when available. Missing links can be
+file**, or **Captured sizes (no updates)**. The selected mode is saved with the project;
+older projects reopen their captured sizes without silently refreshing a link. Missing links can be
 repaired with Browse, or the floorplan can open using its saved sizes alone.
 
 If the associated design differs from the active design, a conflict dialog
@@ -52,11 +52,17 @@ layout stay in place.
 Links are saved relative to the companion file. Moving the two files together
 preserves their association, and **Save as…** rebases the link to the same design.
 The original netlist text is embedded, so it remains available even if its
-original file moves. Version 1 and 2 floorplan files still open; new saves use
-version 3, which adds an optional ALIGN profile name. Machine paths and run
+original file moves. Versions 1–3 still open; new saves use version 4, which
+records sizing-source intent, enabled constraints, and placement run options. Machine paths and run
 history are stored separately from the floorplan and the `.roar` design.
 
-**Saved floorplan sizes** restores the captured sizes without a live source.
+An asterisk in the title marks unsaved floorplan edits. Closing the editor,
+switching documents, or exiting ROAR offers Save, Discard, and Cancel. Saving
+the application state also saves a modified floorplan companion; it does not
+embed the floorplan into the `.roar` file. Undo and Redo cover manual device,
+parameter and constraint edits, including temporary invalid cell text.
+
+**Captured sizes (no updates)** restores the captured sizes without a live source.
 **Current ROAR design** keeps explicitly bound parameters up to date with the
 design editor. Manual values are preserved. A live source is refreshed again
 before generating placement or exporting, so a missing or invalid binding
@@ -67,7 +73,8 @@ blocks those actions rather than exporting its old value.
 1. Click the header's layout button, then **Open floorplan…** and choose
    [`cm_ota.roar.floorplan`](../examples/floorplan/ota/cm_ota.roar.floorplan).
    Its linked [`cm_ota_sizes.roar`](../examples/floorplan/ota/cm_ota_sizes.roar)
-   appears automatically. Open the companion.
+   is retained as its association. Open with **Captured sizes (no updates)**, or choose
+   **Saved ROAR file** to refresh from that snapshot.
 2. Inspect the **Parameters** tab. Each shared symbol lists its affected device
    fields, captured value and ROAR source. For example, `w1_2` is bound to
    `M1_2.W`. W is 2.2 µm total, NF is 2, and the Devices tab therefore shows
@@ -93,11 +100,37 @@ The affected-device column exposes that relationship and preserves it exactly.
 
 ## Generate and inspect the OTA placement
 
+### Set up ALIGN once
+
+An administrator or CAD support engineer can prepare the separate tool
+environment; subsequent editing and placement runs use the GUI. Keep ALIGN's
+dependencies separate from ROAR's Qt environment.
+
+- Build ALIGN 0.9.8 following its
+  [installation instructions](https://align-analoglayout.github.io/ALIGN-public/notes/installation.html).
+  The source used for these compatibility checks is
+  [revision `8d3cc2e9`](https://github.com/ALIGN-analoglayout/ALIGN-public/tree/8d3cc2e9aa5511315203eb5cbfd00d2c88fdbd18).
+  Python 3.10 and a C++ build toolchain are needed; a source checkout alone is
+  insufficient because the native placement extension must be built.
+- Install Dash 2.x in that ALIGN environment (`python -m pip install 'dash>=2,<3'`).
+- Check out the [vibeic SKY130 backend](https://github.com/vibeic/ALIGN-pdk-sky130)
+  at revision `427b3b94242fdcf8009e418f6bbe14286fc71334`.
+  Select its `SKY130_PDK` subdirectory in ROAR. The official SKY130 backend is
+  different and does not satisfy this profile's geometry checks.
+- In **ALIGN settings…**, choose that environment's Python executable and the
+  backend directory. **Test installation** reports Python, ALIGN and Dash
+  versions, checks the pinned backend files and imports the native components.
+  A failure remains visible in the dialog so its message can be shared with CAD
+  support. The test does not install or modify the toolchain.
+
+### Run placement
+
 1. Open the linked OTA example above and select **Placement**. Its saved
    backend profile selects **SKY130A** and supplies the repository's run defaults.
 2. Open **ALIGN settings…**, select a **Layout technology**, and choose the Python
    executable from the separate ALIGN environment, the backend's `SKY130_PDK` directory, and a run
-   directory. These paths are local preferences; they are not written into
+   directory, then use **Test installation** to check the versions and backend.
+   These paths are local preferences; they are not written into
    the floorplan or the linked ROAR design. Settings can be populated from
    `ROAR_ALIGN_PYTHON` and `ROAR_ALIGN_PDK_FIXED` when ROAR starts.
 3. Choose **Generate placement and open ALIGN**. ROAR captures the current
@@ -115,12 +148,17 @@ The affected-device column exposes that relationship and preserves it exactly.
 The repository profile is
 [`align_profile.json`](../src/floorplan/align_profile.json): ALIGN 0.9.8, Dash 2,
 the tested `vibeic/ALIGN-pdk-sky130` backend revision, four requested candidates,
-100 placement iterations and seed zero. These are demonstration defaults;
+100 placement iterations and seed zero. **ALIGN settings…** exposes candidate
+count, placement effort, random seed, and wirelength weight. These choices are
+saved in the floorplan and captured for each run. The initial 100 iterations
+are a quick preview; ALIGN's usual default is 10,000. These are demonstration defaults;
 ALIGN may return fewer distinct candidates. The profile checks the backend
 files that determine MOS geometry. The generic `ROAR_ALIGN_PDK` variable is not
 used because it can refer to a backend with different geometry behavior.
 
-The explorer is served on the local machine with its debugger disabled.
+The explorer is served on the local machine with its debugger disabled. Each
+run uses an authenticated browser link; open it from ROAR. Foreign hosts and
+cross-origin requests are rejected, including requests to Dash callbacks.
 Closing a browser tab does not stop ALIGN; use the run controls or close the
 floorplan editor. Captured inputs and generated artifacts remain available
 after stopping, including across ROAR restarts. Runs are associated with the
@@ -144,9 +182,13 @@ The OTA remains the included demonstration and native acceptance circuit.
    appear together in the same dialog; keep micrometres and width per finger for
    this example. Its explicit SPICE suffixes take precedence over the unit
    selector.
-2. Edit **W per finger (µm)**, **L (µm)** and **NF** on the Devices tab. Sizes
+2. Edit **W per finger (µm)**, **L (µm)**, **NF**, and **M** on the Devices tab. Sizes
    are synthetic geometry examples, not optimized or simulation-qualified designs.
-   NF must be an even integer of at least two for the SKY130 generator.
+   Positive integer NF values can be imported and saved as drafts; this SKY130
+   generator requires even NF of at least two before placement. Effective width
+   includes both NF and multiplicity. The terminal/net inspector shows the
+   selected device's connectivity. Numeric resistor values are editable too,
+   although the included placement backend supports MOS devices only.
 3. On the **Constraints** tab, add a constraint and select its devices and
    settings. Each constraint has its own readable row; select a row to edit
    or remove it. For this example, you can also expand **Advanced** and use
@@ -182,20 +224,33 @@ for the underlying semantics.
 
 | Editor intent | Native ALIGN constraint | Meaning |
 | --- | --- | --- |
-| Symmetry | `SymmetricBlocks` | All pairs share one horizontal or vertical axis. An additional singleton can sit on that axis. |
+| Device symmetry | `SymmetricBlocks` | All pairs share one horizontal or vertical axis. An additional singleton can sit on that axis. |
 | Relative order | `Order` | Left-to-right or top-to-bottom order; reverse the device list for the opposite order. Optional abutment requests touching edges. This does not also align centers. |
 | Align centers / edges | `Align` | Align centers or edges along the selected horizontal or vertical line. |
 | Rows / regions | `Floorplan` | Regions run from top to bottom. Optionally order devices left to right within each row, or mirror them around one shared vertical axis. Add `Align` separately when row centers must coincide. |
 | Packing | `CompactPlacement` | Request left, right or centered packing for the entire circuit. |
 | Place closer | `PlaceCloser` | Encourage selected devices to be close together. |
 | Power ports / Ground ports | `PowerPorts` / `GroundPorts` | Identify supply ports, retaining their order and whether the assignment propagates into child circuits. |
+| Boundary and margins | `Boundary` | Maximum width/height and margins, in µm. |
+| Aspect ratio | `AspectRatio` | Bounds on circuit width/height and the native weight. |
+| Minimum device spacing | `Spread` | A gap in nm between selected devices when they overlap in the other direction. |
+| Circuit spacing | `BlockDistance`, `HorizontalDistance`, `VerticalDistance` | Circuit-wide gaps in nm; the placer rounds up to its routing grid. |
+| Same device layout template | `SameTemplate` | Matching devices use the same physical template. This does not create a common-centroid arrangement. |
+| Align and order | `AlignInOrder` | Edge/center alignment together with left-to-right or top-to-bottom ordering. |
+| Port location | `PortLocation` | A boundary region for signal ports. |
+| Net symmetry | `SymmetricNets` | Two nets and ordered corresponding pins, with an explicit symmetry axis. |
+| Clock ports | `ClockPorts` | Exclude clock nets from ordinary signal symmetry inference. |
+| Keep devices out of pattern recognition | `DoNotIdentify` | Prevent selected devices from being combined into recognized circuit patterns. |
+| Compiler transformations | `ConfigureCompiler` | Control inference, merging, dummy removal, source/drain correction, and propagation. Defaults match ALIGN. |
 
 Symmetric pairs must have matching models and parameters. Centered packing is a
 placement preference, not a guarantee of exact centering in a fixed boundary.
 
-Local validation checks names, supported fields and concrete dimensions. It does
-not solve combined constraints, generate primitives, or prove physical
-feasibility. These examples were also checked with ALIGN 0.9.8's parser,
+Local validation checks names, fields, concrete dimensions, contradictory
+ordering cycles and conflicting port roles. **Check constraints** also runs
+native combined checks when ALIGN is configured. Generation repeats native
+preflight before making primitives. These checks do not prove physical
+feasibility for generated geometry. These examples are also checked with ALIGN 0.9.8's parser,
 constraint verification and native placement-constraint translation. A successful
 export alone does not establish DRC, LVS, model-bin validity or generated geometry.
 
@@ -221,8 +276,8 @@ literal L in an otherwise parameterized device, remain editable directly.
 file. Choose the file's units and width convention. The import is atomic:
 invalid used values leave all existing sizes intact. Unused names are reported;
 matched assignments replace their previous bindings. Expressions and includes
-are outside this importer. The existing simulation parameter files with NF=1
-therefore need explicit layout-appropriate finger counts before import.
+are outside this importer. Simulation parameter files with NF=1 can be imported;
+choose layout-appropriate finger counts before running the SKY130 generator.
 
 The defaults are metres for ROAR W/L and total width. When total width is selected,
 the editor divides W by NF once. Its table always shows per-finger W and L in
@@ -281,8 +336,14 @@ dimension_unit="um", width_convention="total")` imports numeric `.param` values.
 
 This version accepts a selected flat `.subckt` with four-terminal `M` or `X`
 MOS devices and numeric two-terminal resistors. W, L, NF and optional M can be
-numbers or simple shared symbol names. NF must resolve to an even integer of at
-least two; M must resolve to a positive integer. `MULT` is accepted as M, while
+numbers or simple shared symbol names. NF and M must resolve to positive
+integers. The SKY130 placement preflight additionally requires even NF ≥ 2,
+per-finger W from 0.42 to 2.52 µm on a 0.01 µm grid, and L ≥ 0.15 µm on a
+0.005 µm grid. These are generator restrictions, not foundry signoff checks.
+Boundary margins also follow the backend routing grid: left/right margins
+must be multiples of 0.43 µm and top/bottom margins multiples of 0.42 µm.
+Preflight reports off-grid values instead of silently changing them.
+`MULT` is accepted as M, while
 specifying both is rejected as ambiguous. Select the top explicitly for files
 with multiple subcircuits. Xschem's commented wrappers and continuations work.
 
@@ -293,13 +354,25 @@ ALIGN generates its own device geometry. Other extra parameters, arithmetic
 sizing expressions, hierarchy, includes and unsupported device kinds produce
 actionable errors. This adapter is a bounded layout export, not a SPICE simulator.
 
-The constraint forms support the subset listed above. Unsupported constraints
+The constraint forms support the subset listed above. Imported constraints
 or settings already present in a saved floorplan remain visible and are
 preserved when saving. They cannot be edited through a form that does not
-understand them, and validation/export explains the unsupported setting.
+understand them; **Details** shows all fields and explains support. **Duplicate**,
+**Enable / Disable**, Undo, and Redo support trying alternatives. Disabled rows
+stay in the project and are omitted from native exports.
+
+`NetPriority`, `NetConst`, `MultiConnection`, `DoNotRoute`, `DoNotUseLib`, and
+`Route` have validated native export support without graphical forms. Routing
+settings only take effect when routing is run outside this placement-only flow.
+`PlaceOnBoundary` is recognized by ALIGN but dropped by the C++ placer used here;
+it is not offered as an effective placement control. Generator configuration,
+grouping, guard rings, capacitor arrays, placement grids, and charge-flow data
+require additional backend/workflow support and remain preserved but unavailable
+for export here. Internal `AssignBboxVariables` is not a designer-facing option.
+
 The advanced **Load ALIGN constraints…** action checks supported rules before
 changing the floorplan. Rules with unsupported types or settings are retained
-as clearly marked, read-only rows; they must be removed or replaced before
+as clearly marked, read-only rows; disable, remove or replace them before
 export. A file in the wrong format, an invalid supported rule, or cancellation
 leaves the existing constraints intact.
 
@@ -326,7 +399,9 @@ SKY130 ALIGN PDK directory containing `models.sp`:
 ```
 
 This checks the numeric OTA example, the saved OTA floorplan,
-and ordinary/symmetric xschem rows through
+ordinary/symmetric xschem rows, and the additional constraint forms through
 ALIGN's parser, constraint verification and native placement translation. It
 prints a receipt and writes bundles and logs to a temporary directory. It does
-not run physical placement or routing.
+not run physical placement unless `--placement` is supplied. That optional check
+uses small real placement cases to inspect dimensions, spacing, matching,
+port locations, net symmetry and compiler transformations. It never runs routing.

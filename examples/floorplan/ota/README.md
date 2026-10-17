@@ -8,7 +8,7 @@ synthetic layout examples, not an optimized or simulation-qualified design.
 2. Choose **Open floorplan…** and select `cm_ota.roar.floorplan` here.
 3. Inspect the **Devices**, **Parameters**, and **Constraints** tabs. The
    companion contains captured sizes and explicit bindings to `cm_ota_sizes.roar`.
-   Use **Saved floorplan sizes** to work with those captured values, or select
+   Use **Captured sizes (no updates)** to work with those captured values, or select
    **Saved ROAR file** to refresh from the adjacent sizing snapshot.
 4. Use **Save as…** to keep your edited example in your own working directory.
 5. To generate placement, open **Placement → ALIGN settings…**, choose the
