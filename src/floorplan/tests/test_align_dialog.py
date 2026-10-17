@@ -182,6 +182,54 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertIn(previous.run_dir, self.panel.open_last_button.toolTip())
         self.assertNotIn("failed-new-run", self.panel.open_last_button.toolTip())
 
+    def test_invalid_draft_can_reopen_captured_placement(self):
+        self.panel.generate()
+        runner = self.runners[-1]
+        runner.serve()
+        self.panel._poll()
+        self.panel.stop()
+        self.panel._poll()
+        def invalid():
+            raise ValueError('M1: enter a numeric width')
+        self.panel._project_provider = invalid
+        self.panel.refresh()
+        self.assertFalse(self.panel.generate_button.isEnabled())
+        self.assertTrue(self.panel.open_last_button.isEnabled())
+        self.assertIn('captured input', self.panel.last_label.text())
+        self.panel.open_last()
+        self.assertEqual(runner.opens, 1)
+        self.assertEqual(runner.starts, 1)
+
+    def test_run_options_are_edited_transactionally_and_saved_through_callback(self):
+        changed = []
+        self.panel._run_options_setter = lambda value: changed.append(value)
+        def choose():
+            dialog = QApplication.activeModalWidget()
+            dialog.option_fields['nvariants'].setValue(8)
+            dialog.option_fields['placer_sa_iterations'].setValue(10000)
+            dialog.option_fields['seed'].setValue(19)
+            dialog.option_fields['lambda_coeff'].setValue(2.5)
+            dialog.accept()
+        QTimer.singleShot(0, choose)
+        self.panel.edit_settings()
+        self.assertEqual(changed, [{'nvariants': 8, 'placer_sa_iterations': 10000, 'seed': 19, 'lambda_coeff': 2.5}])
+
+    def test_installation_test_starts_asynchronously_and_displays_versions(self):
+        dialog = AlignSettingsDialog(self.config, PROFILE_ID)
+        callbacks = []
+        def start(parent, config, completed):
+            callbacks.append(completed)
+            return None
+        with patch('roar_api.floorplan.align_dialog._probe', side_effect=start):
+            dialog.test_installation()
+            self.assertFalse(dialog.test_button.isEnabled())
+            self.assertIn('Checking', dialog.error.text())
+            callbacks[0]({'ok': True, 'python': '3.10', 'align': '0.9.8', 'dash': '2.18', 'message': 'Installation is ready.'})
+        self.assertTrue(dialog.test_button.isEnabled())
+        self.assertIn('ALIGN 0.9.8', dialog.error.text())
+        self.assertIn('Dash 2.18', dialog.error.text())
+        dialog.deleteLater()
+
     def test_profile_and_complete_input_gate_generation_and_missing_tools_are_actionable(self):
         self.project.align_profile = None
         self.panel.refresh()
@@ -256,12 +304,12 @@ class PlacementPanelTests(unittest.TestCase):
         calls = []
         def update():
             calls.append(True)
-            self.project.set_mos_parameters("M1", 3, 0.15, 2)
+            self.project.set_mos_parameters("M1", 2.4, 0.15, 2)
         self.panel._before_generate = update
         self.panel.generate()
         runner = self.runners[-1]
         self.assertEqual(runner.state.fingerprint, project_fingerprint(self.project))
-        self.assertEqual(self.project.devices[0].width_um, 3)
+        self.assertEqual(self.project.devices[0].width_um, 2.4)
         self.panel.generate()  # Showing the active run must not change its input.
         self.assertEqual(len(calls), 1)
         self.assertEqual(runner.starts, 1)

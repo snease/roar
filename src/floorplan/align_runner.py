@@ -1,9 +1,12 @@
 """Isolated, persistent ALIGN placement runs; no Qt, browser, or ALIGN imports."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -11,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +23,63 @@ import uuid
 PROFILE = json.loads(Path(__file__).with_name('align_profile.json').read_text(encoding='utf-8'))
 PROFILE_ID = PROFILE['id']
 _ACTIVE = {'starting', 'generating', 'serving', 'stopping'}
+_LOCKS = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _ownership_lock(root):
+    """Serialize index changes across processes, including unpublished PIDs."""
+    # Editing and history inspection also work on hosts where launch is disabled.
+    if sys.platform == 'linux':
+        import fcntl
+    else:
+        fcntl = None
+    with _LOCKS_GUARD:
+        mutex, state = _LOCKS.setdefault(str(root), (threading.RLock(), threading.local()))
+    with mutex:
+        outer = not getattr(state, 'depth', 0)
+        if outer:
+            root.mkdir(parents=True, exist_ok=True)
+            state.stream = (root / '.ownership.lock').open('a')
+            if fcntl is not None:
+                fcntl.flock(state.stream, fcntl.LOCK_EX)
+        state.depth = getattr(state, 'depth', 0) + 1
+        try:
+            yield
+        finally:
+            state.depth -= 1
+            if outer:
+                if fcntl is not None:
+                    fcntl.flock(state.stream, fcntl.LOCK_UN)
+                state.stream.close()
+
+
+def _serialized(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        if (method.__name__ in {'last_run', 'last_placement', 'poll'} and self._run_dir is None
+                and (not self.config.run_root or not self._root.exists())):
+            return None
+        with _ownership_lock(self._root):
+            return method(self, *args, **kwargs)
+    return guarded
+
+
+def run_options(project):
+    options = dict(PROFILE['run_defaults'], lambda_coeff=1.0)
+    options.update(getattr(project, 'run_options', {}))
+    allowed = {'nvariants', 'placer_sa_iterations', 'seed', 'lambda_coeff'}
+    if set(options) - allowed:
+        raise ValueError('Unknown ALIGN run options: ' + ', '.join(sorted(set(options) - allowed)))
+    for key, low, high in [('nvariants', 1, 100), ('placer_sa_iterations', 1, 1000000), ('seed', 0, 2147483647)]:
+        value = options[key]
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f'{key} must be an integer from {low} to {high}')
+    value = options['lambda_coeff']
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0.01 <= value <= 1000:
+        raise ValueError('Area / wirelength weight must be a finite number from 0.01 to 1000')
+    return options
 
 
 def _write_json(path, value):
@@ -49,6 +110,31 @@ def validate_ota_project(project):
             raise ValueError(f'{device.name}: unsupported device model {device.model!r} for the selected ALIGN technology')
         if len(device.terminals) != 4:
             raise ValueError(f'{device.name}: the selected ALIGN MOS generator requires four terminals')
+        if device.nf is not None and (device.nf < 2 or device.nf % 2):
+            raise ValueError(f'{device.name}: this SKY130 generator requires an even finger count (NF) of at least 2; edit the draft sizing')
+        # Restrictions from the pinned gen_param.py and mos.py; not layout DRC.
+        for label, value, minimum, maximum, quantum in (
+                ('W per finger', device.width_um, 420, 2520, 10),
+                ('L', device.length_um, 150, None, 5)):
+            if value is None:
+                continue  # project.validate reports unresolved dimensions.
+            nm = value * 1000
+            if not math.isfinite(nm) or nm < minimum - 1e-6 or (maximum is not None and nm > maximum + 1e-6):
+                bounds = f'{minimum / 1000:g}–{maximum / 1000:g} µm' if maximum else f'at least {minimum / 1000:g} µm'
+                raise ValueError(f'{device.name}: {label} must be {bounds} for this SKY130 generator')
+            if abs(nm / quantum - round(nm / quantum)) > 1e-7:
+                raise ValueError(f'{device.name}: {label} must be a multiple of {quantum / 1000:g} µm for this SKY130 generator')
+    # The pinned placement backend snaps instance origins to the M1/M2
+    # routing grid. Off-grid boundary halos shift every instance off that grid.
+    for index, (constraint, enabled) in enumerate(zip(project.constraints, project._constraint_flags()), 1):
+        if not enabled or constraint.get('constraint') != 'Boundary':
+            continue
+        for field, quantum in [('halo_horizontal', 0.43), ('halo_vertical', 0.42)]:
+            value = constraint.get(field, 0)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                if abs(value / quantum - round(value / quantum)) > 1e-7:
+                    raise ValueError(f'Constraint {index} (Boundary): {field.replace("_", " ")} must be a multiple of {quantum:g} µm for this SKY130 placement grid')
+    run_options(project)
 
 
 @dataclass(frozen=True)
@@ -121,7 +207,10 @@ def _ready(url):
     try:
         # Bypass proxy environment variables for the worker's local server.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(url.rstrip('/') + '/_dash-layout', timeout=0.35) as response:
+        request_url = urllib.parse.urlunparse(parsed._replace(path='/_dash-layout', query=''))
+        token = urllib.parse.parse_qs(parsed.query).get('token', [''])[0]
+        request = urllib.request.Request(request_url, headers={'Authorization': 'Bearer ' + token})
+        with opener.open(request, timeout=0.35) as response:
             return response.status == 200 and isinstance(json.load(response), dict)
     except (OSError, ValueError, urllib.error.URLError):
         return False
@@ -210,10 +299,12 @@ class AlignRunner:
                 self._remember(manifest, placement=self._has_dump(directory), operation=True)
             return
 
+    @_serialized
     def last_run(self, project=None):
         self._locate(project)
         return self.poll(project) if self._run_dir else None
 
+    @_serialized
     def last_placement(self, project=None):
         self._locate(project)
         if self._run_dir is None:
@@ -231,21 +322,69 @@ class AlignRunner:
         previous._dump_cache = self._dump_cache
         return previous.poll(project)
 
+    def _check_save_as(self, path):
+        target = str(Path(path).expanduser().resolve()) if path else None
+        if target and self._index(target).is_file():
+            existing = json.loads(self._index(target).read_text())
+            directory = Path(existing['run_dir'])
+            record = directory / 'run.json'
+            if directory != self._run_dir and record.is_file() and _alive(json.loads(record.read_text()), directory):
+                raise ValueError('The Save As target already has an active ALIGN run')
+
+    @contextmanager
+    def save_as_transaction(self, path):
+        """Reserve ownership across a caller's atomic save, before rebinding."""
+        if (self._run_dir is None and (not self.config.run_root or
+                (not self._root.exists() and (not self.config.python or not self.config.backend_path)))):
+            # Authoring a draft does not require configuring/creating ALIGN
+            # storage. There is no history to transfer and launch is unavailable.
+            yield
+            self.project_path = str(Path(path).expanduser().resolve())
+            return
+        with _ownership_lock(self._root):
+            self._check_save_as(path)
+            original_path = self.project_path
+            target = Path(path).expanduser().resolve()
+            records = {target, self._index(str(target))}
+            if self._run_dir is not None:
+                manifest = json.loads((self._run_dir / 'run.json').read_text())
+                pointer = self._pointer(manifest)
+                records.update(Path(directory) / 'run.json' for directory in
+                    {str(self._run_dir), pointer.get('placement_dir'), pointer.get('last_attempt')} - {None})
+            originals = {record: (record.read_bytes(), record.stat().st_mode & 0o777) if record.is_file() else None for record in records}
+            try:
+                yield
+                self.rebind_project_path(path)
+            except Exception:
+                # An I/O failure during the ownership commit must not leave a
+                # saved document associated with half-transferred run history.
+                self.project_path = original_path
+                for record, saved in originals.items():
+                    if saved is None:
+                        record.unlink(missing_ok=True)
+                    else:
+                        contents, permissions = saved
+                        temporary = record.with_name(record.name + '.' + uuid.uuid4().hex + '.rollback')
+                        try:
+                            temporary.write_bytes(contents)
+                            temporary.chmod(permissions)
+                            os.replace(temporary, record)
+                        finally:
+                            temporary.unlink(missing_ok=True)
+                raise
+
+    @_serialized
     def rebind_project_path(self, path):
         """Transfer a Save As association without interrupting its worker."""
         target = str(Path(path).expanduser().resolve()) if path else None
         if target == self.project_path:
             return
+        self._check_save_as(path)
         if self._run_dir is None:
             self.project_path = target
             return
         manifest = json.loads((self._run_dir / 'run.json').read_text())
         pointer = self._pointer(manifest)
-        if target and self._index(target).is_file():
-            existing = json.loads(self._index(target).read_text())
-            directory = Path(existing['run_dir'])
-            if directory != self._run_dir and (directory / 'run.json').is_file() and _alive(json.loads((directory / 'run.json').read_text()), directory):
-                raise ValueError('The Save As target already has an active ALIGN run')
         for directory in {str(self._run_dir), pointer.get('placement_dir'), pointer.get('last_attempt')} - {None}:
             run_path = Path(directory) / 'run.json'
             if run_path.is_file():
@@ -275,6 +414,10 @@ class AlignRunner:
         validate_ota_project(project)
         project.validate()
         self.config.validate()
+        with _ownership_lock(self._root):
+            return self._start_locked(project)
+
+    def _start_locked(self, project):
         previous = self.last_run(project)
         if (previous and previous.status in _ACTIVE) or self._active_index_run() is not None:
             raise ValueError('Stop the current ALIGN run before generating another placement')
@@ -289,12 +432,13 @@ class AlignRunner:
             manifest = {'version': 1, 'profile_id': PROFILE_ID, 'project_path': self.project_path,
                         'fingerprint': project_fingerprint(detached), 'created_at': time.time(),
                         'top': detached.top, 'input_dir': str(netlist.parent),
+                        'constraint_rows': [i + 1 for i, enabled in enumerate(snapshot.get('constraint_enabled', [True] * len(detached.constraints))) if enabled],
                         'netlist': str(netlist), 'constraints': str(constraints),
                         'input_hashes': {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest()
                                          for p in (netlist, constraints, directory / 'floorplan.json')},
                         'generation_config': {'python': str(Path(self.config.python).expanduser().absolute()),
                             'backend_path': str(Path(self.config.backend_path).expanduser().resolve()),
-                            'profile': PROFILE}, 'active': None}
+                            'profile': PROFILE, 'run_options': run_options(detached)}, 'active': None}
             self._run_dir = directory
             _write_json(directory / 'run.json', manifest)
             self._remember(manifest, operation=True)
@@ -328,7 +472,8 @@ class AlignRunner:
             _write_json(self._run_dir / 'status.json', {'token': token, 'status': 'failed', 'url': None, 'error': str(error)})
         return self.poll()
 
-    def open_last(self, project):
+    @_serialized
+    def open_last(self, project=None):
         previous = self.last_run(project)
         if previous is None:
             raise ValueError('No captured ALIGN placement exists for this floorplan')
@@ -363,6 +508,7 @@ class AlignRunner:
             return self._process.poll() is None
         return _alive(manifest, self._run_dir)
 
+    @_serialized
     def poll(self, project=None):
         if self._run_dir is None:
             return None
@@ -419,6 +565,7 @@ class AlignRunner:
             except ProcessLookupError:
                 pass
 
+    @_serialized
     def stop(self):
         if self._run_dir is None:
             raise ValueError('No ALIGN run to stop')

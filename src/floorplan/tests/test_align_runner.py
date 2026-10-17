@@ -6,6 +6,7 @@ import contextlib
 import io
 from types import SimpleNamespace
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import sys
@@ -16,6 +17,21 @@ from unittest.mock import patch
 
 from roar_api.floorplan import FloorplanProject
 from roar_api.floorplan.align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, project_fingerprint, validate_ota_project
+
+
+def _race_start(config, snapshot, path, barrier, results):
+    runner = AlignRunner(config, path)
+    launch = runner._launch
+    def slow_launch(*args):
+        time.sleep(0.15)  # Make the unpublished-PID window deterministic.
+        return launch(*args)
+    runner._launch = slow_launch
+    barrier.wait()
+    try:
+        result = runner.start(FloorplanProject.from_dict(snapshot))
+        results.put(('started', result.run_dir))
+    except ValueError as error:
+        results.put(('rejected', str(error)))
 
 
 FAKE_PYTHON = '''#!PYTHON
@@ -91,6 +107,111 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, first.name + ': unsupported device model'):
             validate_ota_project(self.project)
         self.assertFalse(Path(self.config.run_root).exists())
+
+    def test_generator_geometry_preflight_preserves_repairable_drafts(self):
+        for key, value, message in [('width_um', 0.41, '0.42'), ('width_um', 2.53, '2.52'),
+                                    ('width_um', 1.015, 'multiple of 0.01'),
+                                    ('length_um', 0.145, 'at least 0.15'),
+                                    ('length_um', 0.152, 'multiple of 0.005'), ('nf', 1, 'even finger count')]:
+            project = FloorplanProject.from_dict(self.project.to_dict())
+            setattr(project.devices[0], key, value)
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, message):
+                validate_ota_project(project)
+            self.assertEqual(getattr(project.devices[0], key), value)
+
+    def test_boundary_halos_follow_backend_grid_and_disabled_constraints_are_ignored(self):
+        for horizontal, vertical in [(0, 0), (0.43, 0.42), (0.86, 0.84), (1.72, 2.52)]:
+            self.project.set_constraints([{'constraint': 'Boundary', 'halo_horizontal': horizontal, 'halo_vertical': vertical}])
+            validate_ota_project(self.project)
+        self.project.set_constraints([{'constraint': 'Boundary', 'halo_horizontal': 1.5, 'halo_vertical': 2}])
+        with self.assertRaisesRegex(ValueError, 'Constraint 1.*horizontal.*0.43 µm'):
+            validate_ota_project(self.project)
+        self.project.set_constraint_enabled(0, False)
+        validate_ota_project(self.project)
+
+    def test_concurrent_processes_publish_only_one_worker(self):
+        context = multiprocessing.get_context('fork')
+        barrier, results = context.Barrier(2), context.Queue()
+        workers = [context.Process(target=_race_start, args=(self.config, self.project.to_dict(),
+                   self.runner.project_path, barrier, results)) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        try:
+            outcomes = [results.get(timeout=6) for _ in workers]
+            for worker in workers:
+                worker.join(3)
+                self.assertEqual(worker.exitcode, 0)
+            self.assertEqual(sorted(item[0] for item in outcomes), ['rejected', 'started'])
+            self.assertIn('Stop the current ALIGN run', next(item[1] for item in outcomes if item[0] == 'rejected'))
+            self.runner.last_run(self.project)
+            self.assertEqual(len(list(Path(self.config.run_root).glob('*/run.json'))), 1)
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join()
+            self.runner.last_run(self.project)
+
+    def test_save_as_preflight_conflict_cannot_write_destination(self):
+        self.runner.start(self.project)
+        target = self.base / 'occupied.floorplan'
+        target.write_text('original destination')
+        other = AlignRunner(self.config, target)
+        self.addCleanup(other.shutdown)
+        other.start(self.project)
+        with self.assertRaisesRegex(ValueError, 'already has an active ALIGN run'):
+            with self.runner.save_as_transaction(target):
+                target.write_text('must not be written')
+        self.assertEqual(target.read_text(), 'original destination')
+        previous = self.runner.project_path
+        with self.assertRaisesRegex(OSError, 'write failed'):
+            with self.runner.save_as_transaction(self.base / 'new.floorplan'):
+                raise OSError('write failed')
+        self.assertEqual(self.runner.project_path, previous)
+
+    def test_unconfigured_draft_save_does_not_require_align_storage(self):
+        root = self.base / 'unconfigured-runs'
+        runner = AlignRunner(AlignConfig('', '', str(root)))
+        self.assertIsNone(runner.last_run(self.project))
+        self.assertIsNone(runner.last_placement(self.project))
+        target = self.base / 'draft.floorplan'
+        with runner.save_as_transaction(target):
+            self.project.save(target)
+        self.assertTrue(target.is_file())
+        self.assertFalse(root.exists())
+
+    def test_run_options_are_captured_and_invalid_settings_rejected(self):
+        self.project.run_options = {'nvariants': 7, 'placer_sa_iterations': 500, 'seed': 42, 'lambda_coeff': 2.5}
+        state = self.runner.start(self.project)
+        manifest = json.loads((Path(state.run_dir) / 'run.json').read_text())
+        self.assertEqual(manifest['generation_config']['run_options'], self.project.run_options)
+        self.runner.shutdown()
+        self.project.run_options['lambda_coeff'] = 0
+        with self.assertRaisesRegex(ValueError, 'weight'):
+            self.runner.start(self.project)
+
+    def test_save_as_rolls_back_document_and_history_if_ownership_commit_fails(self):
+        from roar_api.floorplan import align_runner
+        state = self.runner.start(self.project)
+        target = self.base / 'target.floorplan'
+        target.write_text('previous contents')
+        target.chmod(0o600)
+        manifest = Path(state.run_dir) / 'run.json'
+        original = manifest.read_bytes()
+        original_path = self.runner.project_path
+        write = align_runner._write_json
+        def fail_index(path, value):
+            if Path(path) == self.runner._index(str(target.resolve())):
+                raise OSError('ownership write failed')
+            return write(path, value)
+        with patch.object(align_runner, '_write_json', side_effect=fail_index):
+            with self.assertRaisesRegex(OSError, 'ownership write failed'):
+                with self.runner.save_as_transaction(target):
+                    target.write_text('new contents')
+        self.assertEqual(target.read_text(), 'previous contents')
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(manifest.read_bytes(), original)
+        self.assertEqual(self.runner.project_path, original_path)
 
     def test_owned_live_process_does_not_fail_when_proc_observation_is_unavailable(self):
         (self.base / 'mode').write_text('pending')
@@ -258,6 +379,70 @@ class RunnerTests(unittest.TestCase):
 
 
 class WorkerErrorTests(unittest.TestCase):
+    def test_viewer_credential_is_not_the_process_argument_token(self):
+        from roar_api.floorplan import _align_worker
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run.json'
+            activation = 'public-process-activation'
+            path.write_text(json.dumps({'active': {'token': activation, 'mode': 'generate', 'backend_path': directory, 'port': 0},
+                'generation_config': {'profile': PROFILE, 'run_options': {'nvariants': 7, 'seed': 19}},
+                'input_dir': directory, 'top': 'test'}))
+            placer, captured = SimpleNamespace(), {}
+            def schematic2layout(**kwargs):
+                captured['options'] = kwargs
+                placer.run_gui(tagged_bboxes={}, module_name='TEST', lambda_coeff=1, port=0)
+            def server(host, port, application, **kwargs):
+                captured['viewer'] = application
+                return SimpleNamespace(server_port=9012, serve_forever=lambda: None, server_close=lambda: None)
+            modules = {
+                'align': SimpleNamespace(__version__=PROFILE['align_version'], schematic2layout=schematic2layout),
+                'dash': SimpleNamespace(__version__='2.18.2'), 'align.pnr': SimpleNamespace(placer=placer),
+                'align.gui.mockup': SimpleNamespace(AppWithCallbacksAndState=lambda **kwargs: SimpleNamespace(app=SimpleNamespace(server=object()), sel='TEST_0')),
+                'werkzeug.serving': SimpleNamespace(make_server=server),
+            }
+            with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', activation]), \
+                    patch.object(_align_worker.signal, 'signal'), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(_align_worker.main(), 0)
+            self.assertNotEqual(captured['viewer'].token, activation)
+            self.assertEqual(len(captured['viewer'].token), 64)
+            self.assertEqual(captured['options']['nvariants'], 7)
+            self.assertEqual(captured['options']['seed'], 19)
+
+    def test_viewer_protects_layout_assets_and_callbacks_with_host_origin_and_authentication(self):
+        from roar_api.floorplan._align_worker import ProtectedViewer
+        token = 'a' * 32
+        calls = []
+        def application(environ, start):
+            calls.append(environ['PATH_INFO'])
+            start('200 OK', [('Content-Type', 'application/json')])
+            return [b'{"private": "placement"}']
+        viewer = ProtectedViewer(application, token)
+        viewer.port = 9012
+        def request(path='/', **updates):
+            environ = {'HTTP_HOST': '127.0.0.1:9012', 'PATH_INFO': path, 'REQUEST_METHOD': 'GET', 'QUERY_STRING': ''}
+            environ.update(updates)
+            response = {}
+            def start(status, headers, exc_info=None):
+                response.update(status=status, headers=dict(headers))
+            response['body'] = b''.join(viewer(environ, start))
+            return response
+        for path in ('/', '/_dash-layout', '/assets/test.js', '/_dash-update-component'):
+            self.assertEqual(request(path)['status'], '403 Forbidden')
+        self.assertEqual(calls, [])
+        self.assertEqual(request('/_dash-layout', HTTP_HOST='untrusted.example:9012', HTTP_AUTHORIZATION='Bearer ' + token)['status'], '403 Forbidden')
+        self.assertEqual(request('/_dash-layout', HTTP_ORIGIN='http://evil.example', HTTP_AUTHORIZATION='Bearer ' + token)['status'], '403 Forbidden')
+        authenticated = request(QUERY_STRING='token=' + token)
+        self.assertEqual(authenticated['status'], '303 See Other')
+        self.assertEqual(authenticated['headers']['Location'], '/')
+        cookie = authenticated['headers']['Set-Cookie']
+        self.assertIn('HttpOnly', cookie)
+        self.assertIn('SameSite=Strict', cookie)
+        for path in ('/', '/_dash-layout', '/assets/test.js', '/_dash-update-component'):
+            response = request(path, HTTP_COOKIE=cookie.split(';')[0], REQUEST_METHOD='POST' if 'update' in path else 'GET')
+            self.assertEqual(response['status'], '200 OK')
+            self.assertEqual(response['headers']['Referrer-Policy'], 'no-referrer')
+        self.assertEqual(request('/_dash-layout', HTTP_AUTHORIZATION='Bearer ' + token)['status'], '200 OK')
+
     def test_loopback_permission_error_preserves_placement_and_explains_reopen(self):
         from roar_api.floorplan import _align_worker
         with tempfile.TemporaryDirectory() as directory:

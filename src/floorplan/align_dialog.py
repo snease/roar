@@ -1,21 +1,24 @@
 """Qt controls for isolated, managed ALIGN placement runs."""
 
+from contextlib import contextmanager
+import json
 import os
 from pathlib import Path
 import platform
 import re
 import shutil
 import subprocess
+import tempfile
 
-from PyQt6.QtCore import QEvent, QSettings, QTimer, QUrl, Qt
+from PyQt6.QtCore import QEvent, QProcess, QProcessEnvironment, QSettings, QTimer, QUrl, Qt
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-    QPushButton, QVBoxLayout, QWidget,
+    QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+    QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from .align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, validate_ota_project
+from .align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, run_options, validate_ota_project
 
 
 ACTIVE = {"starting", "generating", "serving", "stopping"}
@@ -62,14 +65,72 @@ def _label(text=""):
     return label
 
 
+def _probe(parent, config, completed, *, manifest=None):
+    """Run the isolated interpreter without blocking the Qt event loop."""
+    process = QProcess(parent)
+    process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+    environment = QProcessEnvironment.systemEnvironment()
+    for name in ('PYTHONPATH', 'PYTHONHOME', 'ALIGN_HOME'):
+        environment.remove(name)
+    process.setProcessEnvironment(environment)
+    directory = tempfile.TemporaryDirectory(prefix='roar-align-check-')
+    process.setWorkingDirectory(directory.name)
+    arguments = ['-I', '-u', str(Path(__file__).with_name('_align_probe.py').resolve()),
+                 '--backend', str(Path(config.backend_path).expanduser())]
+    if manifest is not None:
+        arguments += ['--manifest', str(manifest)]
+    finished = False
+    timed_out = False
+    timer = QTimer(process)
+    timer.setSingleShot(True)
+    timer.setInterval(30000)
+    def finish(*_args):
+        nonlocal finished
+        if finished:
+            return
+        finished = True
+        timer.stop()
+        output = bytes(process.readAllStandardOutput()).decode('utf-8', errors='replace')
+        lines = [line[11:] for line in output.splitlines() if line.startswith('ROAR_PROBE ')]
+        try:
+            result = json.loads(lines[-1]) if lines else {'ok': False, 'message': process.errorString() + '\n' + output[-2500:]}
+        except ValueError:
+            result = {'ok': False, 'message': 'Invalid installation-check response.\n' + output[-2500:]}
+        if timed_out:
+            result = {'ok': False, 'message': 'ALIGN check exceeded 30 seconds and was stopped. Check the selected installation and retry.'}
+        completed(result)
+        directory.cleanup()
+        process.deleteLater()
+    def timeout():
+        nonlocal timed_out
+        timed_out = True
+        process.kill()
+    timer.timeout.connect(timeout)
+    process.finished.connect(finish)
+    process.errorOccurred.connect(lambda error: finish() if error == QProcess.ProcessError.FailedToStart else None)
+    process.destroyed.connect(directory.cleanup)
+    process.start(str(Path(config.python).expanduser()), arguments)
+    timer.start()
+    return process
+
+
+def _probe_text(result):
+    versions = ', '.join(f'{name.upper() if name == "align" else name.title()} {result[name]}'
+                         for name in ('python', 'align', 'dash') if name in result)
+    return versions + ('\n' if versions else '') + result.get('message', 'No diagnostic was returned.')
+
+
 class AlignSettingsDialog(QDialog):
     """Machine paths remain local; only the profile ID belongs to a floorplan."""
 
-    def __init__(self, config, profile, parent=None, *, technologies=()):
+    def __init__(self, config, profile, parent=None, *, technologies=(), placement_options=None):
         super().__init__(parent)
         self.setWindowTitle("ALIGN placement settings")
         self.setMinimumWidth(660)
         self.config = None
+        self._probe = None
+        self.run_options = dict(PROFILE['run_defaults'], lambda_coeff=1.0)
+        self.run_options.update(placement_options or {})
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.technology = QComboBox()
@@ -103,13 +164,55 @@ class AlignSettingsDialog(QDialog):
             row.addWidget(browse)
             form.addRow(title, row)
         layout.addLayout(form)
+        self.option_fields = {}
+        for key, title, low, high, tip in (
+                ('nvariants', 'Placement candidates:', 1, 100, 'Maximum number of candidates requested; ALIGN may find fewer.'),
+                ('placer_sa_iterations', 'Placement effort (iterations):', 1, 1000000, 'More simulated-annealing iterations can improve placement and take longer. The initial quick-preview setting is 100; ALIGN normally uses 10000.'),
+                ('seed', 'Random seed:', 0, 2147483647, 'Use the same seed, inputs, and tool versions to reproduce a run.')):
+            field = QSpinBox()
+            field.setRange(low, high)
+            field.setValue(self.run_options[key])
+            field.setToolTip(tip)
+            self.option_fields[key] = field
+            form.addRow(title, field)
+        weight = QDoubleSpinBox()
+        weight.setRange(0.01, 1000)
+        weight.setDecimals(2)
+        weight.setValue(self.run_options['lambda_coeff'])
+        weight.setToolTip('ALIGN minimizes log(area) + λ × log(estimated wirelength). Larger values favor shorter wires. Default: 1.')
+        self.option_fields['lambda_coeff'] = weight
+        form.addRow('Wirelength weight (λ):', weight)
+        layout.addWidget(_label('Run options are saved with this floorplan. This flow generates placement candidates; it does not route or produce final GDS.'))
         self.python.setToolTip("Python executable from the separate ALIGN environment.")
+        self.test_button = QPushButton('Test installation')
+        self.test_button.clicked.connect(self.test_installation)
+        layout.addWidget(self.test_button)
         self.error = _label()
         layout.addWidget(self.error)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+
+    def test_installation(self):
+        config = AlignConfig(self.python.text().strip(), self.backend.text().strip(), self.run_root.text().strip())
+        try:
+            config.validate()
+        except (ValueError, OSError) as error:
+            self.error.setText(str(error))
+            return
+        self.test_button.setEnabled(False)
+        self.error.setText('Checking the separate ALIGN installation…')
+        def completed(result):
+            self._probe = None
+            self.test_button.setEnabled(True)
+            self.error.setText(_probe_text(result))
+        self._probe = _probe(self, config, completed)
+
+    def done(self, result):
+        if self._probe is not None:
+            self._probe.kill()
+        super().done(result)
 
     def _browse(self, field, directory):
         if directory:
@@ -132,6 +235,7 @@ class AlignSettingsDialog(QDialog):
             self.error.setText(str(exc))
             return
         self.config = config
+        self.run_options = {key: field.value() for key, field in self.option_fields.items()}
         super().accept()
 
 
@@ -190,13 +294,17 @@ class PlacementPanel(QWidget):
     def __init__(self, project_provider, path_provider, profile_setter, parent=None,
                  *, settings=None, runner_factory=AlignRunner,
                  browser_opener=None, config=None, validator=validate_ota_project,
-                 technology_provider=None, before_generate=None):
+                 technology_provider=None, before_generate=None, run_options_setter=None):
         super().__init__(parent)
         self._project_provider = project_provider
         self._path_provider = path_provider
         self._profile_setter = profile_setter
         self._technology_provider = technology_provider
         self._before_generate = before_generate
+        self._run_options_setter = run_options_setter
+        self._constraint_probe = None
+        self._constraint_directory = None
+        self._probe_epoch = 0
         self._runner_factory = runner_factory
         self._validator = validator
         self._browser_opener = browser_opener or open_align_browser
@@ -284,10 +392,17 @@ class PlacementPanel(QWidget):
             project = self._project_provider()
         except (ValueError, TypeError, KeyError) as exc:
             self._input_error = str(exc)
+            runner = self._ensure_runner()
+            self._apply_state(runner.last_run())
+            historical = runner.last_placement()
             self.generate_button.setEnabled(self._active())
-            self.open_last_button.setEnabled(False)
+            self.open_last_button.setEnabled(historical is not None and not (self._active() and self._state.status != 'serving'))
+            self.open_last_button.setToolTip(str(historical.run_dir) if historical else '')
             self.status.setText(str(exc))
-            self.last_label.setText("Placement uses saved input." if self._state else "")
+            self.last_label.setText("Current edits are invalid. Open last placement uses its captured input." if historical else "")
+            self.settings_button.setEnabled(not self._active())
+            if self._active():
+                self._poll_timer.start()
             return
         self._input_error = ""
         self.profile_label.setText("Layout technology: " + (
@@ -346,7 +461,11 @@ class PlacementPanel(QWidget):
         self.refresh()
 
     def open_last(self):
-        project = self._project_provider()
+        try:
+            project = self._project_provider()
+        except (ValueError, TypeError, KeyError) as exc:
+            project = None
+            self._input_error = str(exc)
         if self._active() and self._state.status != "serving":
             self._show_view()
             return
@@ -418,9 +537,13 @@ class PlacementPanel(QWidget):
         project = self._project_provider()
         technologies = self._technology_provider() if self._technology_provider is not None else ()
         options = AlignSettingsDialog(self.config, project.align_profile, self._owner,
-                                      technologies=technologies)
+                                      technologies=technologies, placement_options=run_options(project))
         if options.exec() == QDialog.DialogCode.Accepted:
             self._profile_setter(options.profile.currentData())
+            if self._run_options_setter is not None:
+                self._run_options_setter(options.run_options)
+            else:
+                project.run_options = dict(options.run_options)
             self.config = options.config
             for key in ("python", "backend_path", "run_root"):
                 self._settings.setValue(key, str(getattr(self.config, key)))
@@ -430,11 +553,42 @@ class PlacementPanel(QWidget):
             self.refresh()
         options.deleteLater()
 
+    def check_native_constraints(self, project):
+        """Optional native schema/solver check; basic editing needs no ALIGN."""
+        if self._constraint_probe is not None:
+            self.status.setText('An ALIGN constraint check is already running…')
+            return
+        self.config.validate()
+        directory = tempfile.TemporaryDirectory(prefix='roar-native-constraints-')
+        try:
+            netlist, constraints = project.export_align(Path(directory.name) / 'input')
+            manifest = Path(directory.name) / 'check.json'
+            manifest.write_text(json.dumps({'top': project.top, 'netlist': str(netlist),
+                'constraints': str(constraints), 'input_dir': str(netlist.parent),
+                'constraint_rows': [i + 1 for i, enabled in enumerate(project.to_dict().get('constraint_enabled', [True] * len(project.constraints))) if enabled],
+                'active': {'backend_path': self.config.backend_path}}))
+        except Exception:
+            directory.cleanup()
+            raise
+        self._constraint_directory = directory
+        epoch = self._probe_epoch
+        self.status.setText('Checking constraints with native ALIGN…')
+        def completed(result):
+            self._constraint_probe = None
+            if epoch == self._probe_epoch:
+                self.status.setText(_probe_text(result))
+            directory.cleanup()
+            self._constraint_directory = None
+        self._constraint_probe = _probe(self, self.config, completed, manifest=manifest)
+
     def shutdown(self, *_args):
         self._closing = True
         self._refresh_timer.stop()
         self._poll_timer.stop()
         self._open_when_ready = False
+        self._probe_epoch += 1
+        if self._constraint_probe is not None:
+            self._constraint_probe.kill()
         if self._managed and self._runner is not None:
             try:
                 self._state = self._runner.shutdown()
@@ -468,6 +622,14 @@ class PlacementPanel(QWidget):
             self._state = None
         self.schedule_refresh()
 
+    @contextmanager
+    def save_as_transaction(self, path):
+        runner = self._ensure_runner()
+        with runner.save_as_transaction(path):
+            yield
+        self._runner_path = str(path) if path else None
+        self.schedule_refresh()
+
     def close_panel(self):
         """A retained editor can hide while cancellation finishes asynchronously."""
         self._closing = True
@@ -483,6 +645,7 @@ class PlacementPanel(QWidget):
         self.schedule_refresh()
 
     def eventFilter(self, watched, event):
-        if watched is self._main_window and event.type() == QEvent.Type.Close:
+        if (watched is self._main_window and event.type() == QEvent.Type.Close
+                and not hasattr(watched, '_confirm_floorplan_navigation')):
             self.shutdown()
         return super().eventFilter(watched, event)
