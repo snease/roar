@@ -19,7 +19,7 @@ def main():
         return check_setup()
     if options.check_gui:
         return check_setup(gui_only=True)
-    if check_setup(gui_only=True, quiet=True, output=sys.stderr):
+    if check_setup(gui_only=True, quiet=True, prepare_launch=True, output=sys.stderr):
         return 1
     design = Design.load(options.design) if options.design else None
     return Session(design, home=options.home).run()

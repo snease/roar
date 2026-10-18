@@ -48,8 +48,9 @@ do not silently replace them. **ALIGN settings** offers **Managed by ROAR** and
 **Custom installation** choices; saved custom paths and your placement runs
 folder remain available. Setup does not overwrite those local preferences.
 
-Run this command from your desktop terminal so the GUI check can test display
-access. Setup installs into the checkout without changing system Python or
+Run this command from your desktop terminal so the GUI check can render a small
+OpenGL test window. Opening a display connection alone does not verify graphics.
+Setup installs into the checkout without changing system Python or
 installing OS packages. The host still supplies its display server and graphics
 driver. Shell startup files do not need modification.
 
@@ -93,13 +94,17 @@ To rerun only the GUI check:
 ```
 
 Confirm that the terminal belongs to your graphical desktop session. Under
-WSL2, launch from the Ubuntu terminal with a working WSLg connection. If the
-Wayland/OpenGL path fails, try `QT_QPA_PLATFORM=xcb ./bin/roar`. A missing display
-or graphics driver cannot be supplied by a Python package manager.
+WSL2, launch from the Ubuntu terminal with a working WSLg connection. Setup and
+launch test an OpenGL widget through window composition and framebuffer readback.
+If the default Wayland backend fails and `DISPLAY` is available, they test X11
+(`xcb`); launch uses it only after that check succeeds. Explicit
+`QT_QPA_PLATFORM` overrides are respected. To try X11 explicitly, run
+`QT_QPA_PLATFORM=xcb ./bin/roar`. A missing display or graphics driver cannot be
+supplied by a Python package manager.
 
 A check reporting `offscreen` or `minimal` verified headless Qt initialization
-only. Remove that `QT_QPA_PLATFORM` override and rerun from the desktop terminal
-before treating visible startup as checked.
+only, without OpenGL rendering. Remove that `QT_QPA_PLATFORM` override and rerun
+from the desktop terminal before treating visible startup as checked.
 
 ### ALIGN Preview Is Unavailable
 

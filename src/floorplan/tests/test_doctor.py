@@ -24,6 +24,71 @@ class SetupCheckTests(unittest.TestCase):
         text += 'ROAR_GUI ' + json.dumps({'ok': True, 'platform': platform}) + '\n'
         return subprocess.CompletedProcess([], 0, text, '')
 
+    def broken_graphics(self, platform='wayland', *, abort=False):
+        text = 'ROAR_IMPORTS ready\nROAR_PLATFORM ' + json.dumps({'platform': platform}) + '\n'
+        if not abort:
+            text += 'ROAR_GUI ' + json.dumps({'ok': False, 'error': 'OpenGL widget did not render a frame'})
+        return subprocess.CompletedProcess([], -6 if abort else 1, text, 'Failed to create QRhi')
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Wayland fallback requires Linux')
+    def test_failed_wayland_rendering_uses_verified_x11_without_changing_check_environment(self):
+        for abort in (False, True):
+            with self.subTest(abort=abort), patch.dict(os.environ, {'DISPLAY': ':0'}, clear=True):
+                before = dict(os.environ)
+                output = io.StringIO()
+                with patch.object(doctor, '_run', side_effect=[self.broken_graphics(abort=abort), self.gui()]) as run:
+                    self.assertEqual(doctor.check_setup(gui_only=True, output=output), 0)
+                self.assertEqual(os.environ, before)
+                self.assertEqual(run.call_args_list[1].kwargs['environment']['QT_QPA_PLATFORM'], 'xcb')
+                self.assertIn('Using X11 (xcb)', output.getvalue())
+                self.assertNotIn('current display (wayland)', output.getvalue())
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Wayland fallback requires Linux')
+    def test_failed_x11_fallback_does_not_prepare_a_launch_or_claim_success(self):
+        with patch.dict(os.environ, {'DISPLAY': ':0'}, clear=True):
+            output = io.StringIO()
+            with patch.object(doctor, '_run', side_effect=[self.broken_graphics(), self.broken_graphics('xcb')]):
+                self.assertEqual(doctor.check_setup(gui_only=True, prepare_launch=True, output=output), 1)
+            self.assertNotIn('QT_QPA_PLATFORM', os.environ)
+            self.assertIn('X11 fallback also failed', output.getvalue())
+            self.assertNotIn('Using X11', output.getvalue())
+            self.assertNotIn('sudo apt', output.getvalue())
+
+    def test_graphics_failure_respects_explicit_platform_and_available_displays(self):
+        for platform, environment in (
+            ('wayland', {'QT_QPA_PLATFORM': 'wayland', 'DISPLAY': ':0'}),
+            ('wayland', {'QT_QPA_PLATFORM': 'wayland;xcb', 'DISPLAY': ':0'}),
+            ('wayland', {}), ('xcb', {'DISPLAY': ':0'}),
+        ):
+            with self.subTest(environment=environment, platform=platform):
+                code, text, run = self.run_check([self.broken_graphics(platform)],
+                    dict(environment, ROAR_MANAGED_RUNTIME='1'), gui_only=True)
+                self.assertEqual(code, 1)
+                self.assertEqual(run.call_count, 1)
+                self.assertIn('OpenGL widget did not render', text)
+                self.assertNotIn('setup_roar.sh', text)
+                self.assertNotIn('current display', text)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Wayland fallback requires Linux')
+    def test_launch_uses_successful_fallback_before_constructing_the_session(self):
+        from roar_api.__main__ import main
+        with patch.dict(os.environ, {'DISPLAY': ':0'}, clear=True), \
+             patch.object(sys, 'argv', ['roar']), patch.object(sys, 'stderr', io.StringIO()) as errors, \
+             patch.object(doctor, '_run', side_effect=[self.broken_graphics(), self.gui()]), \
+             patch('roar_api.Session') as session:
+            def run_session():
+                self.assertEqual(os.environ['QT_QPA_PLATFORM'], 'xcb')
+                return 0
+            session.return_value.run.side_effect = run_session
+            self.assertEqual(main(), 0)
+            self.assertIn('Using X11 (xcb)', errors.getvalue())
+
+    def test_working_wayland_does_not_trigger_fallback(self):
+        code, text, run = self.run_check([self.gui(platform='wayland')], {'DISPLAY': ':0'}, gui_only=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn('current display (wayland)', text)
+
     def test_native_import_failure_is_a_failure_with_system_library_guidance(self):
         error = {'ok': False, 'error': 'ImportError: libEGL.so.1: cannot open shared object file', 'missing_module': None}
         child = subprocess.CompletedProcess([], 1, 'ROAR_GUI ' + json.dumps(error), '')

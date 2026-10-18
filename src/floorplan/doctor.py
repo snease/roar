@@ -23,13 +23,50 @@ try:
         settings = QSettings("ROAR", "FloorplanALIGN")
         print("ROAR_SETTINGS " + json.dumps({key: settings.value(key) for key in
               ("python", "backend_path", "run_root", "custom_installation") if settings.contains(key)}), flush=True)
-    for module in ("PyQt6.QtWidgets", "PyQt6.Qsci", "pyqtgraph.opengl", "jedi",
+    for module in ("PyQt6.QtWidgets", "PyQt6.QtOpenGLWidgets", "PyQt6.Qsci", "pyqtgraph.opengl", "jedi",
                    "colorama", "qdarktheme", "kiwisolver"):
         importlib.import_module(module)
     print("ROAR_IMPORTS ready", flush=True)
-    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout
+    from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+    from PyQt6.QtCore import QTimer
     application = QApplication([])
-    print("ROAR_GUI " + json.dumps({"ok": True, "platform": application.platformName()}), flush=True)
+    backend = application.platformName()
+    # QApplication alone can succeed even when the first GL widget makes Qt
+    # abort. Publish the selected backend before exercising that native path.
+    print("ROAR_PLATFORM " + json.dumps({"platform": backend}), flush=True)
+    if backend in ('offscreen', 'minimal'):
+        result = {"ok": True, "platform": backend, "opengl": False}
+    else:
+        from PyQt6.QtGui import QOpenGLContext
+        context = QOpenGLContext()
+        if not context.create():
+            raise RuntimeError('Qt cannot create an OpenGL context on ' + backend + '.')
+        window = QWidget()
+        window.setWindowTitle('ROAR graphics check')
+        layout = QVBoxLayout(window)
+        view = QOpenGLWidget()
+        layout.addWidget(view)
+        window.resize(240, 160)
+        result = {"ok": False, "platform": backend,
+                  "error": "OpenGL widget did not render a frame within 5 seconds."}
+        def rendered():
+            try:
+                if view.isValid() and not view.grabFramebuffer().isNull():
+                    result.update(ok=True, opengl=True)
+                    result.pop('error', None)
+            except Exception as error:
+                result['error'] = 'OpenGL framebuffer check: ' + str(error)
+            application.quit()
+        # Test window composition as well as context creation, then read back
+        # the widget's framebuffer. A hidden/offscreen surface misses QRhi failures.
+        view.frameSwapped.connect(lambda: QTimer.singleShot(0, rendered))
+        QTimer.singleShot(5000, application.quit)
+        window.show()
+        application.exec()
+        window.close()
+    print("ROAR_GUI " + json.dumps(result), flush=True)
+    sys.exit(0 if result['ok'] else 1)
 except Exception as error:
     print("ROAR_GUI " + json.dumps({"ok": False, "error": type(error).__name__ + ": " + str(error),
           "missing_module": error.name if isinstance(error, ModuleNotFoundError) else None}), flush=True)
@@ -78,15 +115,17 @@ def _check_runs(path):
     return root
 
 
-def check_setup(*, output=None, gui_only=False, quiet=False):
-    """Return 0 on success; optionally check only GUI and print only failures.
+def check_setup(*, output=None, gui_only=False, quiet=False, prepare_launch=False):
+    """Return 0 on success; quiet suppresses routine success messages.
 
-    Qt initializes in a child so a missing platform plugin or display cannot
-    abort the launcher. Ordinary startup ignores optional ALIGN configuration.
+    Qt renders in a child so a missing platform plugin, display or OpenGL
+    context cannot abort the launcher. A failed default Wayland backend may
+    fall back to verified X11. Only prepare_launch applies that choice to this
+    process; diagnostic checks do not change the environment or preferences.
     """
     output = output or sys.stdout
     def report(level, message):
-        if not quiet or level in ('FAIL', 'FIX'):
+        if not quiet or level in ('FAIL', 'FIX') or (prepare_launch and level == 'INFO'):
             print(f'{level}: {message}'.replace('\u2192', '->'), file=output)
     report('PASS', f'Python {platform.python_version()} ({sys.executable})')
     settings = {}
@@ -99,16 +138,30 @@ def check_setup(*, output=None, gui_only=False, quiet=False):
         child = _run(command)
         settings = _record(child.stdout, 'ROAR_SETTINGS ') or {}
         gui = _record(child.stdout, 'ROAR_GUI ')
+        backend = (_record(child.stdout, 'ROAR_PLATFORM ') or {}).get('platform', '')
+        fallback = False
+        if (sys.platform == 'linux' and backend.startswith('wayland')
+                and not os.environ.get('QT_QPA_PLATFORM') and os.environ.get('DISPLAY')
+                and (not gui or not gui.get('ok') or child.returncode != 0)):
+            fallback = True
+            child = _run(command, environment={**os.environ, 'QT_QPA_PLATFORM': 'xcb'})
+            gui = _record(child.stdout, 'ROAR_GUI ')
         if gui and gui.get('ok') and child.returncode == 0:
             report('PASS', 'GUI dependencies import successfully.')
             backend = gui.get('platform', 'unknown')
+            if fallback:
+                report('INFO', 'Using X11 (xcb): the default Wayland backend failed the OpenGL rendering check.')
+                if prepare_launch:
+                    os.environ['QT_QPA_PLATFORM'] = 'xcb'
             if backend in ('offscreen', 'minimal'):
                 report('WARN', f'Qt initialized with {backend}; desktop display access was not tested. '
-                       'Run again in your desktop terminal without this QT_QPA_PLATFORM override.')
+                       'OpenGL rendering was not tested. Run again in your desktop terminal without this QT_QPA_PLATFORM override.')
             else:
-                report('PASS', f'Qt can open the current display ({backend}).')
+                report('PASS', f'Qt can render an OpenGL widget on the current display ({backend}).')
         else:
             failed = True
+            if fallback:
+                report('FAIL', 'Wayland failed its OpenGL check; the X11 fallback also failed.')
             detail = gui.get('error') if gui else (child.stderr.strip() or f'Qt child exited with code {child.returncode}')
             # Qt emits several paragraphs before aborting. Keep the useful
             # cause visible without repeating its generic crash instructions.
@@ -121,13 +174,14 @@ def check_setup(*, output=None, gui_only=False, quiet=False):
                 # reach the display; avoid recommending the wrong repair.
                 lines = display_lines
             report('FAIL', 'GUI startup: ' + ' '.join(lines[:3])[:1200])
-            if managed and not display_lines:
+            graphics_failure = bool(_record(child.stdout, 'ROAR_PLATFORM '))
+            if managed and not display_lines and not graphics_failure:
                 report('FIX', 'Rerun ./bin/setup_roar.sh from the checkout to repair the managed runtime.')
             if not managed and gui and gui.get('missing_module'):
                 report('FIX', "Activate the ROAR environment and run python3 -m pip install -e '.[gui]' from the checkout root.")
             display_unavailable = 'could not connect to display' in str(detail).lower()
             unknown_platform = 'could not find the qt platform plugin' in str(detail).lower()
-            if not managed and (not gui or '.so' in str(detail)) and not display_unavailable and not unknown_platform and sys.platform == 'linux':
+            if not managed and (not gui or '.so' in str(detail)) and not display_unavailable and not unknown_platform and not graphics_failure and sys.platform == 'linux':
                 report('FIX', 'For Ubuntu 22.04, install the desktop runtime libraries: sudo apt install ' + _UBUNTU_LIBRARIES)
             if 'ROAR_IMPORTS ready' in child.stdout:
                 if unknown_platform:

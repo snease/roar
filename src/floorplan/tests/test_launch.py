@@ -13,6 +13,25 @@ class LauncherTests(unittest.TestCase):
                               cwd=Path(__file__).resolve().parents[3], env=environment,
                               capture_output=True, text=True, timeout=40)
 
+    @unittest.skipUnless(importlib.util.find_spec('PyQt6'), 'Requires the GUI extra')
+    def test_qt_probe_rejects_successful_application_with_unusable_opengl(self):
+        from roar_api.floorplan.doctor import _QT_CHECK, _record
+        # Initialize real headless Qt, but emulate a desktop backend whose
+        # display opens while native context creation fails (the WSLg bug).
+        inject_failure = '''
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QOpenGLContext
+QApplication.platformName = lambda self: 'wayland'
+QOpenGLContext.create = lambda self: False
+'''
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', inject_failure + _QT_CHECK, '--gui-only'],
+            env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen'}, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_record(result.stdout, 'ROAR_PLATFORM '), {'platform': 'wayland'})
+        report = _record(result.stdout, 'ROAR_GUI ')
+        self.assertFalse(report['ok'])
+        self.assertIn('cannot create an OpenGL context', report['error'])
+
     @unittest.skipIf(importlib.util.find_spec('PyQt6'), 'Requires an environment without the GUI extra')
     def test_real_missing_gui_package_exits_with_install_guidance(self):
         result = self.launch(dict(os.environ))

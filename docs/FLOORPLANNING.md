@@ -642,11 +642,12 @@ GUI tests skip only when the PyQt6 package is absent. An installed Qt with missi
 native libraries or broken imports fails the check; run `./bin/roar --check-setup`
 for repair guidance. The core package does not import Qt or ALIGN.
 
-The production managed setup passed on Python 3.11.17 with Wayland display
-initialization, a separate X11/xcb check, and an actual `bin/roar` launch from
-outside the checkout. The floorplan suite ran 311 tests: 310 passed, with the
-missing-GUI-package case skipped in the GUI environment and separately passed
-with system Python. With fresh settings, **Generate preview** produced four OTA
+The managed graphics check now renders an OpenGL widget and reads its framebuffer;
+the earlier display-initialization check missed a Wayland failure on this WSLg
+host. With Python 3.11.17, the check detects that failure and verifies X11/xcb
+before using it for launch. The main ROAR window and a real pyqtgraph 3D grid
+both rendered through this fallback. Explicit display overrides remain honored.
+With fresh settings, **Generate preview** produced four OTA
 candidates with ten rendered blocks in about 11 seconds. The optional ALIGN
 browser also passed its asset, layout, callback and access-control checks.
 
