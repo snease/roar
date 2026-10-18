@@ -7,7 +7,7 @@ import unittest
 
 try:
     from PyQt6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
-    from PyQt6.QtGui import QFocusEvent, QMouseEvent
+    from PyQt6.QtGui import QFocusEvent, QImage, QMouseEvent, QPainter
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QGraphicsItem, QTabWidget, QWidget
 except ModuleNotFoundError as exc:
@@ -85,6 +85,50 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(self.panel.selected_names(), ['M1'])
         self.assertIn('M1: diffpair <inn>', self.panel.details.toPlainText())
         self.assertIn('diffpair &lt;inn&gt;', self.panel.items_by_id['X_M1'].toolTip())
+
+    def test_narrow_block_labels_fit_and_keep_full_role_in_tooltip(self):
+        role = 'differential input pair negative reference'
+        self.panel.set_device_labels({'M1': role})
+        item = self.panel.items_by_id['X_M1']
+        image = QImage(100, 100, QImage.Format.Format_ARGB32)
+        draws = []
+
+        class RecordingPainter(QPainter):
+            def drawText(self, rect, flags, text):
+                draws.append((rect, self.fontMetrics().boundingRect(rect.toRect(), flags, text), text))
+                super().drawText(rect, flags, text)
+
+        painter = RecordingPainter(image)
+        try:
+            painter.scale(42 / item.rect.width(), 42 / item.rect.height())
+            painter.translate(-item.rect.left(), -item.rect.top())
+            item.paint(painter, None)
+        finally:
+            painter.end()
+        self.assertEqual(len(draws), 1)
+        available, rendered, text = draws[0]
+        self.assertIn('M1', text)
+        self.assertIn('…', text)
+        self.assertTrue(available.adjusted(-1, -1, 1, 1).contains(QRectF(rendered)))
+        self.assertIn(role, item.toolTip())
+
+    def test_provenance_keeps_all_lines_when_panel_is_short_or_narrow(self):
+        self.panel.clear()
+        self.app.processEvents()
+        self.data['run_id'] = 'current_mirror_ota_captured_for_layout_handoff'
+        self.data['provenance']['created_at'] = '2026-10-18T12:13:14Z'
+        self.panel.set_preview(self.data)
+        # A newly completed run can be painted in this event, before Qt's next
+        # queued layout pass. Its two-line provenance must already fit.
+        label = self.panel.provenance
+        self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
+        for width in (510, 320):
+            with self.subTest(width=width):
+                self.panel.resize(width, 550)
+                self.app.processEvents()
+                label = self.panel.provenance
+                self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
+                self.assertIn('2026-10-18T12:13:14Z', label.text())
 
     def test_candidate_switch_handles_nonzero_origin_and_unmapped_sources(self):
         other = deepcopy(self.data['candidates'][0])

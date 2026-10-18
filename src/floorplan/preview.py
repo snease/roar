@@ -58,8 +58,8 @@ class _PhysicalBlock(QGraphicsItem):
         painter.setBrush(fill)
         painter.drawRect(self.rect)
         # Fixed-size text remains readable without dwarfing a micron-sized box.
-        device_rect = painter.worldTransform().mapRect(self.rect).adjusted(4, 3, -4, -3)
-        if device_rect.width() < 28 or device_rect.height() < 14:
+        device_rect = painter.worldTransform().mapRect(self.rect).adjusted(3, 3, -3, -3)
+        if device_rect.width() < 16 or device_rect.height() < 14:
             return
         sources = self.block['source_instances']
         text = ', '.join(sources[:3]) if sources else 'Unmapped: ' + self.block['id']
@@ -74,10 +74,15 @@ class _PhysicalBlock(QGraphicsItem):
         font.setPointSizeF(9)
         painter.setFont(font)
         painter.setPen(palette.color(QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text))
-        text = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, int(device_rect.width()))
-        if roles and device_rect.height() > 45:
-            text += '\n' + '\n'.join(roles)
-        painter.drawText(device_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
+        metrics = painter.fontMetrics()
+        line_count = max(1, int(device_rect.height() // metrics.lineSpacing()))
+        lines = [text, *roles]
+        if len(lines) > line_count:
+            lines = lines[:line_count]
+            lines[-1] += ' …'
+        text = '\n'.join(metrics.elidedText(line, Qt.TextElideMode.ElideRight,
+                                           int(device_rect.width())) for line in lines)
+        painter.drawText(device_rect, Qt.AlignmentFlag.AlignCenter, text)
         painter.restore()
 
 
@@ -241,6 +246,9 @@ class PreviewPanel(QWidget):
         layout.addLayout(candidates)
         self.dimensions = self._label('')
         self.provenance = self._label('')
+        policy = self.provenance.sizePolicy()
+        policy.setVerticalPolicy(QSizePolicy.Policy.Minimum)
+        self.provenance.setSizePolicy(policy)
         self.stale_badge = self._label('Earlier inputs — regenerate to compare current inputs.')
         policy = self.stale_badge.sizePolicy()
         policy.setRetainSizeWhenHidden(True)
@@ -347,6 +355,9 @@ class PreviewPanel(QWidget):
             f"\nRun {self.data['run_id']} · {created or 'Time not recorded'}")
         self.provenance.setToolTip(_tooltip(str(getattr(self.state, 'run_dir', '') or self.data['run_id'])))
         self.stale_badge.setVisible(bool(getattr(self.state, 'stale', False)))
+        # The first result replaces a single-line placeholder. Allocate its
+        # wrapped provenance before this frame can be painted or captured.
+        self.layout().activate()
 
     def current_candidate(self):
         if self.data is None:
