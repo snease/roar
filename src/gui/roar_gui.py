@@ -876,7 +876,18 @@ class ROARHeader(QWidget):
     def on_layout_button_clicked(self):
         """Keep one parent-owned floorplan editor across close/reopen cycles."""
         if self._floorplan_dialog is None:
-            from roar_api.floorplan.dialog import FloorplanDialog
+            try:
+                from roar_api.floorplan.dialog import FloorplanDialog
+            except ModuleNotFoundError as exc:
+                if exc.name not in {"roar_api.floorplan", "roar_api.floorplan.dialog", "parse_netlist"}:
+                    raise
+                QMessageBox.warning(self, "Floorplan editor needs installation",
+                    "This checkout's floorplan package is missing from the active Python environment. "
+                    "This can happen after switching branches or updating ROAR.\n\n"
+                    "Close ROAR, then run this from the checkout root using the same Python environment:\n\n"
+                    "python -m pip install -e '.[gui]'\n\n"
+                    "Restart ROAR after installation.")
+                return
             app = self.top_level_app
             if app is None:
                 raise ValueError("No ROAR application is available to read sizes.")

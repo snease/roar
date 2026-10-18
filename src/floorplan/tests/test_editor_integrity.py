@@ -1,7 +1,10 @@
 """Regression tests for saving, repairing and editing floorplan documents."""
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -236,6 +239,37 @@ class EditorIntegrityTests(unittest.TestCase):
         window.capture_app_state = Mock(return_value={"app_name": "ROAR", "marker": "saved"})
         window._record_design_document = Mock()
         return window
+
+    def test_checkout_without_refreshed_install_explains_floorplan_setup(self):
+        # A fresh process with the existing GUI dependencies but no editable
+        # import mappings reproduces launching src/roar.py after a branch switch.
+        script = """
+import sys
+from pathlib import Path
+from unittest.mock import patch
+sys.meta_path[:] = [f for f in sys.meta_path if not f.__module__.startswith('__editable__')]
+sys.path_hooks[:] = [h for h in sys.path_hooks if not h.__module__.startswith('__editable__')]
+sys.path_importer_cache.clear()
+root = Path(sys.argv[1])
+sys.path[:0] = [str(root), str(root / 'src')]
+from roar_api._backend import load_backend
+gui = load_backend('roar_gui', root)
+app = gui.QApplication([])
+header = gui.ROARHeader()
+with patch.object(gui.QMessageBox, 'warning') as warning:
+    header.on_layout_button_clicked()
+warning.assert_called_once()
+message = warning.call_args.args[2]
+assert "python -m pip install -e '.[gui]'" in message, message
+assert 'checkout root' in message, message
+assert 'Restart ROAR' in message, message
+assert header._floorplan_dialog is None
+"""
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(Path(__file__).resolve().parents[3])],
+            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_main_window_cancel_does_not_shutdown_placement(self):
         window = self._main_window()
