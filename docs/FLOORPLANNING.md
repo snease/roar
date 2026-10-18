@@ -108,7 +108,7 @@ configure the separate ALIGN environment when ready to generate physical geometr
 | Keep working after an input change | The previous result stays visible with **Earlier inputs**. Generate again after changing sizes, enabled rules, technology or run options. |
 | Give the design to a layout engineer | **Export handoff…** creates a portable ZIP of captured inputs and drawings; optionally include the displayed physical candidate with its own captured inputs. |
 
-![Role-labeled sketch with related-rule navigation beside physical placement from ALIGN.](images/floorplan/sketch-and-preview.png)
+![Role-labeled sketch with related-rule navigation beside physical placement from ALIGN.](../images/png/floorplan/sketch-and-preview.png)
 
 **1** Drag the sketch boxes. **2** Create relationships that ALIGN will honor.
 **3** Compare a physical candidate; selecting devices highlights both views.
@@ -272,7 +272,7 @@ the runs folder if needed, but does not install or modify the toolchain.
    Drawing-only edits leave the captured result current. Saved results reopen
    without rerunning ALIGN, including after restarting ROAR.
 
-<img src="images/floorplan/preview-details.png" width="600" alt="Generated placement showing its dimensions, earlier-inputs notice, selected-net connections and source-device details">
+<img src="../images/png/floorplan/preview-details.png" width="600" alt="Generated placement showing its dimensions, earlier-inputs notice, selected-net connections and source-device details">
 
 The captured candidate stays inspectable after an input change. Here **Connections**
 shows one net's physical terminals; the dashed lines are connectivity, not routing.
@@ -289,7 +289,7 @@ its viewer assets. Native preview generation does not depend on those assets.
 The browser remains useful for ALIGN's own candidate, hierarchy, pin and net
 inspection.
 
-![ALIGN's optional browser viewer showing a generated OTA placement and candidate tradeoffs.](images/floorplan/placement.png)
+![ALIGN's optional browser viewer showing a generated OTA placement and candidate tradeoffs.](../images/png/floorplan/placement.png)
 
 The repository profile is
 [`align_profile.json`](../src/floorplan/align_profile.json): ALIGN 0.9.8, Dash 2,
@@ -365,7 +365,7 @@ settings. Add a constraint through its form, or select an existing row and edit
 it (double-clicking also opens the form). Changes are validated before applying;
 cancelling leaves the constraint unchanged. No JSON editing is needed.
 
-![Device symmetry form, with the shared axis marked 1 and device pairs marked 2.](images/floorplan/constraints.png)
+![Device symmetry form, with the shared axis marked 1 and device pairs marked 2.](../images/png/floorplan/constraints.png)
 
 **1** Choose the shared axis. **2** Pair devices, or place a singleton on that axis.
 
@@ -415,7 +415,7 @@ Editing the inputs marks that check out of date; run **Check constraints** again
 
 ## Bring sizes over from ROAR
 
-![Parameters tab, with shared symbols marked 1 and ROAR binding controls marked 2.](images/floorplan/parameters.png)
+![Parameters tab, with shared symbols marked 1 and ROAR binding controls marked 2.](../images/png/floorplan/parameters.png)
 
 **1** See which devices share each size. **2** Bind a ROAR value and specify its
 units and width convention; total W is divided by NF for the device's per-finger width.
