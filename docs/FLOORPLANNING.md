@@ -53,11 +53,15 @@ For a new GUI environment, run this from the checkout root in a bash terminal:
 ```sh
 python3.10 -m venv "$HOME/roar-gui"
 . "$HOME/roar-gui/bin/activate"
-python3 -m pip install --upgrade pip
+python3 -m pip install --upgrade pip setuptools wheel
 python3 -m pip install -e '.[gui]'
 python3 -m roar_api --check-setup
 python3 -m roar_api
 ```
+
+Activate that environment again in each new terminal with
+`. "$HOME/roar-gui/bin/activate"` before installing or launching. If pip says
+`Defaulting to user installation`, the virtual environment is not active.
 
 Use `python3 -m roar_api --check-setup` in an existing environment too. It checks
 GUI imports and display initialization in a child process, so a Qt startup
@@ -76,6 +80,7 @@ An SSH or container session also needs display access to show the editor.
 | Startup problem | What to do |
 | --- | --- |
 | `No module named 'PyQt6'` or another GUI package | Activate the GUI environment and install `.[gui]` with that environment's `python3 -m pip`. |
+| Build backend is missing the `build_editable` hook | Create and activate the venv above, upgrade `pip setuptools wheel` inside it, then retry the editable install. ROAR requires setuptools 64 or newer for editable builds. |
 | `ImportError: libEGL.so.1` or another missing `.so` | Install the native runtime packages above. Reinstalling PyQt6 into the venv does not supply these system libraries. |
 | Qt cannot load `xcb` or connect to the display | Run the setup checker; check both the native packages and desktop/WSLg connection. |
 | The checker reports `offscreen` or `minimal` | Only a headless Qt check ran. Remove that `QT_QPA_PLATFORM` override and rerun from the desktop terminal to check visible windows. |
