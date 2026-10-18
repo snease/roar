@@ -17,11 +17,12 @@ jobs:
       # CI verifies Qt imports/widgets headlessly. It cannot accept a desktop
       # display or OpenGL rendering; run check-gui on the user's desktop.
       QT_QPA_PLATFORM: offscreen
-      ROAR_CHECK_OUTPUT_DIR: ${{ runner.temp }}/roar-checks
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Set validation artifact directory
+        run: echo "ROAR_CHECK_OUTPUT_DIR=${RUNNER_TEMP}/roar-checks" >> "$GITHUB_ENV"
       - name: Install the pinned runtime and backend (headless CI setup)
         run: ./bin/setup_roar.sh
       - name: Install the locked GUI-free package test environment
