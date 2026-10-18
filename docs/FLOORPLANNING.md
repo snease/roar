@@ -36,14 +36,19 @@ Constraints belong to the floorplan and are saved with it. A separate constraint
 file is only needed to exchange rules with ALIGN or another tool. There is one
 export action, which includes both the sized netlist and the constraints.
 
-**Open floorplan…** offers a sizing source: **Current ROAR design**, **Saved ROAR
-file**, or **Captured sizes (no updates)**. The selected mode is saved with the project;
+**Open floorplan…** offers a sizing source: **Current ROAR design**, **Open another
+ROAR design…**, or **Captured sizes (no updates)**. Opening another design changes
+ROAR's active design and keeps bound sizes live; selecting its already active
+file uses the current unsaved sizes. In a standalone editor, **Saved ROAR file**
+reads the file without changing a ROAR workspace. The selected mode is saved with the project;
 older projects reopen their captured sizes without silently refreshing a link. Missing links can be
 repaired with Browse, or the floorplan can open using its saved sizes alone.
 
 If the associated design differs from the active design, a conflict dialog
 offers switching to the associated design, associating the floorplan with the
-current design, or cancelling. Unsaved design changes add **Save and Switch**
+current design, using captured sizes, or cancelling. This also applies when a
+saved floorplan reopens in live mode, even if the two designs have identical
+sizes. Unsaved design changes add **Save and Switch**
 and **Discard and Switch** choices. Cancelling or failing a save cancels the
 switch. An unnamed current design must be saved before making a persistent
 association. Switching changes the design editor's data; graph tabs and window
@@ -74,7 +79,8 @@ blocks those actions rather than exporting its old value.
    [`cm_ota.roar.floorplan`](../examples/floorplan/ota/cm_ota.roar.floorplan).
    Its linked [`cm_ota_sizes.roar`](../examples/floorplan/ota/cm_ota_sizes.roar)
    is retained as its association. Open with **Captured sizes (no updates)**, or choose
-   **Saved ROAR file** to refresh from that snapshot.
+   **Open another ROAR design…** to open its linked design as the live sizing
+   source (**Saved ROAR file** in a standalone editor).
 2. Inspect the **Parameters** tab. Each shared symbol lists its affected device
    fields, captured value and ROAR source. For example, `w1_2` is bound to
    `M1_2.W`. W is 2.2 µm total, NF is 2, and the Devices tab therefore shows
@@ -106,22 +112,16 @@ An administrator or CAD support engineer can prepare the separate tool
 environment; subsequent editing and placement runs use the GUI. Keep ALIGN's
 dependencies separate from ROAR's Qt environment.
 
-- Build ALIGN 0.9.8 following its
-  [installation instructions](https://align-analoglayout.github.io/ALIGN-public/notes/installation.html).
-  The source used for these compatibility checks is
-  [revision `8d3cc2e9`](https://github.com/ALIGN-analoglayout/ALIGN-public/tree/8d3cc2e9aa5511315203eb5cbfd00d2c88fdbd18).
-  Python 3.10 and a C++ build toolchain are needed; a source checkout alone is
-  insufficient because the native placement extension must be built.
-- Install Dash 2.x in that ALIGN environment (`python -m pip install 'dash>=2,<3'`).
-- Check out the [vibeic SKY130 backend](https://github.com/vibeic/ALIGN-pdk-sky130)
-  at revision `427b3b94242fdcf8009e418f6bbe14286fc71334`.
-  Select its `SKY130_PDK` subdirectory in ROAR. The official SKY130 backend is
-  different and does not satisfy this profile's geometry checks.
-- In **ALIGN settings…**, choose that environment's Python executable and the
-  backend directory. **Test installation** reports Python, ALIGN and Dash
-  versions, checks the pinned backend files and imports the native components.
-  A failure remains visible in the dialog so its message can be shared with CAD
-  support. The test does not install or modify the toolchain.
+Open **ALIGN settings… → Setup help…** for the
+[installation recipe and common errors](../src/floorplan/ALIGN_SETUP.md). That
+guide uses the official ALIGN 0.9.8 Python 3.10 wheel, Dash 2.18.2 and the pinned
+vibeic SKY130 backend. The source reference used for compatibility checks is
+[revision `8d3cc2e9`](https://github.com/ALIGN-analoglayout/ALIGN-public/tree/8d3cc2e9aa5511315203eb5cbfd00d2c88fdbd18);
+the installed wheel is identified by its release, not assumed to equal that checkout.
+
+**Test installation** reports versions, checks the backend and viewer assets,
+imports native components and verifies write access to the placement runs folder. It creates
+the runs folder if needed, but does not install or modify the toolchain.
 
 ### Run placement
 
@@ -144,6 +144,14 @@ dependencies separate from ROAR's Qt environment.
    apply them. **Open last placement** reopens captured results without
    recompiling the current floorplan. A stale indicator identifies results
    that differ from the current document.
+
+**View last run / log…** reopens progress or failure details without generating
+again. **Copy diagnostics** includes the run folder and displayed log for CAD
+support, with viewer-link credentials removed. The full log remains in the run folder.
+
+![ALIGN's browser viewer showing a generated OTA placement and candidate tradeoffs.](images/floorplan/placement.png)
+
+Compare placement candidates and inspect devices, pins and nets in ALIGN's viewer.
 
 The repository profile is
 [`align_profile.json`](../src/floorplan/align_profile.json): ALIGN 0.9.8, Dash 2,
@@ -218,6 +226,10 @@ settings. Add a constraint through its form, or select an existing row and edit
 it (double-clicking also opens the form). Changes are validated before applying;
 cancelling leaves the constraint unchanged. No JSON editing is needed.
 
+![Device symmetry form, with the shared axis marked 1 and device pairs marked 2.](images/floorplan/constraints.png)
+
+**1** Choose the shared axis. **2** Pair devices, or place a singleton on that axis.
+
 See ALIGN's
 [constraint reference](https://align-analoglayout.github.io/ALIGN-public/notes/const.html)
 for the underlying semantics.
@@ -239,6 +251,7 @@ for the underlying semantics.
 | Align and order | `AlignInOrder` | Edge/center alignment together with left-to-right or top-to-bottom ordering. |
 | Port location | `PortLocation` | A boundary region for signal ports. |
 | Net symmetry | `SymmetricNets` | Two nets and ordered corresponding pins, with an explicit symmetry axis. |
+| Net placement priority | `NetPriority` | Select signal nets and assign a nonnegative integer wirelength weight. Larger values favor shorter connections during placement; unspecified nets have weight 1. This is not a matching or length guarantee. |
 | Clock ports | `ClockPorts` | Exclude clock nets from ordinary signal symmetry inference. |
 | Keep devices out of pattern recognition | `DoNotIdentify` | Prevent selected devices from being combined into recognized circuit patterns. |
 | Compiler transformations | `ConfigureCompiler` | Control inference, merging, dummy removal, source/drain correction, and propagation. Defaults match ALIGN. |
@@ -247,14 +260,26 @@ Symmetric pairs must have matching models and parameters. Centered packing is a
 placement preference, not a guarantee of exact centering in a fixed boundary.
 
 Local validation checks names, fields, concrete dimensions, contradictory
-ordering cycles and conflicting port roles. **Check constraints** also runs
+ordering cycles and conflicting port roles. Use one enabled row for each
+circuit-wide boundary, aspect ratio, packing or compiler setting. For circuit
+spacing, use either one general row or separate horizontal and vertical rows;
+overlaps are rejected because ALIGN can overwrite earlier settings. A net's
+placement weight must likewise be set in only one enabled row.
+**Check constraints** also runs
 native combined checks when ALIGN is configured. Generation repeats native
 preflight before making primitives. These checks do not prove physical
 feasibility for generated geometry. These examples are also checked with ALIGN 0.9.8's parser,
 constraint verification and native placement-constraint translation. A successful
 export alone does not establish DRC, LVS, model-bin validity or generated geometry.
+Native-check results stay visible on **Placement**, separately from run status.
+Editing the inputs marks that check out of date; run **Check constraints** again.
 
 ## Bring sizes over from ROAR
+
+![Parameters tab, with shared symbols marked 1 and ROAR binding controls marked 2.](images/floorplan/parameters.png)
+
+**1** See which devices share each size. **2** Bind a ROAR value and specify its
+units and width convention; total W is divided by NF for the device's per-finger width.
 
 Use the **Sizing source** selector for the current design, a saved design, or
 the floorplan's captured sizes. The Parameters tab binds
@@ -361,14 +386,18 @@ understand them; **Details** shows all fields and explains support. **Duplicate*
 **Enable / Disable**, Undo, and Redo support trying alternatives. Disabled rows
 stay in the project and are omitted from native exports.
 
-`NetPriority`, `NetConst`, `MultiConnection`, `DoNotRoute`, `DoNotUseLib`, and
-`Route` have validated native export support without graphical forms. Routing
-settings only take effect when routing is run outside this placement-only flow.
+`NetConst`, `MultiConnection`, `DoNotRoute`, `DoNotUseLib`, and `Route` have native
+export support without graphical forms. Their fields are checked on import and
+export. `NetConst.criticality` weights placement wirelength; its shielding and
+the other routing settings take effect when routing is run outside this flow.
 `PlaceOnBoundary` is recognized by ALIGN but dropped by the C++ placer used here;
 it is not offered as an effective placement control. Generator configuration,
 grouping, guard rings, capacitor arrays, placement grids, and charge-flow data
 require additional backend/workflow support and remain preserved but unavailable
 for export here. Internal `AssignBboxVariables` is not a designer-facing option.
+Graphical library exclusion needs meaningful library choices and guidance;
+replacing a netlist while retaining rules/bindings and comparing historical
+runs are also deferred.
 
 The advanced **Load ALIGN constraints…** action checks supported rules before
 changing the floorplan. Rules with unsupported types or settings are retained

@@ -7,7 +7,6 @@ from pathlib import Path
 import platform
 import re
 import shutil
-import subprocess
 import tempfile
 
 from PyQt6.QtCore import QEvent, QProcess, QProcessEnvironment, QSettings, QTimer, QUrl, Qt
@@ -15,10 +14,10 @@ from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QPushButton, QSpinBox, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, run_options, validate_ota_project
+from .align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, project_fingerprint, run_options, validate_ota_project
 
 
 ACTIVE = {"starting", "generating", "serving", "stopping"}
@@ -36,25 +35,35 @@ def _plain_log(text):
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", text)
 
 
-def open_align_browser(url):
-    """Open only a ready loopback viewer URL, including the Windows WSL host."""
+def open_align_browser(url, parent=None):
+    """Return a desktop-open result or an asynchronous WSL browser helper."""
     if (url.scheme() != "http" or url.host() != "127.0.0.1"
             or not 1 <= url.port() <= 65535 or url.userName() or url.password()):
         return False
     if os.environ.get("WSL_INTEROP") or "microsoft" in platform.release().lower():
-        executable = shutil.which("wslview") or shutil.which("explorer.exe")
-        if executable is None:
-            executable = next((path for path in (
-                "/mnt/c/WINDOWS/explorer.exe", "/mnt/c/Windows/explorer.exe")
+        executable = shutil.which("wslview")
+        windows = executable is None
+        if windows:
+            executable = shutil.which("powershell.exe") or next((path for path in (
+                "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe",
+                "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
                 if Path(path).is_file()), None)
-        if executable:
-            try:
-                subprocess.Popen([executable, url.toString()], stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
-                return True
-            except OSError:
-                pass
+        if executable is None:
+            return False
+        # Explorer can open Documents instead of the URL under WSL. Ask Windows
+        # to use the HTTP association; keep the URL out of PowerShell source.
+        arguments = (["-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+                      "-Command", "$ErrorActionPreference = 'Stop'; "
+                      "Start-Process -FilePath ([Console]::In.ReadToEnd())"]
+                     if windows else [url.toString(QUrl.ComponentFormattingOption.FullyEncoded)])
+        process = QProcess(parent)
+        process.setStandardOutputFile(QProcess.nullDevice())
+        process.setStandardErrorFile(QProcess.nullDevice())
+        process.start(executable, arguments)
+        if windows:
+            process.write(url.toEncoded())
+        process.closeWriteChannel()
+        return process
     return QDesktopServices.openUrl(url)
 
 
@@ -129,6 +138,7 @@ class AlignSettingsDialog(QDialog):
         self.setMinimumWidth(660)
         self.config = None
         self._probe = None
+        self._probe_epoch = 0
         self.run_options = dict(PROFILE['run_defaults'], lambda_coeff=1.0)
         self.run_options.update(placement_options or {})
         layout = QVBoxLayout(self)
@@ -186,13 +196,41 @@ class AlignSettingsDialog(QDialog):
         self.python.setToolTip("Python executable from the separate ALIGN environment.")
         self.test_button = QPushButton('Test installation')
         self.test_button.clicked.connect(self.test_installation)
-        layout.addWidget(self.test_button)
+        checks = QHBoxLayout()
+        checks.addWidget(self.test_button)
+        help_button = QPushButton('Setup help…')
+        help_button.clicked.connect(self.show_setup_help)
+        checks.addWidget(help_button)
+        layout.addLayout(checks)
         self.error = _label()
+        self.error.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.error)
+        for field in (self.python, self.backend, self.run_root):
+            field.textChanged.connect(self._installation_changed)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+
+    def show_setup_help(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Set up ALIGN')
+        dialog.resize(740, 630)
+        layout = QVBoxLayout(dialog)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        browser.setMarkdown(Path(__file__).with_name('ALIGN_SETUP.md').read_text(encoding='utf-8'))
+        layout.addWidget(browser)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _installation_changed(self):
+        self._probe_epoch += 1
+        if self.error.text():
+            self.error.setText('Installation settings changed. Test installation again.')
 
     def test_installation(self):
         config = AlignConfig(self.python.text().strip(), self.backend.text().strip(), self.run_root.text().strip())
@@ -203,10 +241,12 @@ class AlignSettingsDialog(QDialog):
             return
         self.test_button.setEnabled(False)
         self.error.setText('Checking the separate ALIGN installation…')
+        epoch = self._probe_epoch
         def completed(result):
             self._probe = None
             self.test_button.setEnabled(True)
-            self.error.setText(_probe_text(result))
+            if epoch == self._probe_epoch:
+                self.error.setText(_probe_text(result))
         self._probe = _probe(self, config, completed)
 
     def done(self, result):
@@ -245,6 +285,7 @@ class PlacementRunDialog(QDialog):
         self.setWindowTitle("ALIGN placement")
         self.resize(820, 540)
         self._stop = stop
+        self._diagnostics = ''
         layout = QVBoxLayout(self)
         self.status = _label()
         layout.addWidget(self.status)
@@ -260,6 +301,9 @@ class PlacementRunDialog(QDialog):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(lambda: self._stop())
         buttons.addWidget(self.stop_button)
+        copy_button = QPushButton('Copy diagnostics')
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(self._diagnostics))
+        buttons.addWidget(copy_button)
         buttons.addStretch()
         self.close_button = QPushButton("Close")
         self.close_button.clicked.connect(self.close)
@@ -273,6 +317,9 @@ class PlacementRunDialog(QDialog):
         self.stop_button.setText("Stop ALIGN" if state.status == "serving" else "Cancel generation")
         self.close_button.setText("Stop and close" if state.status in ACTIVE else "Close")
         log = _plain_log(log)
+        # The authenticated browser URL is for local use, not support reports.
+        diagnostics = f'{text}\nRun folder: {state.run_dir}\nLog: {state.log_path}\n\nDisplayed log tail:\n{log}'
+        self._diagnostics = re.sub(r'([?&]token=)[^\s&"<>]+', r'\1[redacted]', diagnostics)
         if self.log.toPlainText() != log:
             scroll = self.log.verticalScrollBar()
             at_end, position = scroll.value() == scroll.maximum(), scroll.value()
@@ -305,9 +352,11 @@ class PlacementPanel(QWidget):
         self._constraint_probe = None
         self._constraint_directory = None
         self._probe_epoch = 0
+        self._checked_fingerprint = None
         self._runner_factory = runner_factory
         self._validator = validator
-        self._browser_opener = browser_opener or open_align_browser
+        self._browser_opener = browser_opener or (lambda url: open_align_browser(url, self))
+        self._browser_process = None
         self._settings = settings if settings is not None else QSettings("ROAR", "FloorplanALIGN")
         defaults = config or AlignConfig.from_environment()
         self.config = AlignConfig(
@@ -342,12 +391,19 @@ class PlacementPanel(QWidget):
         self.open_last_button = QPushButton("Open last placement")
         self.open_last_button.clicked.connect(lambda: self._guard(self.open_last))
         buttons.addWidget(self.open_last_button)
+        self.log_button = QPushButton('View last run / log…')
+        self.log_button.setEnabled(False)
+        self.log_button.clicked.connect(lambda: self._guard(self.show_last_run))
+        buttons.addWidget(self.log_button)
         self.settings_button = QPushButton("ALIGN settings…")
         self.settings_button.clicked.connect(lambda: self._guard(self.edit_settings))
         buttons.addWidget(self.settings_button)
         layout.addLayout(buttons)
         self.status = _label()
         layout.addWidget(self.status)
+        self.constraint_status = _label()
+        self.constraint_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.constraint_status)
         self.last_label = _label()
         layout.addWidget(self.last_label)
         layout.addStretch()
@@ -391,6 +447,7 @@ class PlacementPanel(QWidget):
         try:
             project = self._project_provider()
         except (ValueError, TypeError, KeyError) as exc:
+            self._invalidate_check(None)
             self._input_error = str(exc)
             runner = self._ensure_runner()
             self._apply_state(runner.last_run())
@@ -405,6 +462,7 @@ class PlacementPanel(QWidget):
                 self._poll_timer.start()
             return
         self._input_error = ""
+        self._invalidate_check(project)
         self.profile_label.setText("Layout technology: " + (
             PROFILE["technology"] if project.align_profile == PROFILE_ID else
             ("Unavailable backend" if project.align_profile else "None")))
@@ -438,6 +496,12 @@ class PlacementPanel(QWidget):
         self._view.show()
         self._view.raise_()
         self._view.activateWindow()
+
+    def show_last_run(self):
+        state = self._ensure_runner().last_run()
+        if state is not None:
+            self._show_view()
+            self._apply_state(state)
 
     def generate(self):
         if self._active():
@@ -481,6 +545,7 @@ class PlacementPanel(QWidget):
 
     def _apply_state(self, state):
         self._state = state
+        self.log_button.setEnabled(state is not None)
         if state is None:
             return
         labels = {"starting": "Starting ALIGN…", "generating": "Generating placement…",
@@ -496,12 +561,23 @@ class PlacementPanel(QWidget):
             text += " " + str(state.error)
         if self._open_when_ready and state.status == "serving" and state.url:
             self._open_when_ready = False
+            self._stop_browser_helper()
             try:
                 opened = self._browser_opener(QUrl(str(state.url)))
             except (OSError, ValueError, RuntimeError):
                 opened = False
-            if not opened:
+            if isinstance(opened, QProcess):
+                self._browser_process = opened
+            elif not opened:
                 self._browser_error = "Could not open the browser. Copy the viewer URL."
+        if self._browser_process is not None:
+            process = self._browser_process
+            if process.state() == QProcess.ProcessState.NotRunning:
+                if (process.error() == QProcess.ProcessError.FailedToStart
+                        or process.exitStatus() != QProcess.ExitStatus.NormalExit or process.exitCode() != 0):
+                    self._browser_error = "Could not open the browser. Copy the viewer URL."
+                process.deleteLater()
+                self._browser_process = None
         if state.status in ("failed", "stopped"):
             self._open_when_ready = False
         if self._browser_error:
@@ -509,7 +585,7 @@ class PlacementPanel(QWidget):
         self.status.setText(text)
         if self._view is not None:
             self._view.update_state(state, text, self._runner.log_tail())
-        if state.status not in ACTIVE:
+        if state.status not in ACTIVE and self._browser_process is None:
             self._poll_timer.stop()
 
     def _poll(self):
@@ -526,6 +602,7 @@ class PlacementPanel(QWidget):
 
     def stop(self):
         self._open_when_ready = False
+        self._stop_browser_helper()
         if self._managed and self._runner is not None and self._active() and self._state.status != "stopping":
             self._apply_state(self._runner.stop())
             self._poll_timer.start()
@@ -539,6 +616,7 @@ class PlacementPanel(QWidget):
         options = AlignSettingsDialog(self.config, project.align_profile, self._owner,
                                       technologies=technologies, placement_options=run_options(project))
         if options.exec() == QDialog.DialogCode.Accepted:
+            self._invalidate_check(None)
             self._profile_setter(options.profile.currentData())
             if self._run_options_setter is not None:
                 self._run_options_setter(options.run_options)
@@ -556,7 +634,6 @@ class PlacementPanel(QWidget):
     def check_native_constraints(self, project):
         """Optional native schema/solver check; basic editing needs no ALIGN."""
         if self._constraint_probe is not None:
-            self.status.setText('An ALIGN constraint check is already running…')
             return
         self.config.validate()
         directory = tempfile.TemporaryDirectory(prefix='roar-native-constraints-')
@@ -572,20 +649,33 @@ class PlacementPanel(QWidget):
             raise
         self._constraint_directory = directory
         epoch = self._probe_epoch
-        self.status.setText('Checking constraints with native ALIGN…')
+        self._checked_fingerprint = project_fingerprint(project)
+        self.constraint_status.setText('Checking constraints with native ALIGN…')
         def completed(result):
             self._constraint_probe = None
+            try:
+                self._invalidate_check(self._project_provider())
+            except (ValueError, TypeError, KeyError):
+                self._invalidate_check(None)
             if epoch == self._probe_epoch:
-                self.status.setText(_probe_text(result))
+                self.constraint_status.setText('Constraint check: ' + _probe_text(result))
             directory.cleanup()
             self._constraint_directory = None
         self._constraint_probe = _probe(self, self.config, completed, manifest=manifest)
+
+    def _invalidate_check(self, project):
+        if self._checked_fingerprint is not None and (project is None or
+                project_fingerprint(project) != self._checked_fingerprint):
+            self._probe_epoch += 1
+            self._checked_fingerprint = None
+            self.constraint_status.setText('Inputs changed. Run Check constraints again.')
 
     def shutdown(self, *_args):
         self._closing = True
         self._refresh_timer.stop()
         self._poll_timer.stop()
         self._open_when_ready = False
+        self._stop_browser_helper()
         self._probe_epoch += 1
         if self._constraint_probe is not None:
             self._constraint_probe.kill()
@@ -597,9 +687,21 @@ class PlacementPanel(QWidget):
         if self._view is not None:
             self._view.hide()
 
+    def _stop_browser_helper(self):
+        if self._browser_process is not None:
+            process = self._browser_process
+            self._browser_process = None
+            if process.state() == QProcess.ProcessState.NotRunning:
+                process.deleteLater()
+            else:
+                process.finished.connect(process.deleteLater)
+                process.kill()
+
     def project_changed(self):
         """Changing documents ends the old managed run; Save As uses saved_as."""
         self.shutdown()
+        self._checked_fingerprint = None
+        self.constraint_status.clear()
         self._runner = None
         self._runner_path = None
         self._state = None

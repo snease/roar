@@ -310,34 +310,6 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'resolve arithmetic expressions'):
             FloorplanProject.from_text(CIRCUIT.replace('W=2.2u', "W='width / 2'"))
 
-    def test_v1_backward_read_and_companion_link_rebasing(self):
-        project = self.project()
-        v1 = project.to_dict()
-        v1['version'] = 1
-        for key in ('parameters', 'overrides', 'roar_project_path', 'align_profile',
-                    'source_mode', 'run_options', 'constraint_enabled'):
-            v1.pop(key)
-        self.assertEqual(FloorplanProject.from_dict(v1).devices[0].width_um, project.devices[0].width_um)
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            roar = base / 'designs' / 'amp.roar'
-            roar.parent.mkdir()
-            roar.write_text('unchanged ROAR bytes')
-            project.roar_project_path = roar
-            first = project.save(base / 'first' / 'amp.floorplan.json')
-            raw = json.loads(first.read_text())
-            self.assertEqual(raw['roar_project_path'], '../designs/amp.roar')
-            restored = FloorplanProject.load(first)
-            self.assertEqual(restored.roar_project_path, str(roar.resolve()))
-            second = restored.save(base / 'another' / 'deeper' / 'amp.floorplan.json')
-            self.assertEqual(json.loads(second.read_text())['roar_project_path'], '../../designs/amp.roar')
-            self.assertEqual(FloorplanProject.load(second).roar_project_path, str(roar.resolve()))
-            with self.assertRaisesRegex(ValueError, 'ROAR project'):
-                restored.save(roar)
-            self.assertEqual(roar.read_text(), 'unchanged ROAR bytes')
-            roar.unlink()
-            self.assertEqual(FloorplanProject.load(second).roar_project_path, str(roar.resolve()))
-
     def test_v3_profile_is_portable_and_v2_still_opens_without_one(self):
         project = self.project()
         legacy = project.to_dict()

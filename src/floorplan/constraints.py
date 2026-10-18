@@ -30,6 +30,7 @@ KINDS = {
     'SameTemplate': ('Same device layout template', {'instances'}),
     'PortLocation': ('Port location', {'ports', 'location'}),
     'SymmetricNets': ('Net symmetry', {'net1', 'net2', 'pins1', 'pins2', 'direction'}),
+    'NetPriority': ('Net placement priority', {'nets', 'weight'}),
     'PowerPorts': ('Power ports', {'ports', 'propagate'}),
     'GroundPorts': ('Ground ports', {'ports', 'propagate'}),
     'ClockPorts': ('Clock ports', {'ports', 'propagate'}),
@@ -40,7 +41,7 @@ KINDS = {
 # These can be inspected and exported without a form. The current flow stops
 # before routing: routing rules are preserved for an external ALIGN continuation.
 EXPORT_FIELDS = {
-    'NetPriority': {'nets', 'weight'}, 'NetConst': {'nets', 'shield', 'criticality'},
+    'NetConst': {'nets', 'shield', 'criticality'},
     'MultiConnection': {'nets', 'multiplier'}, 'DoNotRoute': {'nets'},
     'DoNotUseLib': {'libraries', 'propagate'},
     'Route': {'min_layer', 'max_layer', 'customize'},
@@ -67,6 +68,7 @@ HELP = {
     'ConfigureCompiler': 'Control automatic circuit transformations. Defaults match ALIGN 0.9.8; changing these can alter grouping and generated layouts.',
     'DoNotIdentify': 'Prevent these devices from being combined into recognized circuit patterns. Other compiler transformations are controlled separately.',
     'ClockPorts': 'Mark clock nets so ALIGN excludes them from ordinary signal symmetry inference.',
+    'NetPriority': 'Give selected nets more weight in placement wirelength optimization. Larger weights favor shorter connections; this is a preference, not a length or matching guarantee. Unspecified nets have weight 1.',
 }
 
 
@@ -77,9 +79,11 @@ def capability_note(constraint):
     if kind in KINDS:
         return HELP.get(kind, 'Supported by the placement editor; native feasibility is checked by ALIGN.')
     if kind in EXPORT_FIELDS:
-        return ('Validated for native export; inspect fields here. Routing settings take effect only when routing is run outside this placement-only tool.'
-                if kind in ('Route', 'DoNotRoute', 'MultiConnection', 'NetConst') else
-                'Validated for native export; no graphical form is available for these fields yet.')
+        if kind == 'NetConst':
+            return 'Supported for native export; no graphical form. Criticality weights placement wirelength; shielding applies when routing is run outside this tool. Use Check constraints to validate these fields.'
+        return ('Supported for native export; inspect fields here and use Check constraints to validate them. Routing settings take effect only when routing is run outside this placement-only tool.'
+                if kind in ('Route', 'DoNotRoute', 'MultiConnection') else
+                'Supported for native export; no graphical form is available yet. Use Check constraints to validate these fields.')
     if kind == 'PlaceOnBoundary':
         return 'ALIGN recognizes this rule, but its C++ placer used here drops it. Preserve it disabled; use supported ordering/alignment constraints for this flow.'
     return 'No validated export support in this editor. Fields are preserved; disable this row to export the other constraints.'
@@ -289,12 +293,29 @@ def _check_combinations(constraints, row_numbers):
     """Reject obvious contradictions, without claiming physical feasibility."""
     graphs = {'horizontal': {}, 'vertical': {}}
     roles = {}
+    settings = {}
+
+    def reserve(key, row, remedy):
+        previous = settings.setdefault(key, row)
+        if previous != row:
+            raise ValueError(f'Constraints {previous} and {row}: overlapping {key} settings. {remedy}')
 
     def edge(direction, before, after, row):
         graphs[direction].setdefault(before.upper(), {})[after.upper()] = row
 
     for row, constraint in zip(row_numbers, constraints):
         kind = constraint['constraint']
+        if kind in ('Boundary', 'AspectRatio', 'CompactPlacement', 'ConfigureCompiler'):
+            reserve(kind, row, 'Keep one enabled row for this circuit-wide setting; combine its fields in that row.')
+        axes = {'BlockDistance': ('horizontal', 'vertical'),
+                'HorizontalDistance': ('horizontal',), 'VerticalDistance': ('vertical',)}
+        for axis in axes.get(kind, ()):
+            reserve(f'{axis} circuit spacing', row,
+                    'Use either one Circuit spacing row or separate Horizontal and Vertical circuit spacing rows. ALIGN can overwrite overlapping settings.')
+        if kind == 'NetPriority' or (kind == 'NetConst' and 'criticality' in constraint):
+            for net in constraint['nets']:
+                reserve(f'placement weight for net {net.upper()}', row,
+                        'Set each net’s placement weight in only one enabled NetPriority or NetConst row.')
         if kind in ('PowerPorts', 'GroundPorts', 'ClockPorts'):
             for port in constraint['ports']:
                 previous = roles.setdefault(port.upper(), (kind, row))

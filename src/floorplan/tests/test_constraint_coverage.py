@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from roar_api.floorplan import FloorplanProject
-from roar_api.floorplan.constraints import capability_note, net_pins
+from roar_api.floorplan.constraints import net_pins
 
 NETLIST = '''.subckt pair d1 d2 g s b
 M1 d1 g s b sky130_fd_pr__nfet_01v8 W=1u L=0.15u NF=2
@@ -26,6 +26,7 @@ CASES = [
     {'constraint': 'ClockPorts', 'ports': ['g'], 'propagate': False},
     {'constraint': 'DoNotIdentify', 'instances': ['M1']},
     {'constraint': 'ConfigureCompiler', 'merge_series_devices': False, 'merge_parallel_devices': False, 'auto_constraint': False},
+    {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 3},
 ]
 
 
@@ -45,7 +46,6 @@ class ConstraintCoverageTests(unittest.TestCase):
 
     def test_native_export_without_form_is_not_rejected_as_unknown(self):
         for rule in [
-            {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 2},
             {'constraint': 'NetConst', 'nets': ['d1'], 'shield': 's', 'criticality': 3},
             {'constraint': 'MultiConnection', 'nets': ['d1'], 'multiplier': 2},
             {'constraint': 'DoNotRoute', 'nets': ['s']},
@@ -127,10 +127,30 @@ class ConstraintCoverageTests(unittest.TestCase):
             with self.subTest(rule=rule), self.assertRaisesRegex(ValueError, 'Constraint 1'):
                 self.project.set_constraints([rule])
 
-    def test_dropped_placer_rule_is_explained(self):
-        note = capability_note({'constraint': 'PlaceOnBoundary'})
-        self.assertIn('C++', note)
-        self.assertIn('drops', note)
+    def test_native_overrides_are_rejected_in_both_orders_with_original_row_numbers(self):
+        pairs = [
+            ({'constraint': 'HorizontalDistance', 'abs_distance': 5000},
+             {'constraint': 'BlockDistance', 'abs_distance': 420}),
+            ({'constraint': 'VerticalDistance', 'abs_distance': 5000},
+             {'constraint': 'BlockDistance', 'abs_distance': 420}),
+            ({'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 3},
+             {'constraint': 'NetConst', 'nets': ['D1'], 'criticality': 1}),
+        ]
+        for kind in ('Boundary', 'AspectRatio', 'CompactPlacement', 'ConfigureCompiler',
+                     'BlockDistance', 'HorizontalDistance', 'VerticalDistance', 'NetPriority'):
+            rule = next((c for c in CASES if c['constraint'] == kind), {'constraint': kind})
+            pairs.append((rule, rule))
+        for first, second in pairs:
+            for rules in ([first, second], [second, first]):
+                with self.subTest(rules=rules), self.assertRaisesRegex(ValueError, 'Constraints 2 and 3: overlapping'):
+                    self.project.constraints = [{'constraint': 'FutureRule'}] + rules
+                    self.project.constraint_enabled = [False, True, True]
+                    self.project.validate()
+        self.project.set_constraints([
+            {'constraint': 'HorizontalDistance', 'abs_distance': 5000},
+            {'constraint': 'VerticalDistance', 'abs_distance': 420},
+        ])
+        self.project.validate()
 
 
 try:
@@ -162,6 +182,21 @@ class ConstraintFormTests(unittest.TestCase):
         editor = ConstraintEditorDialog(FloorplanProject.from_text(NETLIST), {'constraint': 'Boundary', 'max_width': 20})
         editor.accept()
         self.assertEqual(editor.constraint, {'constraint': 'Boundary', 'max_width': 20})
+        editor.deleteLater()
+
+    def test_net_priority_selects_circuit_nets_and_rejects_invalid_weights(self):
+        editor = ConstraintEditorDialog(FloorplanProject.from_text(NETLIST))
+        editor.kind.setCurrentIndex(editor.kind.findData('NetPriority'))
+        self.assertEqual({editor.names_editor.choice.itemText(i) for i in range(editor.names_editor.choice.count())}, {'D1', 'D2', 'G', 'S', 'B'})
+        editor.names_editor.choice.setCurrentText('D1')
+        editor.names_editor.add_name()
+        for value in ('-1', '1.5'):
+            editor.numbers['weight'][0].setText(value)
+            editor.accept()
+            self.assertIsNone(editor.constraint)
+        editor.numbers['weight'][0].setText('4')
+        editor.accept()
+        self.assertEqual(editor.constraint, {'constraint': 'NetPriority', 'nets': ['D1'], 'weight': 4})
         editor.deleteLater()
 
 

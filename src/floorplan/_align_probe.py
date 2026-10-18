@@ -33,9 +33,10 @@ def main():
         from align.compiler.util import get_generator
         if get_generator('MOSGenerator', backend) is None:
             raise ValueError('The selected backend cannot load its MOS generator')
+        worker = runpy.run_path(str(Path(__file__).with_name('_align_worker.py')))
+        worker['validate_viewer_assets']()
         if args.manifest:
             manifest = json.loads(Path(args.manifest).read_text())
-            worker = runpy.run_path(str(Path(__file__).with_name('_align_worker.py')))
             worker['native_preflight'](manifest)
             result['message'] = 'Native ALIGN schema and combined constraint checks passed. Placement may still be infeasible for the generated geometry.'
         else:
@@ -43,6 +44,12 @@ def main():
         result['ok'] = True
     except Exception as error:
         result['message'] = f'{type(error).__name__}: {error}'
+        if isinstance(error, ModuleNotFoundError):
+            result['message'] += '\nSelect the Python from the ALIGN environment and install its dependencies there; see Setup help in ALIGN settings.'
+        elif isinstance(error, ImportError):
+            result['message'] += '\nThe ALIGN environment could not load a required component. Check its native libraries and Python compatibility; see Setup help in ALIGN settings.'
+        elif not args.manifest:
+            result['message'] += '\nCheck the pinned versions and SKY130_PDK folder in Setup help, then test again.'
     print('ROAR_PROBE ' + json.dumps(result), flush=True)
     return 0 if result['ok'] else 1
 

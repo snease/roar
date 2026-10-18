@@ -59,7 +59,7 @@ def _serialized(method):
     @wraps(method)
     def guarded(self, *args, **kwargs):
         if (method.__name__ in {'last_run', 'last_placement', 'poll'} and self._run_dir is None
-                and (not self.config.run_root or not self._root.exists())):
+                and (not self.config.run_root or not self._root.is_dir())):
             return None
         with _ownership_lock(self._root):
             return method(self, *args, **kwargs)
@@ -165,9 +165,16 @@ class AlignConfig:
         for name, expected in PROFILE['backend_hashes'].items():
             path = backend / name
             if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-                raise ValueError(f'Backend does not match {PROFILE["backend_repository"]}@{PROFILE["backend_revision"]}: {name}')
+                raise ValueError(f'Backend does not match {PROFILE["backend_repository"]}@{PROFILE["backend_revision"]}: {name}. Select that revision’s SKY130_PDK subfolder; see Setup help in ALIGN settings.')
         if not self.run_root:
             raise ValueError('Select a directory for isolated ALIGN runs')
+        try:
+            root = Path(self.run_root).expanduser()
+            root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryFile(dir=root):
+                pass
+        except OSError as error:
+            raise ValueError(f'Cannot write to placement runs folder {self.run_root}: {error}. Choose a writable folder in ALIGN settings.') from error
         if type(self.port) is not int or not 0 <= self.port <= 65535:
             raise ValueError('ALIGN port must be 0 (automatic) or an integer in 1..65535')
 

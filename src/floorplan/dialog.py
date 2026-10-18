@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 
 from .model import FloorplanProject, _scalar
 from .constraint_editor import ConstraintEditorDialog, constraint_summary, editable_constraint
+from .constraints import FIELDS
 
 from .workspace import editor_signature, load_roar_design
 
@@ -88,7 +89,7 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
         candidate = FloorplanProject.from_dict(project.to_dict())
         candidate.source_mode = "saved"
         return candidate, None, None
-    if mode == "live":
+    def current_source():
         provider = workspace.snapshot if workspace is not None else snapshot_provider
         if provider is None:
             raise ValueError("The current ROAR design is unavailable.")
@@ -97,22 +98,28 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
         candidate.roar_project_path = workspace.path if workspace is not None else None
         candidate.source_mode = "live"
         return candidate, design, "live"
+    if mode == "live":
+        associated = project.roar_project_path
+        if workspace is None or not associated or (workspace.path and
+                Path(workspace.path).resolve() == Path(associated).expanduser().resolve()):
+            return current_source()
+        # A persisted live mode belongs to its saved design, not whichever
+        # design happens to be active when this floorplan is reopened.
+        path = associated
     if workspace is not None and workspace.path and Path(workspace.path).resolve() == Path(path).expanduser().resolve():
-        return _choose_source(parent, project, "live", "", workspace, snapshot_provider)
-    design = load_roar_design(path)
+        return current_source()
     if workspace is None:
+        design = load_roar_design(path)
         candidate = _refresh_source_bindings(project, design, "linked")
         candidate.roar_project_path = str(Path(path).expanduser().resolve())
         candidate.source_mode = "linked"
         return candidate, design, "linked"
     if workspace is not None:
         current = workspace.snapshot()
-        differs = editor_signature(current) != editor_signature(design)
-        same_path = workspace.path and Path(workspace.path).resolve() == Path(path).expanduser().resolve()
         from roar_api import Design
         has_current = editor_signature(current) != editor_signature(Design())
         choice = "switch"
-        if differs and has_current:
+        if has_current or workspace.path or workspace.is_modified():
             choice = _source_switch_choice(parent, workspace, path)
             if choice == "cancel":
                 return None
@@ -123,13 +130,13 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
                 _refresh_source_bindings(project, current, "live")
                 if not workspace.path and not _save_workspace(parent, workspace, path):
                     return None
-                return _choose_source(parent, project, "live", "", workspace, snapshot_provider)
+                return current_source()
         # Validate selected target mappings before any save or design switch.
+        design = load_roar_design(path)
         _refresh_source_bindings(project, design, "live")
         if choice == "save" and not _save_workspace(parent, workspace, path):
             return None
-        if differs or not same_path:
-            workspace.switch(path)
+        workspace.switch(path)
         design = workspace.snapshot()
         candidate = _refresh_source_bindings(project, design, "live")
         candidate.roar_project_path = workspace.path
@@ -159,7 +166,7 @@ class OpenFloorplanDialog(QDialog):
         row.addWidget(browse)
         form.addRow("Floorplan (.roar.floorplan):", row)
         self.source_mode = QComboBox()
-        for label, key in (("Current ROAR design", "live"), ("Saved ROAR file", "linked"), ("Captured sizes (no updates)", "saved")):
+        for label, key in (("Current ROAR design", "live"), ("Open another ROAR design…" if workspace else "Saved ROAR file", "linked"), ("Captured sizes (no updates)", "saved")):
             self.source_mode.addItem(label, key)
         form.addRow("Sizing source:", self.source_mode)
         row = QHBoxLayout()
@@ -245,6 +252,10 @@ class OpenFloorplanDialog(QDialog):
             message = "Associated ROAR file is missing; captured floorplan sizes are available."
         elif self._manual_design and self.design_path.text().strip() != self._suggested_design:
             message = "Association will change to the selected ROAR file."
+        if valid and mode == "linked" and self.workspace is not None:
+            message += " Opening this file changes the active ROAR design and keeps its sizes live. If already active, its current unsaved sizes are used."
+        elif valid and mode == "live" and self._suggested_design:
+            message += " A different active design requires a choice before any sizes or association change."
         self.link_status.setText(message)
         self.buttons.button(QDialogButtonBox.StandardButton.Open).setEnabled(valid)
 
@@ -264,7 +275,7 @@ class OpenFloorplanDialog(QDialog):
 class NetlistImportDialog(QDialog):
     """Choose the circuit and interpret source dimensions before importing."""
 
-    def __init__(self, path, parent=None, snapshot_available=False):
+    def __init__(self, path, parent=None, snapshot_available=False, *, workspace_available=False):
         super().__init__(parent)
         self.design = None
         self.setWindowTitle("Import SPICE netlist")
@@ -292,7 +303,9 @@ class NetlistImportDialog(QDialog):
         form.addRow("Netlist W is:", self.width_convention)
         self.source_mode = QComboBox()
         self.source_mode.addItem("No ROAR design", "none")
-        self.source_mode.addItem("Saved ROAR design (.roar)", "linked")
+        self.source_mode.addItem("Open another ROAR design…" if workspace_available else "Saved ROAR design (.roar)", "linked")
+        if workspace_available:
+            self.source_mode.setToolTip("Opening another design changes the active ROAR design and keeps its sizes live; an already active file uses its unsaved sizes.")
         if snapshot_available:
             self.source_mode.addItem("Current ROAR design", "live")
         form.addRow("Optional sizing source:", self.source_mode)
@@ -431,7 +444,7 @@ class FloorplanDialog(QDialog):
         source_bar = QHBoxLayout()
         source_bar.addWidget(QLabel("Sizing source:"))
         self.source_mode = QComboBox()
-        for label, key in (("Current ROAR design", "live"), ("Saved ROAR file", "linked"), ("Captured sizes (no updates)", "saved")):
+        for label, key in (("Current ROAR design", "live"), ("Open another ROAR design…" if workspace else "Saved ROAR file", "linked"), ("Captured sizes (no updates)", "saved")):
             self.source_mode.addItem(label, key)
         self.source_mode.setCurrentIndex(self.source_mode.findData("saved"))
         self.source_mode.activated.connect(self._source_selected)
@@ -1254,7 +1267,8 @@ class FloorplanDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(self, "Choose circuit netlist", initial_directory, "SPICE (*.sp *.spi *.cir *.spice);;All files (*)")
         if not path:
             return
-        options = NetlistImportDialog(path, self, snapshot_available=self.snapshot_provider is not None)
+        options = NetlistImportDialog(path, self, snapshot_available=self.snapshot_provider is not None,
+                                     workspace_available=self.workspace is not None)
         if options.exec() != QDialog.DialogCode.Accepted:
             options.deleteLater()
             return
@@ -1432,9 +1446,12 @@ class FloorplanDialog(QDialog):
             raise ValueError("Choose ALIGN placement rules (.const.json), not a ROAR design or netlist. This action loads only constraints.")
         # Unknown records remain visible and saved. Validate supported records
         # individually so opaque rows cannot block ordinary supported edits.
-        for constraint in constraints:
-            if editable_constraint(constraint):
-                candidate._validate_constraints([constraint])
+        def supported(constraint):
+            kind = constraint.get('constraint')
+            return isinstance(kind, str) and kind in FIELDS and not (set(constraint) - FIELDS[kind] - {'constraint'})
+        for row, constraint in enumerate(constraints, 1):
+            if supported(constraint):
+                candidate._validate_constraints([constraint], row_numbers=[row])
         question = QMessageBox(self)
         question.setWindowTitle("Load ALIGN constraints")
         question.setText(f"Load {len(constraints)} placement rules? Only constraints change; the circuit, sizes and ROAR design link stay the same.")
@@ -1448,6 +1465,11 @@ class FloorplanDialog(QDialog):
         candidate.constraints = (self.project.constraints + constraints if question.clickedButton() is add else constraints)
         candidate.constraint_enabled = (self.project.constraint_enabled + [True] * len(constraints)
                                         if question.clickedButton() is add else [True] * len(constraints))
+        checked = [(row, constraint) for row, (constraint, enabled) in
+                   enumerate(zip(candidate.constraints, candidate._constraint_flags()), 1)
+                   if enabled and supported(constraint)]
+        candidate._validate_constraints([constraint for _, constraint in checked],
+                                        row_numbers=[row for row, _ in checked])
         self.project = candidate
         self._render_constraints()
         self._record_edit()

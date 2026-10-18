@@ -401,7 +401,7 @@ class WorkerErrorTests(unittest.TestCase):
                 'werkzeug.serving': SimpleNamespace(make_server=server),
             }
             with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', activation]), \
-                    patch.object(_align_worker.signal, 'signal'), contextlib.redirect_stdout(io.StringIO()):
+                    patch.object(_align_worker.signal, 'signal'), patch.object(_align_worker, 'validate_viewer_assets'), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(_align_worker.main(), 0)
             self.assertNotEqual(captured['viewer'].token, activation)
             self.assertEqual(len(captured['viewer'].token), 64)
@@ -461,7 +461,7 @@ class WorkerErrorTests(unittest.TestCase):
                 'werkzeug.serving': SimpleNamespace(make_server=lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError(errno.EPERM, 'Operation not permitted'))),
             }
             with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', token]), \
-                    patch.object(_align_worker.signal, 'signal'), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    patch.object(_align_worker.signal, 'signal'), patch.object(_align_worker, 'validate_viewer_assets'), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(_align_worker.main(), 1)
             status = json.loads(path.with_name('status.json').read_text())
             self.assertEqual(status['status'], 'failed')
@@ -471,6 +471,18 @@ class WorkerErrorTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_missing_native_viewer_assets_explain_setup_repair(self):
+        from roar_api.floorplan._align_worker import validate_viewer_assets
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch.dict(sys.modules, {'align.gui.mockup': SimpleNamespace(__file__=str(base / 'mockup.py'))}):
+                with self.assertRaisesRegex(ValueError, 'viewer assets are missing.*Setup help'):
+                    validate_viewer_assets()
+                (base / 'assets').mkdir()
+                for name in ('00_from_codepen.css', '01_style.css', '02_typography.css', 'align.png'):
+                    (base / 'assets' / name).touch()
+                validate_viewer_assets()
+
     def test_unsupported_host_is_rejected_before_launch(self):
         with patch('roar_api.floorplan.align_runner.sys.platform', 'win32'):
             with self.assertRaisesRegex(ValueError, 'Linux or WSL'):
@@ -496,6 +508,15 @@ class ConfigTests(unittest.TestCase):
             with patch.dict(PROFILE, {'backend_hashes': hashes}):
                 config = AlignConfig(sys.executable, directory, str(base / 'runs'))
                 config.validate()
+                blocked = base / 'file-not-folder'
+                blocked.write_text('keep')
+                for root in (blocked, blocked / 'child'):
+                    with self.assertRaisesRegex(ValueError, 'Cannot write.*Choose a writable folder'):
+                        dataclasses.replace(config, run_root=str(root)).validate()
+                with patch('roar_api.floorplan.align_runner.tempfile.TemporaryFile', side_effect=PermissionError('denied')):
+                    with self.assertRaisesRegex(ValueError, 'Cannot write.*denied'):
+                        config.validate()
+                self.assertEqual(blocked.read_text(), 'keep')
                 (base / 'gen_param.py').write_text('changed')
                 with self.assertRaisesRegex(ValueError, 'Backend does not match'):
                     config.validate()

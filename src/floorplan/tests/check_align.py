@@ -46,9 +46,9 @@ CAPABILITIES = [
     {'constraint': 'ClockPorts', 'ports': ['g'], 'propagate': False},
     {'constraint': 'DoNotIdentify', 'instances': ['M1']},
     {'constraint': 'ConfigureCompiler', 'merge_series_devices': False, 'merge_parallel_devices': False, 'auto_constraint': False},
+    {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 2},
 ]
 EXPORT_ONLY = [
-    {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 2},
     {'constraint': 'NetConst', 'nets': ['d1'], 'shield': 's', 'criticality': 3},
     {'constraint': 'MultiConnection', 'nets': ['d1'], 'multiplier': 2},
     {'constraint': 'DoNotRoute', 'nets': ['s']},
@@ -131,6 +131,8 @@ for rule in CAPABILITIES + EXPORT_ONLY:
     kind = rule['constraint']
     if kind == 'PortLocation':
         assert mapped == [{'const_name': 'PortLocation', 'location': 'TC', 'terminal_name': 'D1'}]
+    elif kind == 'NetPriority':
+        assert mapped == [{'const_name': 'CritNet', 'net_name': 'D1', 'priority': 2}]
     elif kind == 'NetConst':
         assert mapped == [{'const_name': 'ShieldNet', 'net_name': 'D1', 'shield_net': 'S'},
                           {'const_name': 'CritNet', 'net_name': 'D1', 'priority': 3}]

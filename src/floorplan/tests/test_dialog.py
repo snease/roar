@@ -116,8 +116,6 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertEqual(self.dialog.project.constraints[3]["regions"], [["M1", "M2"], ["M3", "M4"]])
         self.assertEqual(self.dialog.constraints_table.item(6, 0).text(), "Power ports")
         self.assertIn("first grid port: d", self.dialog.constraints_table.item(6, 2).text())
-        self.assertFalse(hasattr(self.dialog, "constraints_json"))
-        self.assertFalse(hasattr(self.dialog, "_export_constraints"))
         self.dialog._collect_project().validate()
 
     def test_explicit_snapshot_mapping_and_total_width_conversion(self):
@@ -283,6 +281,18 @@ class FloorplanDialogTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "placement rules"):
                 self.dialog._import_constraints()
         self.assertIs(self.dialog.project, original)
+
+    def test_supported_native_imports_are_validated_without_a_form(self):
+        source = self.root / 'invalid.const.json'
+        before = self.dialog.project.to_dict()
+        for rule in ({'constraint': 'NetConst', 'nets': ['missing'], 'criticality': 3},
+                     {'constraint': 'DoNotUseLib', 'libraries': []},
+                     {'constraint': 'NetPriority', 'nets': ['d'], 'weight': -2}):
+            source.write_text(json.dumps([{'constraint': 'FutureRule'}, rule]))
+            with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(source), '')):
+                with self.assertRaisesRegex(ValueError, 'Constraint 2'):
+                    self.dialog._import_constraints()
+            self.assertEqual(self.dialog.project.to_dict(), before)
 
     def test_opaque_rows_survive_supported_edit_cancel_remove_and_save(self):
         opaque = {"constraint": "FutureConstraint", "value": {"nested": [1, "keep"]}}
@@ -698,14 +708,16 @@ class FloorplanDialogTests(unittest.TestCase):
         class Changes(QObject):
             changed = pyqtSignal()
         changes = Changes()
-        workspace = FakeWorkspace(self.design)
+        current = self.design.save(self.root / 'current.roar')
+        workspace = FakeWorkspace(self.design, current)
         dialog = FloorplanDialog(self.parent, workspace=workspace, source_changed_signals=(changes.changed,),
                                  placement_options={"settings": QSettings(str(self.root / "live.ini"), QSettings.Format.IniFormat), "config": AlignConfig("", "", str(self.root / "runs"))})
         project = self._bound_project()
         project.roar_project_path = str(self.root / "obsolete.roar")
         dialog.set_project(project)
-        dialog._read_roar()
-        self.assertIsNone(dialog.project.roar_project_path)
+        with patch('roar_api.floorplan.dialog._source_switch_choice', return_value='current'):
+            dialog._read_roar()
+        self.assertEqual(dialog.project.roar_project_path, str(current))
         self.assertEqual(dialog.project.parameter_rows[0]["binding"]["source"], "live")
         self.assertIsNone(dialog.project.parameter_rows[1]["binding"])
         dialog.show()
@@ -777,6 +789,32 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertEqual(options.source_origin, "live")
         self.assertEqual(workspace.switches, [])
         options.deleteLater()
+
+    def test_saved_live_source_requires_choice_before_rebinding_to_another_design(self):
+        linked = self.design.save(self.root / 'linked.roar')
+        current = self.design.save(self.root / 'current.roar')
+        project = self._bound_project()
+        project.roar_project_path = linked
+        project.source_mode = 'live'
+        sidecar = project.save(self.root / 'live.roar.floorplan')
+        workspace = FakeWorkspace(self.design, current)
+        # Identical sizes still do not make two design files interchangeable.
+        for changed_sizes in (False, True):
+            if changed_sizes:
+                workspace.design.set_instance_attribute('M1_2', 'W', 28e-6)
+                linked.unlink()  # Captured sizes remain available with a missing link.
+            options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
+            self.assertEqual(options.source_mode.currentData(), 'live')
+            with patch('roar_api.floorplan.dialog._source_switch_choice', return_value='cancel') as choose:
+                options.accept()
+            choose.assert_called_once()
+            self.assertIsNone(options.project)
+            with patch('roar_api.floorplan.dialog._source_switch_choice', return_value='saved'):
+                options.accept()
+            self.assertEqual(options.project.roar_project_path, str(linked))
+            self.assertEqual(options.project.devices[0].width_um, 2)
+            self.assertEqual(workspace.switches, [])
+            options.deleteLater()
 
     def test_open_conflict_cancel_save_cancel_discard_and_change_association(self):
         linked = self.root / "linked.roar"

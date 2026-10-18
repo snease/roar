@@ -57,6 +57,16 @@ class ProtectedViewer:
         return self.application(environ, secured_start)
 
 
+def validate_viewer_assets():
+    from align.gui.mockup import __file__ as viewer_module
+    assets = Path(viewer_module).with_name('assets')
+    missing = [name for name in ('00_from_codepen.css', '01_style.css', '02_typography.css', 'align.png')
+               if not (assets / name).is_file()]
+    if missing:
+        raise ValueError('ALIGN viewer assets are missing: ' + ', '.join(missing) +
+                         '. Complete the viewer-assets step in ALIGN settings → Setup help, then test installation again.')
+
+
 def native_preflight(manifest):
     """Use the installed native schema/solver before any primitive generation."""
     from align.schema.parser import SpiceParser
@@ -109,6 +119,7 @@ def main():
         from align.pnr import placer
         from align.gui.mockup import AppWithCallbacksAndState
         from werkzeug.serving import make_server
+        validate_viewer_assets()
 
         def native_gui(*, tagged_bboxes, module_name, lambda_coeff, port):
             # Upstream startup_gui prepares the real native metrics/geometries.

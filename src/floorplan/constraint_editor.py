@@ -32,7 +32,7 @@ def editable_constraint(constraint):
                 'ratio_low', 'ratio_high', 'weight', 'distance', 'abs_distance'):
         if key in constraint and (isinstance(constraint[key], bool) or not isinstance(constraint[key], (int, float)) or not math.isfinite(constraint[key])):
             return False
-    for key in ("instances", "ports", "pairs", "regions", "pins1", "pins2"):
+    for key in ("instances", "ports", "nets", "pairs", "regions", "pins1", "pins2"):
         if key not in constraint:
             continue
         values = constraint[key]
@@ -70,7 +70,7 @@ def constraint_summary(constraint):
         note = ('Imported fields preserved; no form supports these settings. Inspect Details or disable this row.'
                 if isinstance(kind, str) and kind in KINDS else capability_note(constraint))
         return title, json.dumps(fields, ensure_ascii=False), note
-    names = ", ".join(constraint.get("instances", constraint.get("ports", [])))
+    names = ", ".join(constraint.get("instances", constraint.get("ports", constraint.get("nets", []))))
     if kind == "SymmetricBlocks":
         names = "; ".join(" ↔ ".join(pair) if len(pair) > 1 else f"{pair[0]} (on axis)" if pair else "Empty group"
                           for pair in constraint.get("pairs", []))
@@ -100,6 +100,8 @@ def constraint_summary(constraint):
         settings += f"; {len(constraint.get('pins1', []))} matched pins"
     elif kind == 'PortLocation':
         settings = PORT_LOCATIONS.get(constraint.get('location'), 'Choose port region')
+    elif kind == 'NetPriority':
+        settings = f"Placement wirelength weight: {constraint.get('weight', 1)}"
     elif kind == 'Spread':
         settings = f"{constraint.get('distance', '?')} nm, {constraint.get('direction', '?')}"
     elif kind in ('BlockDistance', 'HorizontalDistance', 'VerticalDistance'):
@@ -436,11 +438,14 @@ class ConstraintEditorDialog(QDialog):
             self.option = self._choice('Shared symmetry axis:', [('Vertical (left / right)', 'V'), ('Horizontal (above / below)', 'H')], self.original.get('direction', 'V'))
         else:
             ports = kind in ("PowerPorts", "GroundPorts", 'ClockPorts', 'PortLocation')
-            key = "ports" if ports else "instances"
-            self.names_editor = NamesEditor(self.project.ports if ports else devices)
-            self.names_editor.set_names(self.original.get(key, [] if ports else self.selected_devices))
-            self.form.addRow("Ports in order:" if ports else "Devices in order:" if kind == "Order" else "Devices:", self.names_editor)
-            if kind == "Order":
+            nets = kind == 'NetPriority'
+            key = "ports" if ports else "nets" if nets else "instances"
+            self.names_editor = NamesEditor(self.project.ports if ports else sorted(net_pins(self.project)) if nets else devices)
+            self.names_editor.set_names(self.original.get(key, [] if ports or nets else self.selected_devices))
+            self.form.addRow("Ports in order:" if ports else "Nets:" if nets else "Devices in order:" if kind == "Order" else "Devices:", self.names_editor)
+            if nets:
+                self._number_field('weight', 'Placement wirelength weight (integer ≥ 0):', 1, integer=True)
+            elif kind == "Order":
                 self.option = self._choice("Direction:", [("Left to right", "left_to_right"), ("Top to bottom", "top_to_bottom")], self.original.get("direction", "left_to_right"))
                 self._flag("Devices touch (abut)", "abut")
                 self.names_editor.setToolTip("List order determines placement order. Adds no center or edge alignment.")
@@ -485,7 +490,7 @@ class ConstraintEditorDialog(QDialog):
         elif kind in ('Boundary', 'AspectRatio', 'BlockDistance', 'HorizontalDistance', 'VerticalDistance', 'ConfigureCompiler'):
             pass
         else:
-            result["ports" if kind in ("PowerPorts", "GroundPorts", 'ClockPorts', 'PortLocation') else "instances"] = self.names_editor.names()
+            result["ports" if kind in ("PowerPorts", "GroundPorts", 'ClockPorts', 'PortLocation') else "nets" if kind == 'NetPriority' else "instances"] = self.names_editor.names()
             if kind == "Order":
                 result["direction"] = self.option.currentData()
             elif kind == "Align":

@@ -4,12 +4,12 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
-    from PyQt6.QtCore import QSettings, QTimer, QUrl, Qt
+    from PyQt6.QtCore import QProcess, QSettings, QTimer, QUrl, Qt
     from PyQt6.QtTest import QTest
-    from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QWidget
+    from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QPushButton, QWidget
 except ImportError:
     QApplication = None
 
@@ -182,6 +182,47 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertIn(previous.run_dir, self.panel.open_last_button.toolTip())
         self.assertNotIn("failed-new-run", self.panel.open_last_button.toolTip())
 
+    def test_failed_run_log_can_be_reopened_and_copied_without_rerunning(self):
+        self.panel.generate()
+        runner = self.runners[-1]
+        runner.state = replace(runner.state, status='failed', error='Cannot place M1', can_stop=False)
+        self.panel.refresh()
+        self.panel._view.close()
+        self.assertFalse(self.panel.open_last_button.isEnabled())
+        self.assertTrue(self.panel.log_button.isEnabled())
+        with patch.object(runner, 'log_tail', return_value='Cannot place M1\nhttp://127.0.0.1:9001/?token=secret'):
+            self.panel.log_button.click()
+        self.assertTrue(self.panel._view.isVisible())
+        next(button for button in self.panel._view.findChildren(QPushButton)
+             if button.text() == 'Copy diagnostics').click()
+        report = QApplication.clipboard().text()
+        self.assertIn('Cannot place M1', report)
+        self.assertIn(runner.state.run_dir, report)
+        self.assertNotIn('secret', report)
+        self.assertEqual((runner.starts, runner.opens, self.opened), (1, 0, []))
+
+    def test_native_check_survives_run_polling_and_is_invalidated_by_edits(self):
+        self.panel.generate()
+        runner = self.runners[-1]
+        runner.serve()
+        self.panel._poll()
+        callbacks = []
+        def start(parent, config, completed, **kwargs):
+            callbacks.append(completed)
+            return Mock()
+        with patch('roar_api.floorplan.align_dialog._probe', side_effect=start):
+            self.panel.check_native_constraints(self.project)
+            callbacks[-1]({'ok': False, 'message': 'Rows 2 and 3 conflict'})
+            self.panel._poll()
+            self.assertIn('Rows 2 and 3 conflict', self.panel.constraint_status.text())
+            self.assertIn('Placement ready', self.panel.status.text())
+            self.panel.check_native_constraints(self.project)
+            self.project.set_constraints([{'constraint': 'NetPriority', 'nets': ['g'], 'weight': 3}])
+            self.panel.refresh()
+            callbacks[-1]({'ok': True, 'message': 'Native checks passed'})
+            self.assertIn('Inputs changed', self.panel.constraint_status.text())
+            self.assertNotIn('passed', self.panel.constraint_status.text())
+
     def test_invalid_draft_can_reopen_captured_placement(self):
         self.panel.generate()
         runner = self.runners[-1]
@@ -228,6 +269,11 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertTrue(dialog.test_button.isEnabled())
         self.assertIn('ALIGN 0.9.8', dialog.error.text())
         self.assertIn('Dash 2.18', dialog.error.text())
+        with patch('roar_api.floorplan.align_dialog._probe', side_effect=start):
+            dialog.test_installation()
+            dialog.python.setText('/different/python')
+            callbacks[-1]({'ok': True, 'message': 'Old installation is ready.'})
+        self.assertIn('settings changed', dialog.error.text())
         dialog.deleteLater()
 
     def test_profile_and_complete_input_gate_generation_and_missing_tools_are_actionable(self):
@@ -430,6 +476,26 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertIn("Copy the viewer URL", self.panel._view.status.text())
         self.assertEqual(self.panel._view.url.text(), "http://127.0.0.1:9001/")
 
+    def test_browser_helper_exit_failure_keeps_ready_url_and_does_not_retry(self):
+        process = Mock(spec=QProcess)
+        process.state.return_value = QProcess.ProcessState.Running
+        process.error.return_value = QProcess.ProcessError.UnknownError
+        process.exitStatus.return_value = QProcess.ExitStatus.NormalExit
+        process.exitCode.return_value = 1
+        opener = Mock(return_value=process)
+        self.panel._browser_opener = opener
+        self.panel.generate()
+        self.runners[-1].serve()
+        self.panel._poll()
+        self.assertNotIn("Could not open the browser", self.panel.status.text())
+        process.state.return_value = QProcess.ProcessState.NotRunning
+        self.panel._poll()
+        self.panel._poll()
+        self.assertIn("Copy the viewer URL", self.panel._view.status.text())
+        self.assertEqual(self.panel._view.url.text(), "http://127.0.0.1:9001/")
+        opener.assert_called_once()
+        process.deleteLater.assert_called_once()
+
     def test_start_failure_is_visible_in_the_open_run_window(self):
         with patch.object(self.runners[-1], "start", side_effect=ValueError("Worker could not start")):
             self.panel._guard(self.panel.generate)
@@ -441,26 +507,53 @@ class PlacementPanelTests(unittest.TestCase):
 
 @unittest.skipIf(QApplication is None, "PyQt6 GUI extra is not installed")
 class BrowserHelperTests(unittest.TestCase):
-    def test_wsl_uses_windows_helper_with_one_url_argument_and_no_shell(self):
+    def test_wsl_uses_windows_http_association_with_url_as_data(self):
+        url = QUrl("http://127.0.0.1:9001/?test=a%27%3B%24x&second=2")
+        executable = "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe"
         with patch("roar_api.floorplan.align_dialog.platform.release", return_value="microsoft-WSL2"), \
-             patch("roar_api.floorplan.align_dialog.shutil.which", side_effect=[None, "/mnt/c/WINDOWS/explorer.exe"]), \
-             patch("roar_api.floorplan.align_dialog.subprocess.Popen") as launch, \
+             patch("roar_api.floorplan.align_dialog.shutil.which", side_effect=[None, executable]), \
+             patch("roar_api.floorplan.align_dialog.QProcess") as launch, \
              patch("roar_api.floorplan.align_dialog.QDesktopServices.openUrl") as desktop:
-            self.assertTrue(open_align_browser(QUrl("http://127.0.0.1:9001/")))
-        self.assertEqual(launch.call_args.args[0], ["/mnt/c/WINDOWS/explorer.exe", "http://127.0.0.1:9001/"])
-        self.assertNotIn("shell", launch.call_args.kwargs)
+            self.assertIs(open_align_browser(url), launch.return_value)
+        process = launch.return_value
+        process.start.assert_called_once_with(executable, [
+            "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
+            "$ErrorActionPreference = 'Stop'; Start-Process -FilePath ([Console]::In.ReadToEnd())"])
+        process.write.assert_called_once_with(url.toEncoded())
+        process.closeWriteChannel.assert_called_once()
         desktop.assert_not_called()
 
-    def test_helper_failure_falls_back_to_qt_and_rejects_nonlocal_urls(self):
+    def test_wsl_uses_wslview_and_reports_missing_helpers(self):
+        url = QUrl("http://127.0.0.1:9001/")
         with patch("roar_api.floorplan.align_dialog.platform.release", return_value="microsoft-WSL2"), \
-             patch("roar_api.floorplan.align_dialog.shutil.which", return_value="/usr/bin/wslview"), \
-             patch("roar_api.floorplan.align_dialog.subprocess.Popen", side_effect=OSError("unavailable")), \
-             patch("roar_api.floorplan.align_dialog.QDesktopServices.openUrl", return_value=False) as desktop:
-            self.assertFalse(open_align_browser(QUrl("http://127.0.0.1:9001/")))
-            desktop.assert_called_once()
-        with patch("roar_api.floorplan.align_dialog.subprocess.Popen") as launch:
-            self.assertFalse(open_align_browser(QUrl("https://example.com/")))
-        launch.assert_not_called()
+             patch("roar_api.floorplan.align_dialog.shutil.which", return_value="/usr/bin/wslview") as which, \
+             patch("roar_api.floorplan.align_dialog.Path.is_file", return_value=False), \
+             patch("roar_api.floorplan.align_dialog.QProcess") as launch, \
+             patch("roar_api.floorplan.align_dialog.QDesktopServices.openUrl") as desktop:
+            self.assertIs(open_align_browser(url), launch.return_value)
+            launch.return_value.start.assert_called_once_with("/usr/bin/wslview", [url.toString()])
+            launch.return_value.write.assert_not_called()
+            launch.reset_mock()
+            which.return_value = None
+            self.assertFalse(open_align_browser(url))
+            launch.assert_not_called()
+            desktop.assert_not_called()
+
+    def test_desktop_handoff_and_rejection_of_nonlocal_or_credentialed_urls(self):
+        with patch.dict("os.environ", {"WSL_INTEROP": ""}), \
+             patch("roar_api.floorplan.align_dialog.platform.release", return_value="Linux"), \
+             patch("roar_api.floorplan.align_dialog.QProcess") as launch, \
+             patch("roar_api.floorplan.align_dialog.QDesktopServices.openUrl", return_value=True) as desktop:
+            url = QUrl("http://127.0.0.1:9001/")
+            self.assertTrue(open_align_browser(url))
+            desktop.assert_called_once_with(url)
+            desktop.reset_mock()
+            for value in ("https://example.com/", "file:///tmp/test", "http://127.0.0.1/",
+                          "http://user:pass@127.0.0.1:9001/"):
+                with self.subTest(url=value):
+                    self.assertFalse(open_align_browser(QUrl(value)))
+            desktop.assert_not_called()
+            launch.assert_not_called()
 
 
 if __name__ == "__main__":
