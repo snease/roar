@@ -1,76 +1,50 @@
-"""Run setup against disposable environments and mock installers, never host apt/pip."""
+"""Exercise Pixi bootstrap with local archives and mocks; never download/install."""
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-
-# Every Python and package-manager command is handled here. Unknown commands
-# fail closed, so a script change cannot accidentally invoke a real installer.
 MOCK_COMMAND = r'''
-import json, os, pathlib, sys
+import json, os, pathlib, shutil, sys
 executable, args = pathlib.Path(sys.argv[1]), sys.argv[2:]
 name = executable.name
 with open(os.environ['SETUP_LOG'], 'a') as output:
-    output.write(json.dumps({'executable': str(executable), 'args': args}) + '\n')
-
-def finish(stage):
-    if os.environ.get('FAIL_STAGE') == stage:
-        print('Mock failure: ' + stage, file=sys.stderr)
-        sys.exit(23)
-
-if name == 'sudo':
-    assert args[0] == 'apt-get', args
-    target = pathlib.Path(os.environ['SETUP_MOCK_BIN']) / 'apt-get'
-    os.execv(str(target), [str(target), *args[1:]])
-elif name == 'apt-get':
-    assert args[0] in ('update', 'install'), args
-    finish('apt-' + args[0])
-elif name == 'dpkg-query':
-    if args[-1] in os.environ.get('MISSING_PACKAGES', '').split():
-        sys.exit(1)
-    print('install ok installed')
-elif name.startswith('python'):
-    config = executable.parent.parent / 'pyvenv.cfg'
-    version = config.read_text().strip().split(' = ')[-1] if config.exists() else (
-        '3.11' if name == 'python3.11' else '3.10')
-    if args[:1] == ['-c']:
-        code = args[1]
-        if 'runpy.run_path' in code:
-            print('libegl1 libgl1')
-        elif code == 'import ensurepip':
-            sys.exit(int(os.environ.get('NO_ENSUREPIP', '0')))
-        elif 'sys.prefix == sys.base_prefix' in code:
-            sys.exit(int(os.environ.get('NOT_A_VENV', '0')))
-        elif 'sys.version_info' in code and 'raise SystemExit' in code:
-            sys.exit(int(os.environ.get('OLD_PYTHON', '0')))
-        elif 'sys.version_info' in code and 'print(' in code:
-            print(version)
-        else:
-            raise AssertionError(('Unexpected Python code', code))
-    elif args[:2] == ['-m', 'venv']:
-        finish('venv')
-        directory = pathlib.Path(args[2])
-        (directory / 'bin').mkdir(parents=True)
-        (directory / 'pyvenv.cfg').write_text('version = ' + version)
-        target = directory / 'bin' / 'python3'
-        target.write_text(executable.read_text())
-        target.chmod(0o755)
-    elif args[:3] == ['-m', 'pip', 'install']:
-        finish('dependencies' if '-e' in args else 'tools')
-    elif len(args) == 2 and args[0].endswith('/src/roar.py') and args[1] == '--check-gui':
-        finish('gui')
+    output.write(json.dumps({'command': name, 'args': args, 'cwd': os.getcwd(),
+        'environment': {key: os.environ.get(key) for key in ('VIRTUAL_ENV',
+            'PYTHONHOME', 'PYTHONPATH', 'LD_LIBRARY_PATH', 'LD_PRELOAD',
+            'ROAR_ALIGN_PYTHON', 'ROAR_ALIGN_PDK_FIXED', 'ROAR_MANAGED_RUNTIME',
+            'ROAR_HOME', 'QT_QPA_PLATFORM', 'PYTHONNOUSERSITE', 'QT_PLUGIN_PATH',
+            'QT_QPA_PLATFORM_PLUGIN_PATH')}}) + '\n')
+if name == 'uname':
+    print(os.environ.get('MOCK_SYSTEM', 'Linux') if args == ['-s']
+          else os.environ.get('MOCK_ARCH', 'x86_64'))
+elif name in ('curl', 'wget'):
+    if os.environ.get('FAIL_STAGE') == 'download':
+        sys.exit(7)
+    target = pathlib.Path(args[args.index('--output') + 1] if name == 'curl'
+        else next(value.split('=', 1)[1] for value in args if value.startswith('--output-document=')))
+    if os.environ.get('CORRUPT_DOWNLOAD'):
+        target.write_bytes(b'corrupted archive')
     else:
-        raise AssertionError(('Unexpected Python arguments', args))
+        shutil.copyfile(os.environ['MOCK_ARCHIVE'], target)
+elif name == 'pixi':
+    stage = args[args.index('--environment') + 1] if args[0] == 'install' else 'configure'
+    assert args[0] in ('install', 'run'), args
+    if os.environ.get('FAIL_STAGE') == stage:
+        sys.exit(23)
 else:
     raise AssertionError(('Unexpected command', name, args))
 '''
@@ -82,210 +56,211 @@ class SetupScriptTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='roar-setup-test-')
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
-        self.checkout = self.base / 'checkout with spaces'
+        self.checkout = self.base / 'checkout with spaces $ [literal]'
         (self.checkout / 'bin').mkdir(parents=True)
-        self.os_release = self.base / 'os-release'
-        self.os_release.write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        (self.checkout / 'pyproject.toml').write_text('# mock manifest\n')
+        (self.checkout / 'pixi.lock').write_text('# mock lock\n')
         self.script = self.checkout / 'bin' / 'setup_roar.sh'
-        # Replace only the OS metadata path in the disposable script; the real
-        # setup retains its OS-owned configuration and has no test-only override.
-        self.script.write_text((REPO_ROOT / 'bin' / 'setup_roar.sh').read_text().replace(
-            '/etc/os-release', shlex.quote(str(self.os_release))))
-        self.script.chmod(0o755)
+        self.source = (REPO_ROOT / 'bin' / 'setup_roar.sh').read_text()
         self.log = self.base / 'commands.jsonl'
         self.mock_bin = self.base / 'mockbin'
         self.mock_bin.mkdir()
         self.dispatcher = self.base / 'mock_command.py'
         self.dispatcher.write_text(MOCK_COMMAND)
-        self.wrapper = ('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' '
+        self.wrapper = ('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' -I -B '
                         + shlex.quote(str(self.dispatcher)) + ' "$0" "$@"\n')
-        for name in ('python3', 'python3.11', 'dpkg-query', 'sudo', 'apt-get'):
+        # This PATH has no real network clients, Python, pip, sudo, or apt.
+        for name in ('bash', 'cat', 'dirname', 'mkdir', 'mktemp', 'rm', 'mv', 'chmod', 'tar', 'gzip', 'sha256sum'):
+            executable = shutil.which(name)
+            if executable is None:
+                self.skipTest(f'Requires {name}')
+            (self.mock_bin / name).symlink_to(executable)
+        for name in ('uname', 'curl', 'wget'):
             self.make_executable(self.mock_bin / name)
+        self.archive = self.base / 'release.tar.gz'
+        self.make_archive()
         self.env = dict(os.environ)
-        for name in ('VIRTUAL_ENV', 'ROAR_HOME', 'PYTHONPATH', 'PYTHONHOME', 'BASH_ENV', 'ENV'):
+        for name in ('VIRTUAL_ENV', 'ROAR_HOME', 'PYTHONPATH', 'PYTHONHOME', 'BASH_ENV', 'ENV',
+                     'LD_LIBRARY_PATH', 'LD_PRELOAD'):
             self.env.pop(name, None)
-        self.env.update(PATH=str(self.mock_bin) + ':/usr/bin:/bin',
-                        SETUP_LOG=str(self.log), SETUP_MOCK_BIN=str(self.mock_bin),
-                        HOME=str(self.base))
+        self.env.update(PATH=str(self.mock_bin), SETUP_LOG=str(self.log), MOCK_ARCHIVE=str(self.archive))
 
-    def make_executable(self, path):
+    def make_executable(self, path, content=None):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.wrapper)
+        path.write_text(self.wrapper if content is None else content)
         path.chmod(0o755)
         return path
 
-    def make_environment(self, path, *, version='3.11'):
-        executable = self.make_executable(path / 'bin' / 'python3')
-        (path / 'pyvenv.cfg').write_text('version = ' + version)
-        return executable
+    @property
+    def pixi(self):
+        return self.checkout / '.pixi' / 'bin' / 'pixi'
 
-    def run_setup(self, *args, answer=None):
-        if answer is None:
-            return subprocess.run([str(self.script), *args], cwd=self.base, env=self.env,
-                                  stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
-        master, slave = os.openpty()
-        try:
-            os.write(master, (answer + '\n').encode())
-            return subprocess.run([str(self.script), *args], cwd=self.base, env=self.env,
-                                  stdin=slave, capture_output=True, text=True, timeout=15)
-        finally:
-            os.close(master)
-            os.close(slave)
+    def make_archive(self, *, binary=None, include_pixi=True, extra_members=()):
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            members = list(extra_members)
+            if include_pixi:
+                members.append(('pixi', (self.wrapper if binary is None else binary).encode()))
+            for name, data in members:
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                archive.addfile(member, io.BytesIO(data))
+        # Only the disposable script's expected digests change. Verification and
+        # extraction use real sha256sum/tar against the local fixture archive.
+        source = re.sub(r'(?m)^pixi_archive_sha256=[a-f0-9]+$',
+                        'pixi_archive_sha256=' + hashlib.sha256(self.archive.read_bytes()).hexdigest(), self.source)
+        source = re.sub(r'(?m)^pixi_binary_sha256=[a-f0-9]+$',
+                        'pixi_binary_sha256=' + hashlib.sha256(self.wrapper.encode()).hexdigest(), source)
+        self.script.write_text(source)
+        self.script.chmod(0o755)
 
-    def calls(self):
-        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+    def run_setup(self, *args):
+        return subprocess.run([str(self.script), *args], cwd=self.base, env=self.env,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
 
-    def named_calls(self, name):
-        return [call for call in self.calls() if Path(call['executable']).name == name]
+    def calls(self, command=None):
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return [call for call in calls if call['command'] == command] if command else calls
 
-    def test_help_and_bad_arguments_do_not_run_installers(self):
-        for args, code in ((['--help'], 0), (['--python'], 1), (['--unknown'], 1)):
+    def assert_no_temporary_downloads(self):
+        self.assertEqual(list((self.checkout / '.pixi' / 'bin').glob('.download.*')), [])
+
+    def test_help_and_obsolete_arguments_do_not_run_any_tools(self):
+        for args, code in ((['--help'], 0), (['--python', 'python3.11'], 1),
+                           (['--skip-system-packages'], 1), (['--unknown'], 1)):
             with self.subTest(args=args):
                 result = self.run_setup(*args)
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertEqual(self.calls(), [])
-        self.assertFalse((self.checkout / '.venv').exists())
+                if args[0] in ('--python', '--skip-system-packages'):
+                    self.assertIn('obsolete', result.stderr)
+        self.assertFalse((self.checkout / '.pixi').exists())
 
-    def test_selected_python_creates_environment_and_installs_only_through_it(self):
-        chosen = self.mock_bin / 'python3.11'
-        result = self.run_setup('--skip-system-packages', '--python', str(chosen))
+    def test_verified_download_installs_both_locked_environments_then_configures(self):
+        result = self.run_setup()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        environment = self.checkout / '.venv'
-        interpreter = str(environment / 'bin' / 'python3')
-        calls = self.calls()
-        creation = [call for call in calls if call['args'][:2] == ['-m', 'venv']]
-        self.assertEqual(creation, [{'executable': str(chosen), 'args': ['-m', 'venv', str(environment)]}])
-        self.assertEqual((environment / 'pyvenv.cfg').read_text(), 'version = 3.11')
-        self.assertIn('Using Python 3.11', result.stdout)
-        pip = [call for call in calls if call['args'][:2] == ['-m', 'pip']]
-        self.assertEqual(len(pip), 2)
-        self.assertTrue(all(call['executable'] == interpreter for call in pip))
-        self.assertEqual(pip[-1]['args'], ['-m', 'pip', 'install', '-e', str(self.checkout) + '[gui]'])
-        self.assertEqual(calls[-1], {'executable': interpreter,
-                                    'args': [str(self.checkout / 'src' / 'roar.py'), '--check-gui']})
-        self.assertTrue(all(Path(call['executable']).name.startswith('python') for call in calls))
+        self.assertEqual(self.pixi.read_text(), self.wrapper)
+        self.assertTrue(os.access(self.pixi, os.X_OK))
+        download = self.calls('curl')[0]['args']
+        self.assertEqual(download[0], '-q')
+        self.assertIn('--proto-redir', download)
+        self.assertEqual(download[-1], 'https://github.com/prefix-dev/pixi/releases/download/v0.75.0/pixi-x86_64-unknown-linux-musl.tar.gz')
+        calls = self.calls('pixi')
+        expected = ['install', '--no-config', '--manifest-path', str(self.checkout / 'pyproject.toml'), '--locked', '--environment']
+        self.assertEqual(calls[0]['args'], [*expected, 'default'])
+        self.assertEqual(calls[1]['args'], [*expected, 'align'])
+        self.assertEqual(calls[2]['args'], ['run', '--no-config', '--manifest-path',
+            str(self.checkout / 'pyproject.toml'), '--environment', 'default', '--offline',
+            '--locked', '--no-install', '--executable', 'python', str(self.checkout / 'bin' / 'configure_runtime.py')])
+        self.assert_no_temporary_downloads()
 
-    def test_active_environment_takes_precedence_and_preserves_python_311(self):
-        self.make_environment(self.checkout / '.venv', version='3.10')
-        active = self.base / 'CAD environment with spaces'
-        interpreter = self.make_environment(active)
-        original_config = (active / 'pyvenv.cfg').read_bytes()
-        self.env['VIRTUAL_ENV'] = str(active)
-        result = self.run_setup('--skip-system-packages')
+    def test_wget_fallback_still_verifies_and_uses_https_only(self):
+        (self.mock_bin / 'curl').unlink()
+        result = self.run_setup()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Using Python 3.11', result.stdout)
-        self.assertTrue(all(call['executable'] == str(interpreter) for call in self.calls()))
-        self.assertFalse(any(call['args'][:2] == ['-m', 'venv'] for call in self.calls()))
-        self.assertEqual((active / 'pyvenv.cfg').read_bytes(), original_config)
+        self.assertIn('--https-only', self.calls('wget')[0]['args'])
+        self.assertIn('--no-config', self.calls('wget')[0]['args'])
+        self.assertEqual(len(self.calls('pixi')), 3)
 
-    def test_python_option_never_replaces_an_existing_environment(self):
-        environment = self.checkout / '.venv'
-        self.make_environment(environment)
-        original_config = (environment / 'pyvenv.cfg').read_bytes()
-        result = self.run_setup('--python', 'python3.11', '--skip-system-packages')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('Omit --python to reuse it', result.stderr)
-        self.assertEqual(self.calls(), [])
-        self.assertEqual((environment / 'pyvenv.cfg').read_bytes(), original_config)
+    def test_existing_verified_binary_reused_without_downloading_or_replacing(self):
+        self.make_executable(self.pixi)
+        original = self.pixi.stat()
+        result = self.run_setup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.calls('curl'))
+        self.assertFalse(self.calls('wget'))
+        self.assertEqual(self.pixi.stat().st_ino, original.st_ino)
+        self.assertEqual(self.pixi.stat().st_mtime_ns, original.st_mtime_ns)
 
-    def test_missing_active_environment_and_incomplete_directory_are_not_replaced(self):
-        self.env['VIRTUAL_ENV'] = str(self.base / 'missing active environment')
-        result = self.run_setup('--skip-system-packages')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('active VIRTUAL_ENV does not exist', result.stderr)
-        self.env.pop('VIRTUAL_ENV')
-        (self.checkout / '.venv').mkdir()
-        result = self.run_setup('--skip-system-packages')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('not a usable virtual environment', result.stderr)
-        self.assertEqual(self.calls(), [])
-
-    def test_old_python_and_false_virtual_environment_fail_before_pip(self):
-        self.env['OLD_PYTHON'] = '1'
-        result = self.run_setup('--skip-system-packages')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('Python 3.10 or newer', result.stderr)
-        self.assertEqual(len(self.calls()), 1)
-        self.env.pop('OLD_PYTHON')
-        self.env['NOT_A_VENV'] = '1'
-        self.make_environment(self.checkout / '.venv')
-        result = self.run_setup('--skip-system-packages')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('not running in a virtual environment', result.stderr)
-        self.assertFalse(any(call['args'][:2] in (['-m', 'pip'], ['-m', 'venv']) for call in self.calls()))
-
-    def test_missing_native_packages_noninteractive_prints_commands_without_installing(self):
-        self.env['MISSING_PACKAGES'] = 'libegl1'
+    def test_unexpected_existing_binary_is_not_executed_or_overwritten(self):
+        self.make_executable(self.pixi, 'unrecognized local binary')
         result = self.run_setup()
         self.assertEqual(result.returncode, 1)
-        self.assertIn('sudo apt-get update', result.stdout)
-        self.assertIn('sudo apt-get install libegl1', result.stdout)
-        self.assertIn('Run setup interactively', result.stderr)
-        self.assertFalse(self.named_calls('sudo'))
-        self.assertFalse(self.named_calls('apt-get'))
-        self.assertFalse((self.checkout / '.venv').exists())
+        self.assertIn('has not been replaced', result.stderr)
+        self.assertEqual(self.pixi.read_text(), 'unrecognized local binary')
+        self.assertFalse(self.calls('pixi'))
+        self.assertFalse(self.calls('curl'))
 
-    def test_missing_ensurepip_requests_the_selected_pythons_venv_package(self):
-        self.env.update(NO_ENSUREPIP='1', MISSING_PACKAGES='python3.11-venv')
-        result = self.run_setup('--python', 'python3.11')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('sudo apt-get install python3.11-venv', result.stdout)
-        self.assertFalse(self.named_calls('sudo'))
-        self.assertFalse(self.named_calls('apt-get'))
-
-    def test_satisfied_native_packages_and_rolling_os_need_no_apt(self):
-        for release in ('ID=ubuntu\nVERSION_ID=22.04\n', 'ID=arch\n'):
-            with self.subTest(release=release):
-                self.os_release.write_text(release)
+    def test_download_and_checksum_failures_never_execute_or_leave_a_binary(self):
+        for failure in ('download', 'checksum'):
+            with self.subTest(failure=failure):
+                self.env['FAIL_STAGE'] = 'download' if failure == 'download' else ''
+                self.env['CORRUPT_DOWNLOAD'] = '1' if failure == 'checksum' else ''
                 result = self.run_setup()
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertFalse(self.named_calls('apt-get'))
-                self.assertFalse(self.named_calls('sudo'))
-                self.assertEqual(self.calls()[-1]['args'][-1], '--check-gui')
-                self.log.unlink()
-                shutil.rmtree(self.checkout / '.venv')
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('download Pixi' if failure == 'download' else 'archive checksum mismatch', result.stderr)
+                self.assertFalse(self.pixi.exists())
+                self.assertFalse(self.calls('pixi'))
+                self.assert_no_temporary_downloads()
 
-    def test_each_python_failure_stops_before_later_steps(self):
-        for stage in ('venv', 'tools', 'dependencies', 'gui'):
+    def test_wrong_or_missing_archive_executable_is_never_installed(self):
+        for include_pixi in (True, False):
+            with self.subTest(include_pixi=include_pixi):
+                self.make_archive(binary='unexpected executable', include_pixi=include_pixi)
+                result = self.run_setup()
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('executable checksum mismatch' if include_pixi else 'Could not unpack', result.stderr)
+                self.assertFalse(self.pixi.exists())
+                self.assertFalse(self.calls('pixi'))
+                self.assert_no_temporary_downloads()
+
+    def test_archive_members_are_not_extracted_as_paths(self):
+        escaped = self.base / 'should-not-exist'
+        self.make_archive(extra_members=((str(escaped), b'absolute member'),
+                                         ('../../should-not-exist', b'traversal member')))
+        result = self.run_setup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(escaped.exists())
+        self.assertFalse((self.checkout / '.pixi' / 'should-not-exist').exists())
+        self.assert_no_temporary_downloads()
+
+    def test_install_failures_stop_before_later_environment_or_configuration(self):
+        self.make_executable(self.pixi)
+        for stage, expected_calls in (('default', 1), ('align', 2), ('configure', 3)):
             with self.subTest(stage=stage):
                 self.env['FAIL_STAGE'] = stage
-                result = self.run_setup('--skip-system-packages')
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn('Mock failure: ' + stage, result.stderr)
-                self.assertNotIn('Setup check passed', result.stdout)
-                final = self.calls()[-1]['args']
-                if stage == 'venv':
-                    self.assertEqual(final[:2], ['-m', 'venv'])
-                elif stage == 'tools':
-                    self.assertEqual(final[:4], ['-m', 'pip', 'install', '--upgrade'])
-                elif stage == 'dependencies':
-                    self.assertEqual(final[:4], ['-m', 'pip', 'install', '-e'])
-                else:
-                    self.assertEqual(final[-1], '--check-gui')
+                result = self.run_setup()
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(len(self.calls('pixi')), expected_calls)
+                self.assertNotIn('Setup passed', result.stdout)
                 self.log.unlink()
-                shutil.rmtree(self.checkout / '.venv', ignore_errors=True)
 
-    def test_interactive_approval_and_apt_failures_gate_python_installation(self):
-        self.env['MISSING_PACKAGES'] = 'libegl1'
-        for answer, stage in (('n', ''), ('y', 'apt-update'), ('yes', 'apt-install'), ('y', '')):
-            with self.subTest(answer=answer, stage=stage):
-                self.env['FAIL_STAGE'] = stage
-                result = self.run_setup(answer=answer)
-                approved = answer != 'n'
-                succeeded = approved and not stage
-                self.assertEqual(result.returncode, 0 if succeeded else 1, result.stdout + result.stderr)
-                apt = [call['args'] for call in self.named_calls('apt-get')]
-                expected = [] if not approved else [['update']]
-                if approved and stage != 'apt-update':
-                    expected.append(['install', '-y', '--no-install-recommends', 'libegl1'])
-                self.assertEqual(apt, expected)
-                self.assertEqual((self.checkout / '.venv').exists(), succeeded)
-                if succeeded:
-                    self.assertEqual(self.calls()[-1]['args'][-1], '--check-gui')
-                else:
-                    self.assertFalse(any(call['args'][:2] == ['-m', 'pip'] for call in self.calls()))
-                self.log.unlink()
-                shutil.rmtree(self.checkout / '.venv', ignore_errors=True)
+    def test_managed_commands_ignore_old_runtime_environment_but_preserve_display_override(self):
+        inherited = ('VIRTUAL_ENV', 'PYTHONHOME', 'PYTHONPATH', 'LD_LIBRARY_PATH',
+                     'ROAR_ALIGN_PYTHON', 'ROAR_ALIGN_PDK_FIXED', 'ROAR_MANAGED_RUNTIME',
+                     'QT_PLUGIN_PATH', 'QT_QPA_PLATFORM_PLUGIN_PATH')
+        self.env.update({key: '/old/runtime' for key in inherited})
+        self.env.update(LD_PRELOAD='', ROAR_HOME='/old/checkout', QT_QPA_PLATFORM='xcb')
+        result = self.run_setup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for call in self.calls('pixi'):
+            for key in (*inherited, 'LD_PRELOAD'):
+                self.assertIsNone(call['environment'][key], key)
+            self.assertEqual(call['environment']['ROAR_HOME'], str(self.checkout))
+            self.assertEqual(call['environment']['QT_QPA_PLATFORM'], 'xcb')
+            self.assertEqual(call['environment']['PYTHONNOUSERSITE'], '1')
+
+    def test_missing_lock_and_unsupported_platform_fail_before_download(self):
+        self.env['MOCK_ARCH'] = 'aarch64'
+        result = self.run_setup()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Linux x86_64', result.stderr)
+        self.env.pop('MOCK_ARCH')
+        (self.checkout / 'pixi.lock').unlink()
+        result = self.run_setup()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('missing pyproject.toml or pixi.lock', result.stderr)
+        self.assertFalse(self.calls('curl'))
+        self.assertFalse((self.checkout / '.pixi').exists())
+
+    def test_managed_directory_symlink_is_not_followed(self):
+        elsewhere = self.base / 'other installation'
+        elsewhere.mkdir()
+        (self.checkout / '.pixi').symlink_to(elsewhere, target_is_directory=True)
+        result = self.run_setup()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('is a symlink', result.stderr)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertFalse(self.calls('curl'))
 
 
 if __name__ == '__main__':

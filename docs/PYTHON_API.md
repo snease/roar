@@ -8,10 +8,26 @@ newer** is required. Its implementation is in [roar_api/design.py](../roar_api/d
 
 ## Installation, imports, and assets
 
-From a checkout and an activated Python environment, install the headless API
-with `python3 -m pip install -e .`. For the desktop, use `./bin/setup_roar.sh`;
-it installs the GUI extra and checks native dependencies and display access.
-See [INSTALLATION_AND_USAGE.md](INSTALLATION_AND_USAGE.md) for setup options.
+For the desktop and its managed Python 3.11 runtime, run `./bin/setup_roar.sh`
+then `./bin/roar` from the checkout. Setup uses Pixi to install locked Python
+and native dependencies, with a separate Python 3.10 environment for ALIGN.
+Run your own API script in the managed ROAR environment with:
+
+```sh
+./.pixi/bin/pixi run --offline --locked --no-install -e default --executable python my_script.py
+```
+
+This supplies the API's Python and native dependencies. The managed ALIGN path
+configuration is supplied by `./bin/roar`; scripts that launch the floorplanner
+directly must provide their ALIGN configuration separately.
+
+For a headless or independently managed Python environment, the package remains
+installable with `python3 -m pip install -e .`; add `.[gui]` for live Qt operations
+and provide the required native libraries separately. Python 3.11 compatibility
+remains required. The managed `bin/roar` launcher always selects its own runtime;
+use your environment's `python3 -m roar_api` to launch a manual installation.
+See [INSTALLATION_AND_USAGE.md](INSTALLATION_AND_USAGE.md) for requirements,
+diagnostics and the manual fallback.
 
 ```python
 from pathlib import Path

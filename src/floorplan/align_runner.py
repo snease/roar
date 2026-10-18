@@ -27,6 +27,33 @@ _LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
 
 
+def managed_installation(settings):
+    """Legacy saved paths cannot silently replace the bundled installation."""
+    custom = str(settings.get('custom_installation', False)).lower() in ('true', '1')
+    return os.environ.get('ROAR_MANAGED_RUNTIME') == '1' and not custom
+
+
+def align_process_environment(python):
+    """Keep the GUI's native libraries out of the isolated ALIGN worker.
+
+    A custom installation owns its own runtime. Only the bundled interpreter
+    gets the managed ALIGN prefix; do not infer a library path from user input.
+    """
+    environment = dict(os.environ)
+    for name in ('ALIGN_HOME', 'PYTHONPATH', 'PYTHONHOME'):
+        environment.pop(name, None)
+    if environment.get('ROAR_MANAGED_RUNTIME') == '1':
+        for name in ('LD_LIBRARY_PATH', 'LD_PRELOAD', 'CONDA_PREFIX', 'CONDA_DEFAULT_ENV', 'VIRTUAL_ENV'):
+            environment.pop(name, None)
+        managed = environment.get('ROAR_ALIGN_PYTHON', '')
+        if managed and Path(python).expanduser().absolute() == Path(managed).absolute():
+            prefix = Path(managed).parent.parent
+            environment['LD_LIBRARY_PATH'] = str(prefix / 'lib')
+            environment['CONDA_PREFIX'] = str(prefix)
+            environment['PATH'] = str(prefix / 'bin') + os.pathsep + os.defpath
+    return environment
+
+
 @contextmanager
 def _ownership_lock(root):
     """Serialize index changes across processes, including unpublished PIDs."""
@@ -201,6 +228,15 @@ class AlignConfig:
         state = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local' / 'state'))
         return cls(os.environ.get(PROFILE['python_environment'], ''),
                    os.environ.get(PROFILE['backend_environment'], ''), str(state / 'roar' / 'align' / 'runs'))
+
+    @classmethod
+    def from_settings(cls, settings, defaults=None):
+        managed = defaults is None and managed_installation(settings)
+        defaults = defaults or cls.from_environment()
+        return cls(
+            defaults.python if managed else str(settings.get('python', defaults.python)),
+            defaults.backend_path if managed else str(settings.get('backend_path', defaults.backend_path)),
+            str(settings.get('run_root', defaults.run_root)), defaults.port)
 
     def validate(self):
         if sys.platform != 'linux':
@@ -584,10 +620,7 @@ class AlignRunner:
         self._remember(manifest, operation=True)
         command = [active['python'], '-I', '-u', str(Path(__file__).with_name('_align_worker.py').resolve()),
                    '--manifest', str(self._run_dir / 'run.json'), '--token', token]
-        environment = dict(os.environ)
-        environment.pop('ALIGN_HOME', None)
-        environment.pop('PYTHONPATH', None)
-        environment.pop('PYTHONHOME', None)
+        environment = align_process_environment(self.config.python)
         try:
             with (self._run_dir / 'align.log').open('ab') as stream:
                 self._process = subprocess.Popen(command, cwd=self._run_dir, env=environment,

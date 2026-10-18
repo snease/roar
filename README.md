@@ -6,21 +6,24 @@ The Robust and Optimal Analog Reuse (ROAR) flow/tool is developed to enable a GU
 
 ## Requirements
 
-- **Python 3.10** or newer
-- **Bash** for the setup script
-- A Linux desktop environment with Qt/OpenGL system libraries
+- Linux x86-64, targeting glibc 2.28 or newer and kernel 4.18 or newer
+- Bash, `curl` or `wget`, `tar`, `gzip` and `sha256sum`; network access during setup
+- A working desktop display and graphics driver, including WSLg when using WSL2
+
+The managed runtime has been exercised on Ubuntu 22.04 under WSLg. Other Linux
+distributions meeting these requirements are targets, not yet validated platforms.
 
 **Compatibility requirement:** ROAR must remain compatible with Python 3.11.
 Preserve that support when changing code, dependencies or installation scripts.
-The separate ALIGN environment currently uses a tested Python 3.10 setup;
-ROAR and ALIGN do not need to use the same Python version.
+Setup supplies Python 3.11 for ROAR and a separate Python 3.10 environment for
+ALIGN. You do not need to install Python or choose interpreter paths yourself.
 
 ## Python API
 
 See the [Python API guide](docs/PYTHON_API.md) for headless design editing,
 evaluation/exports, and live GUI sessions. In an activated Python environment,
 install the headless API with `python3 -m pip install -e .`. For the desktop,
-use the setup command below, which also checks native prerequisites.
+use the setup command below, which also supplies native runtime libraries.
 
 The header's layout button opens the [graphical floorplanner](docs/FLOORPLANNING.md)
 for sketching placement intent and inspecting generated ALIGN placements side by side.
@@ -36,17 +39,15 @@ cd roar
 ./bin/setup_roar.sh
 ```
 
-Setup creates the checkout's `.venv`, installs ROAR and its GUI dependencies,
-and checks that the GUI can start. If a virtual environment is already active,
-setup uses that environment instead. A failed check stops setup and reports
-what needs attention.
+Setup downloads the pinned Pixi 0.75.0 executable, verifies its checksum, and
+installs the versions recorded in `pixi.lock`. It prepares ROAR's GUI and native
+libraries, a separate ALIGN environment, and the SKY130 ALIGN backend. ALIGN
+paths are configured automatically. The runtime lives under the checkout's
+`.pixi` directory; setup needs no `sudo`, shell activation or Conda knowledge.
 
-On Ubuntu 22.04, setup offers to install the required native packages with
-`apt` after explicit confirmation in the terminal. On other distributions,
-install the corresponding Qt/OpenGL system packages separately. Run setup
-from a desktop session so it can check display access.
-
-The setup flow has not yet been verified end to end on a fresh OS installation.
+Run setup from your desktop terminal so its final checks can verify display
+access. A failed check stops with repair guidance. The host still supplies the
+display server and graphics driver; this is not a complete operating-system image.
 
 ## Run
 
@@ -54,18 +55,16 @@ The setup flow has not yet been verified end to end on a fresh OS installation.
 ./bin/roar
 ```
 
-The launcher uses the active virtual environment, or the checkout's `.venv`
-when none is active. Activation, sourcing `roar_env.csh`, and tcsh are not
-required. The older `setup_roar.csh` and `run_roar.csh` entry points remain
-compatibility wrappers.
+The launcher uses this checkout's managed environment and runs offline. It
+does not install packages or use an unrelated active virtual environment.
+After updating the checkout, rerun setup before launching. The older
+`setup_roar.csh` and `run_roar.csh` commands remain compatibility wrappers.
 
-To choose Python 3.11 when creating a new environment, run
-`./bin/setup_roar.sh --python python3.11`. For a CAD-managed runtime whose
-native libraries are provided separately, use
-`./bin/setup_roar.sh --skip-system-packages`; GUI verification still runs.
-
-See [Installation and Usage](docs/INSTALLATION_AND_USAGE.md) for setup options
-and troubleshooting.
+Pixi lets ROAR keep Python and native dependencies in one reviewed lock file.
+A plain virtual environment leaves the native libraries to each workstation;
+the managed setup removes that extra step. See
+[Installation and Usage](docs/INSTALLATION_AND_USAGE.md) for troubleshooting,
+runtime maintenance and the expert manual-installation fallback.
 
 ## Disclaimer
 

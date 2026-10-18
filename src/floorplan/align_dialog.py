@@ -18,7 +18,10 @@ from PyQt6.QtWidgets import (
     QPushButton, QSpinBox, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, project_fingerprint, run_options, validate_ota_project
+from .align_runner import (
+    AlignConfig, AlignRunner, PROFILE, PROFILE_ID, align_process_environment,
+    managed_installation, project_fingerprint, run_options, validate_ota_project,
+)
 
 
 ACTIVE = {"starting", "generating", "serving", "stopping"}
@@ -79,9 +82,9 @@ def _probe(parent, config, completed, *, manifest=None):
     """Run the isolated interpreter without blocking the Qt event loop."""
     process = QProcess(parent)
     process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-    environment = QProcessEnvironment.systemEnvironment()
-    for name in ('PYTHONPATH', 'PYTHONHOME', 'ALIGN_HOME'):
-        environment.remove(name)
+    environment = QProcessEnvironment()
+    for name, value in align_process_environment(config.python).items():
+        environment.insert(name, value)
     process.setProcessEnvironment(environment)
     directory = tempfile.TemporaryDirectory(prefix='roar-align-check-')
     process.setWorkingDirectory(directory.name)
@@ -135,17 +138,36 @@ def _probe_text(result):
 class AlignSettingsDialog(QDialog):
     """Machine paths remain local; only the profile ID belongs to a floorplan."""
 
-    def __init__(self, config, profile, parent=None, *, technologies=(), placement_options=None):
+    def __init__(self, config, profile, parent=None, *, technologies=(), placement_options=None,
+                 managed_config=None, custom_config=None, custom_installation=False):
         super().__init__(parent)
         self.setWindowTitle("ALIGN placement settings")
         self.setMinimumWidth(660)
         self.config = None
         self._probe = None
         self._probe_epoch = 0
+        self._managed_config = managed_config
+        custom_config = custom_config or config
+        self._custom_paths = (custom_config.python, custom_config.backend_path)
+        self.custom_installation = managed_config is None or custom_installation
         self.run_options = dict(PROFILE['run_defaults'], lambda_coeff=1.0)
         self.run_options.update(placement_options or {})
         layout = QVBoxLayout(self)
+        introduction = (
+            'ROAR setup supplies the separate ALIGN installation and matching backend. '
+            'Keep Managed by ROAR selected for the supplied tools, or choose Custom installation '
+            'to use tools you configured separately.' if managed_config is not None else
+            'Physical previews require a separate ALIGN installation. Select its Python executable '
+            'and the matching backend folder below, or use Setup help to install ALIGN.')
+        layout.addWidget(_label(introduction + ' Floorplan editing and export remain available without ALIGN.'))
         form = QFormLayout()
+        self.installation = None
+        if managed_config is not None:
+            self.installation = QComboBox()
+            self.installation.addItem('Managed by ROAR', False)
+            self.installation.addItem('Custom installation', True)
+            self.installation.setCurrentIndex(int(self.custom_installation))
+            form.addRow('ALIGN installation:', self.installation)
         self.technology = QComboBox()
         # Keep the persisted backend ID independent from its library label.
         self.profile = self.technology
@@ -166,6 +188,7 @@ class AlignSettingsDialog(QDialog):
         self.python = QLineEdit(str(config.python))
         self.backend = QLineEdit(str(config.backend_path))
         self.run_root = QLineEdit(str(config.run_root))
+        self._installation_controls = []
         for title, field, directory in (
                 ("ALIGN Python:", self.python, False),
                 ("ALIGN backend folder:", self.backend, True),
@@ -176,6 +199,8 @@ class AlignSettingsDialog(QDialog):
             browse.clicked.connect(lambda _checked=False, field=field, directory=directory: self._browse(field, directory))
             row.addWidget(browse)
             form.addRow(title, row)
+            if field is not self.run_root:
+                self._installation_controls.extend((field, browse))
         layout.addLayout(form)
         self.option_fields = {}
         for key, title, low, high, tip in (
@@ -214,6 +239,26 @@ class AlignSettingsDialog(QDialog):
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+        if self.installation is not None:
+            self.installation.currentIndexChanged.connect(self._installation_mode_changed)
+            self._installation_mode_changed()
+
+    def _installation_mode_changed(self):
+        if self.custom_installation:
+            self._custom_paths = (self.python.text(), self.backend.text())
+        self.custom_installation = bool(self.installation.currentData())
+        paths = self._custom_paths if self.custom_installation else (
+            self._managed_config.python, self._managed_config.backend_path)
+        self.python.setText(paths[0])
+        self.backend.setText(paths[1])
+        for control in self._installation_controls:
+            control.setEnabled(self.custom_installation)
+        self._installation_changed()
+
+    def _selected_config(self):
+        if self._managed_config is not None and not self.custom_installation:
+            return replace(self._managed_config, run_root=self.run_root.text().strip())
+        return AlignConfig(self.python.text().strip(), self.backend.text().strip(), self.run_root.text().strip())
 
     def show_setup_help(self):
         dialog = QDialog(self)
@@ -236,7 +281,7 @@ class AlignSettingsDialog(QDialog):
             self.error.setText('Installation settings changed. Test installation again.')
 
     def test_installation(self):
-        config = AlignConfig(self.python.text().strip(), self.backend.text().strip(), self.run_root.text().strip())
+        config = self._selected_config()
         try:
             config.validate()
         except (ValueError, OSError) as error:
@@ -269,9 +314,7 @@ class AlignSettingsDialog(QDialog):
         try:
             if not self.technology.model().item(self.technology.currentIndex()).isEnabled():
                 raise ValueError("No ALIGN backend is configured for the selected technology.")
-            config = AlignConfig(python=self.python.text().strip(),
-                                 backend_path=self.backend.text().strip(),
-                                 run_root=self.run_root.text().strip())
+            config = self._selected_config()
             if self.profile.currentData() is not None:
                 config.validate()
         except (ValueError, TypeError, OSError, RuntimeError) as exc:
@@ -364,11 +407,9 @@ class PlacementPanel(QWidget):
         self._browser_opener = browser_opener or (lambda url: open_align_browser(url, self))
         self._browser_process = None
         self._settings = settings if settings is not None else QSettings("ROAR", "FloorplanALIGN")
-        defaults = config or AlignConfig.from_environment()
-        self.config = AlignConfig(
-            python=str(self._settings.value("python", defaults.python)),
-            backend_path=str(self._settings.value("backend_path", defaults.backend_path)),
-            run_root=str(self._settings.value("run_root", defaults.run_root)))
+        self._managed_config = (AlignConfig.from_environment()
+                                if config is None and os.environ.get('ROAR_MANAGED_RUNTIME') == '1' else None)
+        self.config = AlignConfig.from_settings(self._installation_settings(), defaults=config)
         self._runner = None
         self._runner_path = None
         self._managed = False
@@ -425,6 +466,10 @@ class PlacementPanel(QWidget):
         self._refresh_timer.timeout.connect(lambda: self._guard(self.refresh))
         self.generate_button.setEnabled(False)
         self.open_last_button.setEnabled(False)
+
+    def _installation_settings(self):
+        return {key: self._settings.value(key) for key in
+                ('python', 'backend_path', 'run_root', 'custom_installation') if self._settings.contains(key)}
 
     def _guard(self, action):
         try:
@@ -544,12 +589,25 @@ class PlacementPanel(QWidget):
             self._managed = True
             self._show_view()
             return
+        try:
+            self.config.validate()
+        except (ValueError, OSError, RuntimeError) as error:
+            if not self.edit_settings(generation_error=str(error)):
+                self.status.setText(
+                    'Preview not generated. ' + str(error) +
+                    ' Open ALIGN settings to configure the separate installation. '
+                    'Floorplan editing and export remain available.')
+                return
+            if self._project_provider().align_profile is None:
+                return  # The user explicitly disabled ALIGN in settings.
+            self.config.validate()
+        # Capture live sizing only after configuration is accepted, so cancelling
+        # setup leaves the authoring document and its undo history untouched.
         if self._before_generate is not None:
             self._before_generate()
         project = self._project_provider()
         self._validator(project)
         project.validate()
-        self.config.validate()
         self._closing = False
         self._open_when_ready = not preview
         self._browser_error = ""
@@ -644,15 +702,23 @@ class PlacementPanel(QWidget):
             self._apply_state(self._runner.stop())
             self._poll_timer.start()
 
-    def edit_settings(self):
+    def edit_settings(self, *, generation_error=None):
         if self._active():
             self._show_view()
-            return
+            return False
         project = self._project_provider()
         technologies = self._technology_provider() if self._technology_provider is not None else ()
+        settings = self._installation_settings()
+        custom_config = AlignConfig.from_settings(settings, defaults=self.config)
         options = AlignSettingsDialog(self.config, project.align_profile, self._owner,
-                                      technologies=technologies, placement_options=run_options(project))
-        if options.exec() == QDialog.DialogCode.Accepted:
+                                      technologies=technologies, placement_options=run_options(project),
+                                      managed_config=self._managed_config, custom_config=custom_config,
+                                      custom_installation=not managed_installation(settings))
+        if generation_error is not None:
+            options.error.setText(generation_error)
+            options.buttons.button(QDialogButtonBox.StandardButton.Ok).setText('Save and generate')
+        accepted = options.exec() == QDialog.DialogCode.Accepted
+        if accepted:
             self._invalidate_check(None)
             self._profile_setter(options.profile.currentData())
             if self._run_options_setter is not None:
@@ -660,13 +726,17 @@ class PlacementPanel(QWidget):
             else:
                 project.run_options = dict(options.run_options)
             self.config = options.config
-            for key in ("python", "backend_path", "run_root"):
+            if self._managed_config is not None:
+                self._settings.setValue('custom_installation', options.custom_installation)
+            keys = ('python', 'backend_path', 'run_root') if options.custom_installation else ('run_root',)
+            for key in keys:
                 self._settings.setValue(key, str(getattr(self.config, key)))
             self._settings.sync()
             self._runner = None
             self._state = None
             self.refresh()
         options.deleteLater()
+        return accepted
 
     def check_native_constraints(self, project):
         """Optional native schema/solver check; basic editing needs no ALIGN."""

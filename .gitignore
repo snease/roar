@@ -9,6 +9,7 @@
 
 # virtualenv
 .venv
+.pixi/
 venv/
 ENV/
 
@@ -67,3 +68,4 @@ wheels/
 
 # ROAR Environment file
 roar_env.csh
+roar_env.sh

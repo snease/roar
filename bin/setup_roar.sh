@@ -1,128 +1,109 @@
 #!/usr/bin/env bash
-# Set up the checkout with the standard Python and Ubuntu package managers.
+# Install the locked ROAR and ALIGN environments without changing the host OS.
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./bin/setup_roar.sh [--python python3.11] [--skip-system-packages]
+Usage: ./bin/setup_roar.sh
 
-Create .venv in this checkout, or reuse the active VIRTUAL_ENV. Install ROAR's
-GUI dependencies and check desktop startup. No shell activation is required
-when using the checkout's .venv with ./bin/roar.
+Install this checkout's pinned Pixi and locked environments: Python 3.11 for
+ROAR and Python 3.10 for ALIGN. Then configure and check the managed runtime.
+Requires Linux x86_64, a desktop display, curl or wget, tar, gzip, and sha256sum.
+Downloads are stored in the checkout and Pixi's package cache. No sudo, system
+Python, shell activation, or shell profile changes are needed.
 
-  --python COMMAND        Choose Python 3.10+ for a new environment.
-                          Existing environments are preserved, never replaced.
-  --skip-system-packages  Leave native libraries to your CAD/system administrator.
-                          The final GUI check still runs.
-  -h, --help              Show this help.
+  -h, --help  Show this help.
 
-Ubuntu 22.04: offers to install missing native libraries using apt and sudo.
-Other distributions: install the native prerequisites in docs/FLOORPLANNING.md.
-Run from a desktop terminal (WSL2 needs WSLg). ALIGN is optional and separate.
+Launch after setup with ./bin/roar. Normal launch works offline and does not
+install packages. Run setup again after changes to the committed lock file.
 EOF
 }
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-python_choice=""
-skip_system=0
 while (($#)); do
     case "$1" in
-        --python)
-            (($# >= 2)) && [[ -n "$2" ]] || fail '--python needs an interpreter name or path.'
-            python_choice=$2
-            shift 2 ;;
-        --skip-system-packages) skip_system=1; shift ;;
         -h|--help) usage; exit 0 ;;
+        --python|--python=*) fail '--python is obsolete: Pixi manages Python 3.11 for ROAR and Python 3.10 for ALIGN. Run setup without this option.' ;;
+        --skip-system-packages) fail '--skip-system-packages is obsolete: setup no longer installs system packages. Run setup without this option.' ;;
         *) fail "Unknown option: $1. Run ./bin/setup_roar.sh --help." ;;
     esac
 done
 
+[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] ||
+    fail 'The managed runtime currently supports Linux x86_64, including WSL2. See the installation guide for other platforms.'
+
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-venv_dir=${VIRTUAL_ENV:-$repo_dir/.venv}
-venv_python=$venv_dir/bin/python3
-new_environment=0
-if [[ -e "$venv_dir" || -L "$venv_dir" ]]; then
-    [[ -f "$venv_dir/pyvenv.cfg" && -x "$venv_python" ]] ||
-        fail "$venv_dir is not a usable virtual environment. Select a working environment or move this directory aside, then retry."
-    python_cmd=$venv_python
-    if [[ -n "$python_choice" ]]; then
-        fail "An environment already exists at $venv_dir. Omit --python to reuse it; create a separate environment to change Python versions."
-    fi
+manifest=$repo_dir/pyproject.toml
+[[ -f "$manifest" && -f "$repo_dir/pixi.lock" ]] ||
+    fail 'This checkout is missing pyproject.toml or pixi.lock. Restore the committed files before running setup.'
+
+pixi_version=0.75.0
+pixi_archive_sha256=bcd825d62905c29b3c754b71f9cdc9d6f119454398f58330f111a7b6a0de0a3f
+pixi_binary_sha256=4383aed18b2d5569cf34a19638daf954aa4415cc87ad3a9da9f34059cc4a004c
+pixi_url=https://github.com/prefix-dev/pixi/releases/download/v${pixi_version}/pixi-x86_64-unknown-linux-musl.tar.gz
+pixi_dir=$repo_dir/.pixi/bin
+pixi_bin=$pixi_dir/pixi
+
+command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum is required to verify the pinned Pixi download.'
+verify_sha256() {
+    local actual
+    actual=$(sha256sum < "$1") || return 1
+    [[ ${actual%% *} == "$2" ]]
+}
+
+[[ ! -L "$repo_dir/.pixi" && ! -L "$pixi_dir" ]] ||
+    fail 'The managed .pixi or .pixi/bin directory is a symlink. Move it aside or use a separate checkout before setup.'
+if [[ -e "$pixi_bin" || -L "$pixi_bin" ]]; then
+    [[ -f "$pixi_bin" && ! -L "$pixi_bin" && -x "$pixi_bin" ]] &&
+        verify_sha256 "$pixi_bin" "$pixi_binary_sha256" ||
+        fail "The existing $pixi_bin is not the pinned Pixi $pixi_version binary. Move it aside and rerun setup; it has not been replaced."
 else
-    [[ -z "${VIRTUAL_ENV:-}" ]] || fail "The active VIRTUAL_ENV does not exist: $venv_dir. Deactivate it and retry."
-    python_cmd=${python_choice:-python3}
-    command -v "$python_cmd" >/dev/null 2>&1 || fail "Cannot find $python_cmd. Install Python 3.10 or 3.11, or use --python /path/to/python3."
-    new_environment=1
-fi
-
-"$python_cmd" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' ||
-    fail 'ROAR requires Python 3.10 or newer. Choose it with --python, or activate a compatible environment.'
-python_version=$("$python_cmd" -c 'import sys; print("{}.{}".format(*sys.version_info[:2]))')
-printf 'Using Python %s; environment: %s\n' "$python_version" "$venv_dir"
-
-# Use the same package list as the startup diagnostic, without importing Qt.
-native_libraries=$("$python_cmd" -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["_UBUNTU_LIBRARIES"])' "$repo_dir/src/floorplan/doctor.py")
-if (( ! skip_system )); then
-    distro=""
-    distro_version=""
-    if [[ -r /etc/os-release ]]; then
-        # This is an OS-owned configuration file, not input from a project.
-        distro=$(. /etc/os-release; printf '%s' "${ID:-}")
-        distro_version=$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")
-    fi
-    if [[ "$distro" == ubuntu && "$distro_version" == 22.04 ]]; then
-        read -r -a packages <<< "$native_libraries"
-        if (( new_environment )) && ! "$python_cmd" -c 'import ensurepip' >/dev/null 2>&1; then
-            packages+=("python${python_version}-venv")
-        fi
-        missing=()
-        for package in "${packages[@]}"; do
-            if [[ $(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true) != 'install ok installed' ]]; then
-                missing+=("$package")
-            fi
-        done
-        if ((${#missing[@]})); then
-            printf '\nUbuntu desktop packages are missing. This is separate from the Python environment.\n'
-            printf '  sudo apt-get update\n  sudo apt-get install'
-            printf ' %s' "${missing[@]}"
-            printf '\n'
-            [[ -t 0 ]] || fail 'Run setup interactively to approve system packages, or have your administrator run the commands above, then retry.'
-            read -r -p 'Install these system packages now? [y/N] ' answer
-            case "$answer" in
-                y|Y|yes|YES) ;;
-                *) fail 'System package installation declined. Nothing was installed; rerun after the prerequisites are available.' ;;
-            esac
-            elevate=()
-            if (( EUID != 0 )); then
-                command -v sudo >/dev/null 2>&1 || fail 'sudo is unavailable. Ask your administrator to run the displayed apt-get commands.'
-                elevate=(sudo)
-            fi
-            "${elevate[@]}" apt-get update || fail 'apt-get update failed. Check network access and repository configuration, then rerun setup.'
-            "${elevate[@]}" apt-get install -y --no-install-recommends "${missing[@]}" ||
-                fail 'System package installation failed. Resolve the apt error above, then rerun setup.'
-        fi
+    command -v tar >/dev/null 2>&1 || fail 'tar is required to unpack the pinned Pixi download.'
+    command -v gzip >/dev/null 2>&1 || fail 'gzip is required to unpack the pinned Pixi download.'
+    if command -v curl >/dev/null 2>&1; then
+        downloader=curl
+    elif command -v wget >/dev/null 2>&1; then
+        downloader=wget
     else
-        printf 'Native packages are managed separately on this OS; see docs/FLOORPLANNING.md.\n'
+        fail 'Install curl or wget, then rerun setup to download the pinned Pixi binary.'
     fi
+    mkdir -p -- "$pixi_dir"
+    download_dir=$(mktemp -d "$pixi_dir/.download.XXXXXXXX")
+    trap 'rm -rf -- "$download_dir"' EXIT
+    archive=$download_dir/pixi.tar.gz
+    printf 'Downloading Pixi %s for this checkout...\n' "$pixi_version"
+    if [[ $downloader == curl ]]; then
+        curl -q --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --output "$archive" "$pixi_url" ||
+            fail 'Could not download Pixi. Check network access to github.com, then rerun setup.'
+    else
+        wget --no-config --https-only --tries=3 --output-document="$archive" "$pixi_url" ||
+            fail 'Could not download Pixi. Check network access to github.com, then rerun setup.'
+    fi
+    verify_sha256 "$archive" "$pixi_archive_sha256" ||
+        fail 'Pixi archive checksum mismatch. Nothing from this download was executed; rerun setup to retry.'
+    # Stream only the named executable; never extract archive paths to disk.
+    tar -xOzf "$archive" pixi > "$download_dir/pixi" || fail 'Could not unpack the pinned Pixi executable.'
+    verify_sha256 "$download_dir/pixi" "$pixi_binary_sha256" ||
+        fail 'Pixi executable checksum mismatch. The download was not installed or executed.'
+    chmod 755 "$download_dir/pixi"
+    mv -T -- "$download_dir/pixi" "$pixi_bin"
 fi
 
-if (( new_environment )); then
-    "$python_cmd" -m venv "$venv_dir" ||
-        fail "Could not create $venv_dir. On Ubuntu, install python${python_version}-venv. If creation left an incomplete directory, move it aside before retrying."
-fi
-# Never run pip through sudo or against the system interpreter.
-"$venv_python" -c 'import sys; raise SystemExit(sys.prefix == sys.base_prefix)' ||
-    fail "The interpreter at $venv_python is not running in a virtual environment."
-"$venv_python" -m pip install --upgrade pip setuptools wheel ||
-    fail 'Could not update Python installation tools. Check the pip error above and your network/package index, then rerun setup.'
-"$venv_python" -m pip install -e "$repo_dir[gui]" ||
-    fail 'Could not install ROAR GUI dependencies. Check the pip error above, then rerun setup.'
+# Each managed environment supplies its own interpreter and native libraries.
+unset VIRTUAL_ENV PYTHONHOME PYTHONPATH LD_LIBRARY_PATH LD_PRELOAD
+unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH
+unset ROAR_ALIGN_PYTHON ROAR_ALIGN_PDK_FIXED ROAR_MANAGED_RUNTIME
+export ROAR_HOME="$repo_dir" PYTHONNOUSERSITE=1
+for environment in default align; do
+    printf '\nInstalling locked %s environment...\n' "$environment"
+    "$pixi_bin" install --no-config --manifest-path "$manifest" --locked --environment "$environment" ||
+        fail "Could not install the locked $environment environment. Resolve the Pixi error above, then rerun setup."
+done
 
-printf '\nChecking GUI startup in the selected environment...\n'
-"$venv_python" "$repo_dir/src/roar.py" --check-gui ||
-    fail 'Desktop startup is not ready. Follow the FIX above, then rerun setup. ALIGN is not required for this check.'
-printf '\nSetup check passed. Launch ROAR with: %s/bin/roar\n' "$repo_dir"
-if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-    printf 'This uses your active environment. Activate %s again in new terminals.\n' "$venv_dir"
-fi
+printf '\nConfiguring and checking the managed runtime...\n'
+"$pixi_bin" run --no-config --manifest-path "$manifest" --environment default \
+    --offline --locked --no-install --executable python "$repo_dir/bin/configure_runtime.py" ||
+    fail 'Runtime setup did not complete. Follow the diagnostic above, then rerun setup.'
+printf '\nSetup passed. Launch ROAR with ./bin/roar from this checkout.\n'

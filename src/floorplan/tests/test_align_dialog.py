@@ -128,6 +128,14 @@ class PlacementPanelTests(unittest.TestCase):
         patch.stopall()
         self.directory.cleanup()
 
+    def _use_managed_panel(self):
+        factory = self.panel._runner_factory
+        self.panel.shutdown()
+        self.panel = PlacementPanel(
+            lambda: self.project, lambda: self.path, lambda value: setattr(self.project, 'align_profile', value),
+            self.editor, settings=self.settings, runner_factory=factory)
+        self.panel.refresh()
+
     def test_generate_waits_for_verified_readiness_and_reuses_active_run(self):
         self.assertTrue(self.panel.generate_button.isEnabled())
         self.panel.generate()
@@ -369,10 +377,70 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertFalse(self.panel.generate_button.isEnabled())
         self.project.devices[0].model = original
         self.validate.side_effect = ValueError("Select isolated ALIGN Python")
+        QTimer.singleShot(0, lambda: QApplication.activeModalWidget().reject())
         self.panel._guard(self.panel.generate)
         self.assertIn("isolated ALIGN Python", self.panel.status.text())
         self.assertEqual(self.opened, [])
         self.assertEqual(self.runners[-1].starts, 0)
+
+    def test_missing_installation_opens_settings_and_cancel_preserves_the_draft(self):
+        original = self.project.to_dict()
+        self.panel._before_generate = Mock()
+        self.validate.side_effect = ValueError('Select the Python executable in the separate ALIGN environment')
+        inspected = []
+        def cancel():
+            dialog = QApplication.activeModalWidget()
+            inspected.append(isinstance(dialog, AlignSettingsDialog))
+            labels = ' '.join(label.text() for label in dialog.findChildren(QLabel))
+            self.assertIn('separate ALIGN installation', labels)
+            self.assertIn('editing and export remain available', labels)
+            self.assertIn('Select the Python executable', dialog.error.text())
+            dialog.python.setText('/not-yet-confirmed/python')
+            dialog.option_fields['nvariants'].setValue(8)
+            dialog.profile.setCurrentIndex(dialog.profile.findData(None))
+            dialog.reject()
+        QTimer.singleShot(0, cancel)
+        with patch('roar_api.floorplan.align_dialog._probe') as probe:
+            self.panel.generate_button.click()
+        self.assertEqual(inspected, [True])
+        probe.assert_not_called()
+        self.panel._before_generate.assert_not_called()
+        self.assertEqual(self.project.to_dict(), original)
+        self.assertEqual(self.panel.config, self.config)
+        self.assertEqual(self.settings.allKeys(), [])
+        self.assertEqual(self.profiles, [])
+        self.assertEqual(self.runners[-1].starts, 0)
+        self.assertIsNone(self.panel._view)
+        self.assertIn('editing and export remain available', self.panel.status.text())
+
+    def test_settings_recovery_resumes_preview_with_confirmed_config_and_current_inputs(self):
+        self.validate.side_effect = [ValueError('Select ALIGN Python'), None, None]
+        captured = []
+        def capture():
+            captured.append(True)
+            self.project.set_mos_parameters('M1', 2.4, 0.15, 2)
+        self.panel._before_generate = capture
+        def configure():
+            dialog = QApplication.activeModalWidget()
+            self.assertTrue(any(button.text() == 'Save and generate'
+                                for button in dialog.findChildren(QPushButton)))
+            dialog.python.setText('/confirmed/python')
+            dialog.backend.setText('/confirmed/backend')
+            dialog.option_fields['nvariants'].setValue(8)
+            dialog.accept()
+        QTimer.singleShot(0, configure)
+        self.panel.generate_button.click()
+        runner = self.runners[-1]
+        self.assertEqual(captured, [True])
+        self.assertEqual(runner.starts, 1)
+        self.assertTrue(runner.preview_mode)
+        self.assertEqual(runner.config.python, '/confirmed/python')
+        self.assertEqual(runner.config.backend_path, '/confirmed/backend')
+        self.assertEqual(self.settings.value('python'), '/confirmed/python')
+        self.assertEqual(self.project.run_options['nvariants'], 8)
+        self.assertEqual(self.project.devices[0].width_um, 2.4)
+        self.assertEqual(runner.state.fingerprint, project_fingerprint(self.project))
+        self.assertEqual(self.opened, [])
 
     def test_library_technologies_show_backend_eligibility_and_legacy_profile_uses_sky130_label(self):
         self.assertEqual(self.panel.profile_label.text(), "Layout technology: SKY130A")
@@ -537,6 +605,86 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertEqual(self.profiles, [None])
         self.assertFalse(self.panel.generate_button.isEnabled())
         self.assertEqual(self.settings.value("python"), original.python)
+
+    def test_managed_installation_ignores_stale_paths_and_cancel_keeps_custom_values(self):
+        self.settings.setValue('python', '/old/python')
+        self.settings.setValue('backend_path', '/old/backend')
+        self.settings.setValue('run_root', str(self.root / 'chosen-runs'))
+        saved = {key: self.settings.value(key) for key in self.settings.allKeys()}
+        environment = {'ROAR_MANAGED_RUNTIME': '1', 'ROAR_ALIGN_PYTHON': '/managed/python',
+                       'ROAR_ALIGN_PDK_FIXED': '/managed/backend'}
+        with patch.dict(os.environ, environment):
+            self._use_managed_panel()
+            self.assertEqual(self.panel.config.python, '/managed/python')
+            self.assertEqual(self.panel.config.backend_path, '/managed/backend')
+            self.assertEqual(self.panel.config.run_root, saved['run_root'])
+            def inspect_and_cancel():
+                dialog = QApplication.activeModalWidget()
+                self.assertEqual(dialog.installation.currentText(), 'Managed by ROAR')
+                self.assertEqual(dialog.python.text(), '/managed/python')
+                self.assertEqual(dialog.backend.text(), '/managed/backend')
+                self.assertFalse(dialog.python.isEnabled())
+                self.assertFalse(dialog.backend.isEnabled())
+                self.assertTrue(dialog.run_root.isEnabled())
+                browse = [button for button in dialog.findChildren(QPushButton) if button.text() == 'Browse…']
+                self.assertEqual([button.isEnabled() for button in browse], [False, False, True])
+                dialog.installation.setCurrentIndex(1)
+                self.assertEqual(dialog.python.text(), '/old/python')
+                self.assertEqual(dialog.backend.text(), '/old/backend')
+                self.assertTrue(dialog.python.isEnabled())
+                dialog.python.setText('/edited/custom/python')
+                dialog.installation.setCurrentIndex(0)
+                self.assertEqual(dialog.python.text(), '/managed/python')
+                dialog.installation.setCurrentIndex(1)
+                self.assertEqual(dialog.python.text(), '/edited/custom/python')
+                dialog.reject()
+            QTimer.singleShot(0, inspect_and_cancel)
+            with patch('roar_api.floorplan.align_dialog._probe') as probe:
+                self.assertFalse(self.panel.edit_settings())
+            probe.assert_not_called()
+        self.assertEqual({key: self.settings.value(key) for key in self.settings.allKeys()}, saved)
+        self.assertEqual(self.panel.config.python, '/managed/python')
+
+    def test_explicit_custom_installation_can_switch_to_managed_and_back_without_losing_paths(self):
+        self.settings.setValue('python', '/custom/python')
+        self.settings.setValue('backend_path', '/custom/backend')
+        self.settings.setValue('custom_installation', 'TrUe')
+        environment = {'ROAR_MANAGED_RUNTIME': '1', 'ROAR_ALIGN_PYTHON': '/managed/python',
+                       'ROAR_ALIGN_PDK_FIXED': '/managed/backend'}
+        with patch.dict(os.environ, environment):
+            self._use_managed_panel()
+            self.assertEqual(self.panel.config.python, '/custom/python')
+            self.assertEqual(self.panel.config.backend_path, '/custom/backend')
+            def choose_managed():
+                dialog = QApplication.activeModalWidget()
+                self.assertEqual(dialog.installation.currentText(), 'Custom installation')
+                self.assertTrue(dialog.python.isEnabled())
+                dialog.installation.setCurrentIndex(0)
+                dialog.run_root.setText(str(self.root / 'moved-runs'))
+                dialog.accept()
+            QTimer.singleShot(0, choose_managed)
+            self.assertTrue(self.panel.edit_settings())
+            self.assertEqual(self.panel.config.python, '/managed/python')
+            self.assertEqual(self.panel.config.run_root, str(self.root / 'moved-runs'))
+            self.assertFalse(self.settings.value('custom_installation'))
+            self.assertEqual(self.settings.value('python'), '/custom/python')
+            self.assertEqual(self.settings.value('backend_path'), '/custom/backend')
+            self._use_managed_panel()
+            self.assertEqual(self.panel.config.python, '/managed/python')
+            def choose_custom():
+                dialog = QApplication.activeModalWidget()
+                dialog.installation.setCurrentIndex(1)
+                self.assertEqual(dialog.python.text(), '/custom/python')
+                self.assertEqual(dialog.backend.text(), '/custom/backend')
+                dialog.python.setText('/confirmed/custom/python')
+                dialog.backend.setText('/confirmed/custom/backend')
+                dialog.accept()
+            QTimer.singleShot(0, choose_custom)
+            self.assertTrue(self.panel.edit_settings())
+            self.assertEqual(self.panel.config.python, '/confirmed/custom/python')
+            self.assertTrue(self.settings.value('custom_installation'))
+            self.assertEqual(self.settings.value('python'), '/confirmed/custom/python')
+            self.assertEqual(self.settings.value('backend_path'), '/confirmed/custom/backend')
 
     def test_browser_failure_keeps_ready_url_and_error_visible(self):
         self.panel._browser_opener = lambda _url: False

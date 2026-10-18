@@ -42,6 +42,28 @@ class SetupCheckTests(unittest.TestCase):
         self.assertIn("pip install -e '.[gui]'", text)
         self.assertNotIn('sudo apt install', text)
 
+    def test_managed_native_failure_points_to_setup_instead_of_apt(self):
+        error = {'ok': False, 'error': 'ImportError: libEGL.so.1: cannot open shared object file'}
+        child = subprocess.CompletedProcess([], 1, 'ROAR_GUI ' + json.dumps(error), '')
+        code, text, _ = self.run_check([child], {'ROAR_MANAGED_RUNTIME': '1'}, gui_only=True)
+        self.assertEqual(code, 1)
+        self.assertIn('./bin/setup_roar.sh', text)
+        self.assertNotIn('sudo apt', text)
+        self.assertNotIn('pip install', text)
+
+    def test_managed_checker_uses_bundled_paths_and_align_native_libraries(self):
+        gui = self.gui(settings={'python': '/old/python', 'backend_path': '/old/backend'})
+        probe = subprocess.CompletedProcess([], 0, 'ROAR_PROBE ' + json.dumps({'ok': True}), '')
+        code, text, run = self.run_check([gui, probe], {
+            'ROAR_MANAGED_RUNTIME': '1', 'ROAR_ALIGN_PYTHON': '/bundled/align/bin/python',
+            'ROAR_ALIGN_PDK_FIXED': '/bundled/backend', 'LD_LIBRARY_PATH': '/gui/lib',
+            'XDG_STATE_HOME': tempfile.gettempdir()})
+        self.assertEqual(code, 0, text)
+        call = run.call_args_list[1]
+        self.assertEqual(call.args[0][0], '/bundled/align/bin/python')
+        self.assertEqual(call.args[0][-1], '/bundled/backend')
+        self.assertEqual(call.kwargs['environment']['LD_LIBRARY_PATH'], '/bundled/align/lib')
+
     def test_display_abort_is_reported_without_aborting_the_checker(self):
         child = subprocess.CompletedProcess([], -6, 'ROAR_IMPORTS ready\n',
             'qt.qpa.xcb: could not connect to display\n'
@@ -105,6 +127,14 @@ class SetupCheckTests(unittest.TestCase):
         code, text, _ = self.run_check([self.gui()], {'ROAR_ALIGN_PYTHON': '/align/bin/python'})
         self.assertEqual(code, 1)
         self.assertIn('ALIGN configuration is incomplete', text)
+
+    def test_custom_installation_failure_does_not_recommend_managed_repair(self):
+        gui = self.gui(settings={'python': '/custom/python', 'backend_path': '/custom/backend',
+                                 'custom_installation': 'true'})
+        code, text, _ = self.run_check([gui, OSError('missing Python')], {'ROAR_MANAGED_RUNTIME': '1'})
+        self.assertEqual(code, 1)
+        self.assertIn('Check the Python path in ALIGN settings', text)
+        self.assertNotIn('setup_roar.sh', text)
 
     def test_explicitly_cleared_settings_override_environment_paths(self):
         code, text, run = self.run_check([self.gui(settings={'python': '', 'backend_path': ''})],
