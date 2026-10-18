@@ -29,8 +29,9 @@ class FakeRunner:
     def _current(self, state, project):
         return replace(state, stale=bool(project and project_fingerprint(project) != state.fingerprint)) if state else None
 
-    def start(self, project):
+    def start(self, project, *, preview=False):
         self.starts += 1
+        self.preview_mode = preview
         self.state = RunState(str(Path(self.config.run_root) / f"run-{self.starts}"), "starting", None, None,
                               "align.log", project_fingerprint(project), can_stop=True)
         return self.state
@@ -44,6 +45,9 @@ class FakeRunner:
 
     def last_placement(self, project=None):
         return self._current(self.placement, project)
+
+    def last_preview(self, project=None):
+        return None
 
     def open_last(self, project):
         if self.state and self.state.status == "serving":
@@ -135,6 +139,36 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertIn("isolated ALIGN log", self.panel._view.log.toPlainText())
         self.panel._poll()
         self.assertEqual(len(self.opened), 1)
+
+    def test_native_preview_never_opens_browser_and_invalid_edits_stay_stale(self):
+        import json
+        from roar_api.floorplan.geometry import build_preview
+        self.panel.generate_button.click()
+        runner = self.runners[-1]
+        self.assertTrue(runner.preview_mode)
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        data = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
+        directory = Path(runner.state.run_dir)
+        directory.mkdir(parents=True)
+        (directory / 'preview.json').write_text(json.dumps(data))
+        runner.state = replace(runner.state, status='completed', has_preview=True, can_stop=False)
+        emissions = []
+        self.panel.previewReady.connect(lambda data, state: emissions.append((data, state)))
+        with patch.object(runner, 'last_preview', side_effect=lambda project=None: runner._current(runner.state, project)):
+            self.panel._poll()
+            self.assertEqual(self.opened, [])
+            self.assertFalse(emissions[-1][1].stale)
+            self.project.devices[0].width_um = 2.1
+            self.panel.refresh()
+            self.assertTrue(emissions[-1][1].stale)
+            with patch.object(self.panel, '_project_provider', side_effect=ValueError('Incomplete width')):
+                self.panel.refresh()
+                self.assertTrue(emissions[-1][1].stale)
+            self.project.devices[0].width_um = 2
+            self.panel.refresh()
+            self.assertFalse(emissions[-1][1].stale)
+        self.panel.project_changed()
+        self.assertEqual(emissions[-1], (None, None))
 
     def test_log_display_removes_terminal_codes_and_preserves_unicode_and_raw_log(self):
         self.panel.generate()
@@ -413,11 +447,14 @@ class PlacementPanelTests(unittest.TestCase):
         self.panel._poll()
         self.assertEqual(self.panel._state.status, "stopped")
 
-    def test_source_link_change_is_stale_without_claiming_geometry_changed(self):
+    def test_source_link_change_keeps_geometry_current_but_size_change_is_stale(self):
         self.panel.generate()
         self.runners[-1].serve()
         self.panel._poll()
         self.project.roar_project_path = str(self.root / "other-source.roar")
+        self.panel.refresh()
+        self.assertNotIn("out of date", self.panel.last_label.text())
+        self.project.devices[0].width_um *= 2
         self.panel.refresh()
         self.assertIn("out of date", self.panel.last_label.text())
 

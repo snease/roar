@@ -90,6 +90,84 @@ class FloorplanDialogTests(unittest.TestCase):
         self.app.processEvents()
         self.directory.cleanup()
 
+    def test_sketch_history_keeps_incomplete_cells_and_relationship_ids(self):
+        dialog = self.dialog
+        self.assertIs(dialog.tabs.currentWidget(), dialog.floorplan_views)
+        original = dialog.project.sketch
+        dialog.devices_table.item(0, 3).setText('unfinished')
+        moved = dialog.project.sketch
+        moved['positions']['M1'][0] += 40
+        dialog._sketch_edited(moved)
+        dialog._undo()
+        self.assertEqual(dialog.project.sketch, original)
+        self.assertEqual(dialog.devices_table.item(0, 3).text(), 'unfinished')
+        dialog._redo()
+        self.assertEqual(dialog.project.sketch, moved)
+        self.assertEqual(dialog.devices_table.item(0, 3).text(), 'unfinished')
+        dialog.devices_table.item(0, 3).setText('2')
+        dialog._sketch_relationship({'constraint': 'Align', 'instances': ['M1', 'M2'], 'line': 'h_center'})
+        identifier = dialog.project.constraint_ids[-1]
+        aligned = dialog.project.sketch
+        dialog._undo()
+        self.assertFalse(dialog.project.constraints)
+        dialog._redo()
+        self.assertEqual(dialog.project.constraint_ids[-1], identifier)
+        self.assertEqual(dialog.project.sketch, aligned)
+        dialog.devices_table.item(0, 3).setText('3')
+        dialog.devices_table.item(0, 3).setText('4')
+        dialog._undo()
+        self.assertIn('W 3 /', dialog.sketch_panel.items_by_name['M1'].detail)
+        dialog._redo()
+        self.assertIn('W 4 /', dialog.sketch_panel.items_by_name['M1'].detail)
+
+    def test_failed_live_sizing_marks_physical_preview_stale_until_repaired(self):
+        from roar_api.floorplan.align_runner import RunState, project_fingerprint
+        from roar_api.floorplan.geometry import build_preview
+        project = FloorplanProject.from_text(SYMBOLIC)
+        project.set_parameter('nfs', 4)
+        project.bind_parameter(self.design, 'ws', 'M1_2', 'W', source='live')
+        self.dialog.set_project(project, design=self.design, source_origin='live')
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        data = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
+        (self.root / 'preview.json').write_text(json.dumps(data))
+        state = RunState(str(self.root), 'completed', None, None, 'align.log',
+                         project_fingerprint(project), has_preview=True)
+        panel = self.dialog.placement_panel
+        runner = panel._ensure_runner()
+        with patch.object(runner, 'last_preview', return_value=state):
+            panel.refresh()
+            self.assertFalse(self.dialog.preview_panel.state.stale)
+            self.design.set_instance_attribute('M1_2', 'W', -1)
+            self.dialog._live_source_update()
+            panel.refresh()
+            self.assertTrue(self.dialog.preview_panel.state.stale)
+            self.assertIn('Sizing source error', self.dialog.snapshot_label.text())
+            self.design.set_instance_attribute('M1_2', 'W', 8e-6)
+            self.dialog._live_source_update()
+            panel.refresh()
+            self.assertFalse(self.dialog.preview_panel.state.stale)
+
+    def test_physical_selection_links_sources_without_editing_geometry(self):
+        from roar_api.floorplan.geometry import build_preview
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        project = FloorplanProject.from_text((fixture / 'input' / 'current_mirror_ota.sp').read_text())
+        self.dialog.set_project(project)
+        data = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
+        self.dialog.placement_panel.previewReady.emit(data, None)
+        panel = self.dialog.preview_panel
+        group = next(iter(panel.items_by_id.values()))
+        group.setSelected(True)
+        names = set(group.block['source_instances'])
+        self.assertEqual(set(self.dialog._selected_device_names()), names)
+        self.assertEqual(set(self.dialog.sketch_panel.selected_names()), names)
+        self.assertIn(next(iter(names)), self.dialog.connectivity.toPlainText())
+        self.assertFalse(self.dialog._dirty)
+        self.dialog.sketch_panel.set_selection([project.devices[0].name])
+        self.assertEqual(self.dialog._selected_device_names(), [project.devices[0].name])
+        self.assertIn(project.devices[0].name, panel.selected_names())
+        self.assertEqual(panel.data, data)
+        self.assertFalse(self.dialog._dirty)
+
     def test_constraints_have_readable_rows_and_typed_add_for_every_kind(self):
         for kind in ("SymmetricBlocks", "Order", "Align", "Floorplan", "CompactPlacement", "PlaceCloser", "PowerPorts", "GroundPorts"):
             def accept_constraint(kind=kind):
@@ -263,8 +341,8 @@ class FloorplanDialogTests(unittest.TestCase):
                 self.dialog._import_constraints()
             self.assertEqual(self.dialog.project.constraints, expected)
             current = self.dialog.project.to_dict()
-            self.assertEqual({key: value for key, value in current.items() if key not in ("constraints", "constraint_enabled")},
-                             {key: value for key, value in previous.items() if key not in ("constraints", "constraint_enabled")})
+            self.assertEqual({key: value for key, value in current.items() if key not in ("constraints", "constraint_enabled", "constraint_ids")},
+                             {key: value for key, value in previous.items() if key not in ("constraints", "constraint_enabled", "constraint_ids")})
         original = self.dialog.project
         QTimer.singleShot(0, lambda: QApplication.activeModalWidget().button(QMessageBox.StandardButton.Cancel).click())
         with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):

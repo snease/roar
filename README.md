@@ -16,8 +16,9 @@ See the [Python API guide](docs/PYTHON_API.md) for headless design editing,
 evaluation/exports, and live GUI sessions. Install with `pip install -e .`
 (headless) or `pip install -e '.[gui]'` (desktop).
 
-The header's layout button opens the [floorplan constraint editor](docs/FLOORPLANNING.md)
-for sizing devices and exporting placement intent to ALIGN. A runnable
+The header's layout button opens the [graphical floorplanner](docs/FLOORPLANNING.md)
+for sketching placement intent and inspecting generated ALIGN placements side by side.
+It also exports sized SPICE and native placement constraints. A runnable
 [OTA example](examples/floorplan/ota/README.md) includes the netlist, sizing snapshot,
 and saved floorplan project.
 

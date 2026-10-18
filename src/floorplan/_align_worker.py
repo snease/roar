@@ -5,6 +5,7 @@ from http.cookies import SimpleCookie, CookieError
 import json
 import os
 from pathlib import Path
+import runpy
 import signal
 import secrets
 import sys
@@ -110,12 +111,32 @@ def main():
     signal.signal(signal.SIGTERM, stopped)
     signal.signal(signal.SIGINT, stopped)
     try:
-        status('generating' if active['mode'] == 'generate' else 'starting')
+        status('generating' if active['mode'] in ('generate', 'preview') else 'starting')
         import align
         import dash
         profile = manifest['generation_config']['profile']
         if align.__version__ != profile['align_version'] or int(dash.__version__.split('.')[0]) != profile['dash_major']:
             raise ValueError(f"This profile requires ALIGN {profile['align_version']} and Dash {profile['dash_major']}.x")
+        options = dict(profile['run_defaults'])
+        options.update(manifest['generation_config'].get('run_options', {}))
+        options.update(netlist_dir=manifest['input_dir'], pdk_dir=active['backend_path'],
+            subckt=manifest['top'], working_dir=str(path.parent))
+        if active['mode'] == 'preview':
+            # ALIGN itself imports Dash, but generation needs neither viewer
+            # assets nor a listening server. Normalize data before publishing.
+            native_preflight(manifest)
+            align.schematic2layout(**dict(options, gui=False, flow_stop='3_pnr:place'))
+            adapter = runpy.run_path(str(Path(__file__).with_name('geometry.py')))
+            preview = adapter['build_preview'](path.parent, manifest)
+            target = path.with_name('preview.json')
+            temporary = target.with_name('preview.' + uuid.uuid4().hex + '.tmp')
+            try:
+                temporary.write_text(json.dumps(preview, allow_nan=False), encoding='utf-8')
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            status('completed')
+            return 0
         from align.pnr import placer
         from align.gui.mockup import AppWithCallbacksAndState
         from werkzeug.serving import make_server
@@ -155,11 +176,7 @@ def main():
             return application.sel
 
         placer.run_gui = native_gui
-        options = dict(profile['run_defaults'])
-        options.update(manifest['generation_config'].get('run_options', {}))
-        options.update(netlist_dir=manifest['input_dir'], pdk_dir=active['backend_path'],
-            subckt=manifest['top'], working_dir=str(path.parent), gui=True,
-            flow_stop='3_pnr:gui', port=active['port'])
+        options.update(gui=True, flow_stop='3_pnr:gui', port=active['port'])
         if active['mode'] == 'reopen':
             options['flow_start'] = '3_pnr:gui'
         elif 'netlist' in manifest:

@@ -10,13 +10,13 @@ import json
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QItemSelectionModel
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMessageBox, QPlainTextEdit, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from .model import FloorplanProject, _scalar
@@ -413,6 +413,7 @@ class FloorplanDialog(QDialog):
         self._source_origin = None
         self._dirty = False
         self._rendering = False
+        self._syncing_selection = False
         self._undo_states, self._redo_states = [], []
         self._history_current = self._saved_state = None
         layout = QVBoxLayout(self)
@@ -466,12 +467,30 @@ class FloorplanDialog(QDialog):
         self._build_devices_tab()
         self._build_parameters_tab()
         self._build_constraints_tab()
+        from .canvas import SketchPanel
+        self.sketch_panel = SketchPanel(self)
+        self.sketch_panel.sketchEdited.connect(lambda state: self._guard(lambda: self._sketch_edited(state)))
+        self.sketch_panel.relationshipRequested.connect(lambda rule: self._guard(lambda: self._sketch_relationship(rule)))
+        self.sketch_panel.selectionChanged.connect(self._canvas_selection)
+        from .preview import PreviewPanel
+        self.preview_panel = PreviewPanel(self)
+        self.preview_panel.selectionChanged.connect(lambda names: self._canvas_selection(names, physical=True))
+        self.floorplan_views = QSplitter(Qt.Orientation.Horizontal, self)
+        self.floorplan_views.addWidget(self.sketch_panel)
+        self.floorplan_views.addWidget(self.preview_panel)
+        self.floorplan_views.setChildrenCollapsible(False)
+        self.floorplan_views.setSizes([520, 520])
+        self.tabs.insertTab(0, self.floorplan_views, "Floorplan")
+        self.tabs.setCurrentWidget(self.floorplan_views)
         from .align_dialog import PlacementPanel
         self.placement_panel = PlacementPanel(
-            self._collect_project, lambda: self.project_path, self._set_align_profile,
+            self._collect_placement_project, lambda: self.project_path, self._set_align_profile,
             self, **dict({"before_generate": self._ensure_current_source,
                           "run_options_setter": self._set_run_options}, **(placement_options or {})))
         self.tabs.addTab(self.placement_panel, "Placement")
+        self.placement_panel.previewReady.connect(self._show_physical_preview)
+        self.preview_panel.generationRequested.connect(lambda: self._guard(self.placement_panel.generate_preview))
+        self.preview_panel.settingsRequested.connect(lambda: self._guard(self.placement_panel.edit_settings))
         self.status = QLabel("")
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
@@ -500,6 +519,97 @@ class FloorplanDialog(QDialog):
             self._record_edit()
             if hasattr(self, "placement_panel"):
                 self.placement_panel.schedule_refresh()
+
+    def _refresh_sketch(self):
+        if not hasattr(self, 'sketch_panel'):
+            return
+        try:
+            project = self._collect_project() if self.project else None
+        except (ValueError, TypeError, KeyError):
+            # Incomplete cell text remains in the table; sketching is still useful.
+            project = self.project
+        self._syncing_selection = True
+        try:
+            self.sketch_panel.set_project(project)
+        finally:
+            self._syncing_selection = False
+
+    def _sketch_edited(self, state):
+        self._require_project()
+        try:
+            self.project.set_sketch(state)
+        finally:
+            self._refresh_sketch()
+        self._record_edit()
+        self.status.setText("Sketch saved in this floorplan. Drawing positions do not change ALIGN constraints.")
+
+    @staticmethod
+    def _arrange_sketch(project, *, required=False):
+        from .sketch import SketchConflict, solve_positions
+        try:
+            state = project.sketch
+            state['positions'] = solve_positions(project)
+            project.set_sketch(state)
+        except SketchConflict:
+            if required:
+                raise
+            # A native rule may be useful even when the placeholder drawing
+            # cannot satisfy it. The canvas explains the conflict in that case.
+
+    def _sketch_relationship(self, rule):
+        candidate = self._collect_project()
+        if rule.get('action') == 'symmetry':
+            names = rule['instances']
+            native = {'constraint': 'SymmetricBlocks', 'direction': rule['direction'],
+                      'pairs': [names[i:i + 2] for i in range(0, len(names), 2)]}
+            options = ConstraintEditorDialog(candidate, native, parent=self)
+            accepted = options.exec() == QDialog.DialogCode.Accepted
+            rule = options.constraint
+            options.deleteLater()
+            if not accepted:
+                return
+        candidate._validate_constraints([rule])
+        candidate.constraints.append(rule)
+        candidate.constraint_enabled.append(True)
+        self._arrange_sketch(candidate, required=True)
+        self.project = candidate
+        self._render_constraints()
+        self.constraints_table.selectRow(len(candidate.constraints) - 1)
+        self._record_edit()
+        self.status.setText("Added placement relationship. Edit its settings on Constraints.")
+
+    def _show_physical_preview(self, data, state):
+        self._syncing_selection = True
+        try:
+            changed = data != self.preview_panel.data
+            self.preview_panel.set_preview(data, state)
+            if changed and data is not None:
+                self.preview_panel.set_selection(self._selected_device_names())
+        finally:
+            self._syncing_selection = False
+
+    def _canvas_selection(self, names, *, physical=False):
+        if self._syncing_selection or self._rendering:
+            return
+        self._syncing_selection = True
+        try:
+            selected = {name.upper() for name in names}
+            self.devices_table.blockSignals(True)
+            self.devices_table.clearSelection()
+            selection = self.devices_table.selectionModel()
+            for row in range(self.devices_table.rowCount()):
+                if self.devices_table.item(row, 0).text().upper() in selected:
+                    selection.select(self.devices_table.model().index(row, 0),
+                        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+            self.devices_table.blockSignals(False)
+            self._use_selection()
+            if physical:
+                self.sketch_panel.set_selection(names)
+            else:
+                self.preview_panel.set_selection(names)
+        finally:
+            self.devices_table.blockSignals(False)
+            self._syncing_selection = False
 
     def _editor_state(self):
         if self.project is None:
@@ -545,6 +655,7 @@ class FloorplanDialog(QDialog):
                     self.devices_table.item(row, column).setText(value)
         finally:
             self._rendering = False
+        self._refresh_sketch()
         self._history_current = self._editor_state()
         self._dirty = self._document_state(self._history_current) != self._document_state(self._saved_state)
         self._update_document_title()
@@ -880,6 +991,13 @@ class FloorplanDialog(QDialog):
             self._source_error = str(exc)
             self.snapshot_label.setText("Sizing source error: " + str(exc))
             raise
+        finally:
+            self.placement_panel.schedule_refresh()
+
+    def _collect_placement_project(self):
+        if self._source_error:
+            raise ValueError('Sizing source error: ' + self._source_error)
+        return self._collect_project()
 
     def _build_constraints_tab(self):
         tab = QWidget()
@@ -939,6 +1057,9 @@ class FloorplanDialog(QDialog):
         self.inspect_constraint_button.setEnabled(selected)
         enabled = selected and self.project._constraint_flags()[index]
         self.toggle_constraint_button.setText("Disable" if enabled else "Enable")
+        if hasattr(self, 'sketch_panel'):
+            self.sketch_panel.highlight_constraint(self.project.constraints[index] if selected else None,
+                                                   enabled=bool(enabled))
 
     def _render_constraints(self):
         self.constraints_table.setRowCount(len(self.project.constraints))
@@ -950,6 +1071,7 @@ class FloorplanDialog(QDialog):
                 item.setToolTip(value)
                 self.constraints_table.setItem(row, column, item)
         self._constraint_selection()
+        self._refresh_sketch()
         if hasattr(self, "placement_panel"):
             self.placement_panel.schedule_refresh()
 
@@ -963,6 +1085,7 @@ class FloorplanDialog(QDialog):
         if options.exec() == QDialog.DialogCode.Accepted:
             candidate.constraints.append(options.constraint)
             candidate.constraint_enabled.append(True)
+            self._arrange_sketch(candidate)
             self.project = candidate
             self._render_constraints()
             self.constraints_table.selectRow(len(candidate.constraints) - 1)
@@ -980,7 +1103,12 @@ class FloorplanDialog(QDialog):
             return
         options = ConstraintEditorDialog(candidate, candidate.constraints[index], parent=self)
         if options.exec() == QDialog.DialogCode.Accepted:
-            candidate.constraints[index] = options.constraint
+            # Keep row identity while replacing its native fields, including
+            # documents containing preserved, unsupported sibling constraints.
+            state = candidate.to_dict()
+            state['constraints'][index] = options.constraint
+            candidate = FloorplanProject.from_dict(state)
+            self._arrange_sketch(candidate)
             self.project = candidate
             self._render_constraints()
             self.constraints_table.selectRow(index)
@@ -1003,8 +1131,12 @@ class FloorplanDialog(QDialog):
         index = self.constraints_table.currentRow()
         if 0 <= index < len(candidate.constraints):
             from copy import deepcopy
-            candidate.constraints.insert(index + 1, deepcopy(candidate.constraints[index]))
-            candidate.constraint_enabled.insert(index + 1, candidate.constraint_enabled[index])
+            from uuid import uuid4
+            state = candidate.to_dict()
+            state['constraints'].insert(index + 1, deepcopy(state['constraints'][index]))
+            state['constraint_enabled'].insert(index + 1, state['constraint_enabled'][index])
+            state['constraint_ids'].insert(index + 1, uuid4().hex)
+            candidate = FloorplanProject.from_dict(state)
             self.project = candidate
             self._render_constraints()
             self.constraints_table.selectRow(index + 1)
@@ -1015,6 +1147,7 @@ class FloorplanDialog(QDialog):
         index = self.constraints_table.currentRow()
         if 0 <= index < len(candidate.constraints):
             candidate.set_constraint_enabled(index, not candidate.constraint_enabled[index])
+            self._arrange_sketch(candidate)
             self.project = candidate
             self._render_constraints()
             self.constraints_table.selectRow(index)
@@ -1083,6 +1216,13 @@ class FloorplanDialog(QDialog):
                     port = " [circuit port]" if net.upper() in {name.upper() for name in self.project.ports} else ""
                     lines.append(f"  {terminal} → {net}{port}" + ("; also " + ", ".join(peers) if peers else ""))
         self.connectivity.setPlainText("\n".join(lines))
+        if hasattr(self, 'sketch_panel') and not self._syncing_selection:
+            self._syncing_selection = True
+            try:
+                self.sketch_panel.set_selection(self._selected_device_names())
+                self.preview_panel.set_selection(self._selected_device_names())
+            finally:
+                self._syncing_selection = False
 
     def _device_edited(self, item):
         if self._rendering:
@@ -1101,6 +1241,7 @@ class FloorplanDialog(QDialog):
             finally:
                 self._rendering = False
         self._mark_dirty()
+        self._refresh_sketch()
 
     def _require_project(self):
         if self.project is None:
@@ -1190,6 +1331,7 @@ class FloorplanDialog(QDialog):
         finally:
             self._rendering = False
         self._parameter_selected()
+        self._use_selection()
         self.placement_panel.schedule_refresh()
 
     def _update_document_title(self):
@@ -1204,6 +1346,7 @@ class FloorplanDialog(QDialog):
         self.project = project
         self.project_path = Path(path) if path else None
         self._set_source(design, source_origin)
+        self._arrange_sketch(self.project)
         self._render()
         self._dirty = False
         self._undo_states.clear()
@@ -1215,6 +1358,7 @@ class FloorplanDialog(QDialog):
 
     def confirm_unsaved(self, action="continue", *, discard=False):
         """Return False when cancellation or a failed save must stop navigation."""
+        self.sketch_panel.view.cancel_drag()
         if not self._dirty:
             return True
         answer = QMessageBox.question(

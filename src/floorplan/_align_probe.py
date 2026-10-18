@@ -19,8 +19,6 @@ def main():
         import dash
         result['dash'] = dash.__version__
         from align.pnr import placer
-        from align.gui.mockup import AppWithCallbacksAndState
-        from werkzeug.serving import make_server
         result.update(align=align.__version__, dash=dash.__version__)
         profile = json.loads(Path(__file__).with_name('align_profile.json').read_text())
         if align.__version__ != profile['align_version'] or int(dash.__version__.split('.')[0]) != profile['dash_major']:
@@ -34,13 +32,20 @@ def main():
         if get_generator('MOSGenerator', backend) is None:
             raise ValueError('The selected backend cannot load its MOS generator')
         worker = runpy.run_path(str(Path(__file__).with_name('_align_worker.py')))
-        worker['validate_viewer_assets']()
         if args.manifest:
             manifest = json.loads(Path(args.manifest).read_text())
             worker['native_preflight'](manifest)
             result['message'] = 'Native ALIGN schema and combined constraint checks passed. Placement may still be infeasible for the generated geometry.'
         else:
-            result['message'] = 'Installation is ready for placement generation.'
+            result['message'] = 'Installation is ready for physical preview generation.'
+            try:
+                from align.gui.mockup import AppWithCallbacksAndState
+                from werkzeug.serving import make_server
+                worker['validate_viewer_assets']()
+                result['browser_viewer'] = True
+            except Exception as error:
+                result['browser_viewer'] = False
+                result['message'] += '\nOptional ALIGN browser viewer is unavailable: ' + str(error)
         result['ok'] = True
     except Exception as error:
         result['message'] = f'{type(error).__name__}: {error}'

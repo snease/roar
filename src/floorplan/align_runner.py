@@ -58,7 +58,7 @@ def _ownership_lock(root):
 def _serialized(method):
     @wraps(method)
     def guarded(self, *args, **kwargs):
-        if (method.__name__ in {'last_run', 'last_placement', 'poll'} and self._run_dir is None
+        if (method.__name__ in {'last_run', 'last_placement', 'last_preview', 'poll'} and self._run_dir is None
                 and (not self.config.run_root or not self._root.is_dir())):
             return None
         with _ownership_lock(self._root):
@@ -93,8 +93,55 @@ def _write_json(path, value):
 
 
 def project_fingerprint(project):
-    data = json.dumps(project.to_dict(), sort_keys=True, separators=(',', ':'), allow_nan=False)
+    """Identify generation inputs, independently of drawing and sizing provenance.
+
+    This also works for incomplete drafts. Callers refresh live bindings before
+    capturing a run; freshness checks never export files or resolve bindings.
+    """
+    devices = [{key: getattr(device, key) for key in
+                  ('name', 'kind', 'terminals', 'model', 'width_um', 'length_um',
+                   'nf', 'parameters', 'value')} for device in project.devices]
+    for device in devices:
+        for key in ('width_um', 'length_um'):
+            if type(device[key]) in (int, float):
+                device[key] = float(device[key])
+    inputs = {'version': 2, 'top': project.top, 'ports': project.ports,
+              'devices': devices,
+              'constraints': project.active_constraints,
+              'profile': project.align_profile, 'run_options': run_options(project)}
+    data = json.dumps(inputs, sort_keys=True, separators=(',', ':'), allow_nan=False)
     return hashlib.sha256(data.encode()).hexdigest()
+
+
+def _legacy_fingerprint(project):
+    """Find unsaved captures made before sketch state was introduced."""
+    state = project.to_dict()
+    state.pop('sketch', None)
+    state.pop('constraint_ids', None)
+    state['version'] = 4
+    return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(',', ':'),
+                                    allow_nan=False).encode()).hexdigest()
+
+
+def _tool_identity(config):
+    # Backend source changes affect geometry even when its directory is the same.
+    hashes = {}
+    for name in PROFILE['backend_hashes']:
+        try:
+            hashes[name] = hashlib.sha256((Path(config.backend_path).expanduser() / name).read_bytes()).hexdigest()
+        except OSError:
+            hashes[name] = None
+    packages = {}
+    if config.python:
+        prefix = Path(config.python).expanduser().absolute().parent.parent
+        for metadata in prefix.glob('lib/python*/site-packages/align*.dist-info/METADATA'):
+            try:
+                packages[str(metadata.relative_to(prefix))] = hashlib.sha256(metadata.read_bytes()).hexdigest()
+            except OSError:
+                packages[str(metadata.relative_to(prefix))] = None
+    return {'python': str(Path(config.python).expanduser().absolute()) if config.python else '',
+            'backend_path': str(Path(config.backend_path).expanduser().resolve()) if config.backend_path else '',
+            'backend_hashes': hashes, 'align_version': PROFILE['align_version'], 'packages': packages}
 
 
 def validate_ota_project(project):
@@ -190,6 +237,7 @@ class RunState:
     stale: bool = False
     can_stop: bool = False
     has_placement: bool = False
+    has_preview: bool = False
 
 
 def _alive(manifest, run_dir):
@@ -237,6 +285,7 @@ class AlignRunner:
         self._process = None
         self._verified_ready = None
         self._dump_cache = {}
+        self._preview_cache = {}
 
     @property
     def _root(self):
@@ -261,12 +310,43 @@ class AlignRunner:
         except (OSError, ValueError):
             return False
 
+    def _has_preview(self, directory):
+        path = Path(directory) / 'preview.json'
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            cached = self._preview_cache.get(str(path))
+            if cached and cached[0] == signature:
+                return cached[1]
+            from .geometry import load_preview
+            load_preview(path)
+            self._preview_cache[str(path)] = (signature, True)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _stale(self, manifest, project):
+        if project is None:
+            return False
+        if manifest.get('fingerprint_version') == 2:
+            matches = project_fingerprint(project) == manifest['fingerprint']
+        else:
+            # Old captures hashed the complete authoring document. Compare their
+            # immutable captured circuit with today's generation-only identity.
+            try:
+                snapshot = json.loads((self._run_dir / 'floorplan.json').read_text())
+                matches = project_fingerprint(type(project).from_dict(snapshot)) == project_fingerprint(project)
+            except (OSError, ValueError, KeyError, TypeError):
+                matches = False
+        captured_tool = manifest.get('generation_config', {}).get('tool_identity')
+        return not matches or (captured_tool is not None and captured_tool != _tool_identity(self.config))
+
     def _pointer(self, manifest):
         key = self.project_path or 'snapshot:' + manifest['fingerprint']
         path = self._index(key)
         return json.loads(path.read_text()) if path.is_file() else {}
 
-    def _remember(self, manifest, placement=False, operation=False):
+    def _remember(self, manifest, placement=False, operation=False, preview=False):
         directory = self._root / 'last_runs'
         directory.mkdir(parents=True, exist_ok=True)
         pointer = self._pointer(manifest)
@@ -278,6 +358,8 @@ class AlignRunner:
             # An older window may still poll its historical run. Only the
             # current operation may advance this floorplan's placement history.
             pointer['placement_dir'] = str(self._run_dir)
+        if preview and pointer.get('run_dir') == str(self._run_dir):
+            pointer['preview_dir'] = str(self._run_dir)
         key = self.project_path or 'snapshot:' + manifest['fingerprint']
         path = self._index(key)
         if not path.is_file() or json.loads(path.read_text()) != pointer:
@@ -289,6 +371,7 @@ class AlignRunner:
         keys = [self.project_path] if self.project_path else []
         if project is not None:
             keys.append('snapshot:' + project_fingerprint(project))
+            keys.append('snapshot:' + _legacy_fingerprint(project))
         for key in keys:
             pointer = self._index(key)
             if not pointer.is_file():
@@ -301,9 +384,14 @@ class AlignRunner:
                 continue
             self._run_dir = directory
             if self.project_path and manifest.get('project_path') is None:
-                manifest['project_path'] = self.project_path
-                _write_json(directory / 'run.json', manifest)
-                self._remember(manifest, placement=self._has_dump(directory), operation=True)
+                target = self.project_path
+                self.project_path = None
+                try:
+                    # Adopt the whole unsaved history, including a successful
+                    # preview preceding the latest failed/cancelled attempt.
+                    self.rebind_project_path(target)
+                finally:
+                    self.project_path = target
             return
 
     @_serialized
@@ -327,6 +415,25 @@ class AlignRunner:
         previous = AlignRunner(self.config, self.project_path)
         previous._run_dir = Path(directory)
         previous._dump_cache = self._dump_cache
+        return previous.poll(project)
+
+    @_serialized
+    def last_preview(self, project=None):
+        """Return the latest successful physical preview, including after failure."""
+        self._locate(project)
+        if self._run_dir is None:
+            return None
+        manifest = json.loads((self._run_dir / 'run.json').read_text())
+        directory = self._pointer(manifest).get('preview_dir')
+        if not directory and self._has_preview(self._run_dir):
+            directory = str(self._run_dir)
+        if not directory or not self._has_preview(directory):
+            return None
+        if Path(directory) == self._run_dir:
+            return self.poll(project)
+        previous = AlignRunner(self.config, self.project_path)
+        previous._run_dir = Path(directory)
+        previous._preview_cache = self._preview_cache
         return previous.poll(project)
 
     def _check_save_as(self, path):
@@ -357,7 +464,7 @@ class AlignRunner:
                 manifest = json.loads((self._run_dir / 'run.json').read_text())
                 pointer = self._pointer(manifest)
                 records.update(Path(directory) / 'run.json' for directory in
-                    {str(self._run_dir), pointer.get('placement_dir'), pointer.get('last_attempt')} - {None})
+                    {str(self._run_dir), pointer.get('placement_dir'), pointer.get('preview_dir'), pointer.get('last_attempt')} - {None})
             originals = {record: (record.read_bytes(), record.stat().st_mode & 0o777) if record.is_file() else None for record in records}
             try:
                 yield
@@ -392,7 +499,7 @@ class AlignRunner:
             return
         manifest = json.loads((self._run_dir / 'run.json').read_text())
         pointer = self._pointer(manifest)
-        for directory in {str(self._run_dir), pointer.get('placement_dir'), pointer.get('last_attempt')} - {None}:
+        for directory in {str(self._run_dir), pointer.get('placement_dir'), pointer.get('preview_dir'), pointer.get('last_attempt')} - {None}:
             run_path = Path(directory) / 'run.json'
             if run_path.is_file():
                 record = json.loads(run_path.read_text())
@@ -417,17 +524,20 @@ class AlignRunner:
                 return directory
         return None
 
-    def start(self, project):
+    def start(self, project, *, preview=False):
         validate_ota_project(project)
         project.validate()
         self.config.validate()
         with _ownership_lock(self._root):
-            return self._start_locked(project)
+            return self._start_locked(project, preview=preview)
 
-    def _start_locked(self, project):
+    def _start_locked(self, project, *, preview=False):
         previous = self.last_run(project)
         if (previous and previous.status in _ACTIVE) or self._active_index_run() is not None:
             raise ValueError('Stop the current ALIGN run before generating another placement')
+        history = None
+        if self.project_path is None and self._run_dir is not None:
+            history = self._pointer(json.loads((self._run_dir / 'run.json').read_text()))
         self._root.mkdir(parents=True, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix=project.top + '-', dir=self._root))
         try:
@@ -436,8 +546,9 @@ class AlignRunner:
             detached = type(project).from_dict(snapshot)
             netlist, constraints = detached.export_align(directory / 'input')
             _write_json(directory / 'floorplan.json', snapshot)
-            manifest = {'version': 1, 'profile_id': PROFILE_ID, 'project_path': self.project_path,
+            manifest = {'version': 2, 'profile_id': PROFILE_ID, 'project_path': self.project_path,
                         'fingerprint': project_fingerprint(detached), 'created_at': time.time(),
+                        'fingerprint_version': 2,
                         'top': detached.top, 'input_dir': str(netlist.parent),
                         'constraint_rows': [i + 1 for i, enabled in enumerate(snapshot.get('constraint_enabled', [True] * len(detached.constraints))) if enabled],
                         'netlist': str(netlist), 'constraints': str(constraints),
@@ -445,11 +556,16 @@ class AlignRunner:
                                          for p in (netlist, constraints, directory / 'floorplan.json')},
                         'generation_config': {'python': str(Path(self.config.python).expanduser().absolute()),
                             'backend_path': str(Path(self.config.backend_path).expanduser().resolve()),
-                            'profile': PROFILE, 'run_options': run_options(detached)}, 'active': None}
+                            'profile': PROFILE, 'run_options': run_options(detached),
+                            'tool_identity': _tool_identity(self.config)}, 'active': None}
             self._run_dir = directory
             _write_json(directory / 'run.json', manifest)
+            if history:
+                # An unsaved draft changes snapshot keys when inputs change.
+                # Its last valid outputs still belong to this editing session.
+                _write_json(self._index('snapshot:' + manifest['fingerprint']), history)
             self._remember(manifest, operation=True)
-            return self._launch(manifest, 'generate')
+            return self._launch(manifest, 'preview' if preview else 'generate')
         except Exception:
             # Retain failed setup artifacts for diagnosis, never overwrite inputs.
             raise
@@ -548,6 +664,8 @@ class AlignRunner:
                 _write_json(self._run_dir / 'status.json', progress)
         if status in {'serving', 'completed', 'stopped', 'failed'} and self._has_dump(self._run_dir):
             self._remember(manifest, placement=True)
+        if status in {'completed', 'stopped', 'failed'} and self._has_preview(self._run_dir):
+            self._remember(manifest, preview=True)
         url = progress.get('url')
         if status == 'serving':
             identity = (active.get('token'), url)
@@ -559,9 +677,11 @@ class AlignRunner:
         if status != 'serving':
             url = None
         return RunState(str(self._run_dir), status, url, progress.get('error'), str(self._run_dir / 'align.log'),
-                        manifest['fingerprint'], project is not None and project_fingerprint(project) != manifest['fingerprint'],
+                        manifest['fingerprint'], self._stale(manifest, project),
                         alive and status != 'stopping', self._has_dump(self._run_dir) or
-                        self._has_dump(self._pointer(manifest).get('placement_dir', self._run_dir)))
+                        self._has_dump(self._pointer(manifest).get('placement_dir', self._run_dir)),
+                        self._has_preview(self._run_dir) or
+                        self._has_preview(self._pointer(manifest).get('preview_dir', self._run_dir)))
 
     def _signal(self, manifest, sig):
         if self._process_alive(manifest):

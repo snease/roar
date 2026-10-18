@@ -1,10 +1,16 @@
-# Floorplan constraints for ALIGN
+# Graphical floorplanning with ALIGN
 
-The layout button in ROAR's header opens a floorplan editor for device sizes and
-high-level placement intent. It exports sized SPICE and native ALIGN constraint
-JSON. The optional **Placement** tab runs the circuit through ALIGN and opens ALIGN's
-own placement explorer in a browser. ALIGN supplies both the placement engine
-and the explorer; ROAR manages the inputs, settings and run lifecycle.
+The layout button in ROAR's header opens two connected views: an editable
+**Sketch** of placement intent and a read-only **Generated placement** from
+ALIGN. Arrange device rectangles, create explicit alignment, order or symmetry
+rules, then generate physical candidates to compare with the sketch. ROAR keeps
+the device sizes, native constraints and captured results together in one workflow.
+
+The sketch is **not to scale**. Its equal-sized boxes help organize a circuit;
+the generated view shows actual completed ALIGN placements, with selected
+primitive variants and physical dimensions. Only explicit native constraints
+are sent to ALIGN. Dragging, snapping and drawing groups save your drawing
+without changing generation inputs or making a physical result stale.
 
 The editor uses ROAR's existing Qt interface and netlist parser. Install ROAR
 with `pip install -e '.[gui]'`, then launch it normally. ALIGN, Xschem, Magic and
@@ -18,6 +24,45 @@ restart ROAR; no reinstall is needed to find the floorplan editor. Both
 Activate that environment before launching; `python3 --version` must report
 Python 3.10 or newer. If an older system Python is selected, reactivate the
 existing ROAR environment rather than reinstalling ROAR.
+
+## Main controls
+
+Open the [linked OTA example](#try-a-linked-parameterized-ota) to try the two
+views side by side on **Floorplan**. Sketching requires no ALIGN installation;
+configure the separate ALIGN environment when ready to generate physical geometry.
+
+| Task | Control and result |
+| --- | --- |
+| Arrange the sketch | Select boxes or rubber-band a selection, then drag. Wheel zooms; middle-drag pans; **Fit all** restores the view. **Alt** temporarily bypasses snap guides. **Escape** cancels a drag. |
+| Keep a relationship | Select devices and use **Align**, **Order**, **Make row**, or **Make symmetric…**. These create native rules also visible in **Constraints**. A row combines center alignment with left-to-right order. |
+| Move a visual group | **Group for drawing…** adds a label and moves its members together. It does not combine circuit devices or generate ALIGN hierarchy. |
+| Refine or disable a rule | Use **Constraints**. Selecting a row highlights its participants; the sketch explains whether the rule is enforced locally, exported for ALIGN to check, unsupported, or disabled. |
+| Inspect a physical result | **Generate preview** runs ALIGN through placement. Choose a **Candidate**, inspect dimensions and provenance, and select a net under **Connections**. Selection links known source devices across the views and **Devices**. |
+| Keep working after an input change | The previous result stays visible with **Earlier inputs**. Generate again after changing sizes, enabled rules, technology or run options. |
+
+![Floorplan views: 1 unscaled sketch, 2 explicit relationship actions, 3 physical placement from ALIGN.](images/floorplan/sketch-and-preview.png)
+
+**1** Drag the sketch boxes. **2** Create relationships that ALIGN will honor.
+**3** Compare a physical candidate; selecting devices highlights both views.
+
+**Undo** and **Redo** cover the sketch and forms together; one completed drag is
+one edit. Save and reopen the floorplan to retain positions, drawing groups,
+sizes and rules. Snap guides are temporary. Use an explicit relationship action
+when the relationship should survive future moves and be exported.
+
+The live sketch enforces `Align`, `Order`, `AlignInOrder` and `SymmetricBlocks`
+using placeholder rectangles. Other supported rules, including `Floorplan`
+regions and physical spacing, remain available in the forms for ALIGN to check.
+A local conflict preserves the prior feasible drawing; edit or disable the
+reported rule in **Constraints**. Sketch feasibility does not establish that
+physical device geometry will fit.
+
+The physical preview is read-only. A compiled block may represent several source
+devices; selecting it highlights the known members together. Details identify
+the compiled block and chosen primitive template. Incomplete source mapping is
+marked explicitly. Selected-net lines show connectivity, not routed wires or
+parasitics. Exact physical-coordinate editing, routing and circuit hierarchy
+rewrites are outside this workflow.
 
 ## A companion to the ROAR design
 
@@ -64,9 +109,10 @@ layout stay in place.
 Links are saved relative to the companion file. Moving the two files together
 preserves their association, and **Save as…** rebases the link to the same design.
 The original netlist text is embedded, so it remains available even if its
-original file moves. Versions 1–3 still open; new saves use version 4, which
-records sizing-source intent, enabled constraints, and placement run options. Machine paths and run
-history are stored separately from the floorplan and the `.roar` design.
+original file moves. Versions 1–4 still open; new saves use version 5, adding
+sketch positions, drawing groups and stable rule identities to the existing
+sizes, bindings and run options. Machine paths, run history and generated
+geometry are stored separately from the floorplan and the `.roar` design.
 
 An asterisk in the title marks unsaved floorplan edits. Closing the editor,
 switching documents, or exiting ROAR offers Save, Discard, and Cancel. Saving
@@ -96,9 +142,10 @@ blocks those actions rather than exporting its old value.
    instance attribute. Manual assignment replaces that parameter's binding.
    Clearing its value makes it unresolved again. Shared symbols update all
    their device references together.
-4. Use **Save** or **Save as…**, then the **Placement** tab to generate and
-   inspect an OTA placement. To run ALIGN manually elsewhere, **Export ALIGN
-   inputs…** creates a fresh circuit directory with sized SPICE and native
+4. Arrange devices in the **Floorplan** sketch and use an explicit relationship
+   action when needed. Use **Save** or **Save as…**, then **Generate preview**
+   to compare the drawing with a physical OTA placement. To run ALIGN manually
+   elsewhere, **Export ALIGN inputs…** creates a fresh circuit directory with sized SPICE and native
    constraint JSON.
 
 This example embeds the actual [`design/cm_ota.spice`](../design/cm_ota.spice)
@@ -126,8 +173,9 @@ vibeic SKY130 backend. The source reference used for compatibility checks is
 [revision `8d3cc2e9`](https://github.com/ALIGN-analoglayout/ALIGN-public/tree/8d3cc2e9aa5511315203eb5cbfd00d2c88fdbd18);
 the installed wheel is identified by its release, not assumed to equal that checkout.
 
-**Test installation** reports versions, checks the backend and viewer assets,
-imports native components and verifies write access to the placement runs folder. It creates
+**Test installation** reports versions, checks the backend, imports native
+components and verifies write access to the placement runs folder. Optional
+browser-viewer checks report warnings separately. It creates
 the runs folder if needed, but does not install or modify the toolchain.
 
 ### Run placement
@@ -140,25 +188,38 @@ the runs folder if needed, but does not install or modify the toolchain.
    These paths are local preferences; they are not written into
    the floorplan or the linked ROAR design. Settings can be populated from
    `ROAR_ALIGN_PYTHON` and `ROAR_ALIGN_PDK_FIXED` when ROAR starts.
-3. Choose **Generate placement and open ALIGN**. ROAR captures the current
-   sizes and constraints, exports them into a new run directory, and runs ALIGN
-   in a separate process. Progress and logs remain available while ROAR stays
-   responsive. The browser opens after the local explorer responds.
-4. Explore the generated candidates, hierarchy, pins and nets in ALIGN's
-   existing interface. The run stops before routing; this is placement
-   exploration, not a DRC/LVS-qualified layout flow.
-5. After changing sizes or constraints in ROAR, generate a new placement to
-   apply them. **Open last placement** reopens captured results without
-   recompiling the current floorplan. A stale indicator identifies results
-   that differ from the current document.
+3. Choose **Generate preview** on **Floorplan**, or **Generate physical preview**
+   on **Placement**. ROAR captures current sizes and enabled constraints, exports
+   them to a new run directory, then runs ALIGN in a separate process. Progress
+   and logs remain available while editing stays responsive. Native generation
+   starts no web server and opens no browser.
+4. Compare the sketch with a generated **Candidate**. Inspect width, height,
+   scale and source-device selection, then choose a net under **Connections**.
+   Geometry comes from completed placement, including the concrete primitive
+   variant chosen for each compiled block. The flow stops before routing.
+5. After changing generation inputs, the captured result remains visible with
+   **Earlier inputs**. Generate again to apply the changes.
+   Drawing-only edits leave the captured result current. Saved results reopen
+   without rerunning ALIGN, including after restarting ROAR.
+
+<img src="images/floorplan/preview-details.png" width="600" alt="Generated placement showing its dimensions, earlier-inputs notice, selected-net connections and source-device details">
+
+The captured candidate stays inspectable after an input change. Here **Connections**
+shows one net's physical terminals; the dashed lines are connectivity, not routing.
 
 **View last run / log…** reopens progress or failure details without generating
-again. **Copy diagnostics** includes the run folder and displayed log for CAD
-support, with viewer-link credentials removed. The full log remains in the run folder.
+again. **Cancel generation** stops an active run; cancellation or failure keeps
+the sketch and last successful preview. **Copy diagnostics** includes the run
+folder and displayed log for CAD support, with viewer-link credentials removed.
+The full log remains in the run folder.
 
-![ALIGN's browser viewer showing a generated OTA placement and candidate tradeoffs.](images/floorplan/placement.png)
+**Open in ALIGN browser…** explicitly opens ALIGN's own placement explorer for
+the captured result. This optional viewer starts a local server and requires
+its viewer assets. Native preview generation does not depend on those assets.
+The browser remains useful for ALIGN's own candidate, hierarchy, pin and net
+inspection.
 
-Compare placement candidates and inspect devices, pins and nets in ALIGN's viewer.
+![ALIGN's optional browser viewer showing a generated OTA placement and candidate tradeoffs.](images/floorplan/placement.png)
 
 The repository profile is
 [`align_profile.json`](../src/floorplan/align_profile.json): ALIGN 0.9.8, Dash 2,
@@ -171,11 +232,12 @@ ALIGN may return fewer distinct candidates. The profile checks the backend
 files that determine MOS geometry. The generic `ROAR_ALIGN_PDK` variable is not
 used because it can refer to a backend with different geometry behavior.
 
-The explorer is served on the local machine with its debugger disabled. Each
-run uses an authenticated browser link; open it from ROAR. Foreign hosts and
+When explicitly opened, the browser explorer is served on the local machine
+with its debugger disabled. Each run uses an authenticated browser link; open it from ROAR. Foreign hosts and
 cross-origin requests are rejected, including requests to Dash callbacks.
-Closing a browser tab does not stop ALIGN; use the run controls or close the
-floorplan editor. Captured inputs and generated artifacts remain available
+Closing a browser tab does not stop its server; use the run controls or close
+the floorplan editor. Native preview generation exits after writing its result.
+Captured inputs and generated artifacts remain available
 after stopping, including across ROAR restarts. Runs are associated with the
 saved floorplan path. Saving an unsaved floorplan before running gives it a
 stable identity for reopening results. **Save as…** moves the current run's
@@ -411,6 +473,57 @@ changing the floorplan. Rules with unsupported types or settings are retained
 as clearly marked, read-only rows; disable, remove or replace them before
 export. A file in the wrong format, an invalid supported rule, or cancellation
 leaves the existing constraints intact.
+
+## Data flow and code organization
+
+ROAR supplies circuit sizes and native placement intent. ALIGN generates
+primitives, chooses concrete variants and places compiled blocks. ROAR then
+reads captured artifacts into a small physical preview contract; sketch
+coordinates and visual groups never enter ALIGN's inputs.
+
+```mermaid
+flowchart LR
+    R[ROAR sizes and enabled native rules] -->|Sized SPICE + constraint JSON| W[Separate ALIGN Python process]
+    W --> A[Primitive generation and placement]
+    A -->|Placement candidates + topology + units| G[ROAR geometry adapter]
+    G -->|preview.json in micrometres| P[Read-only generated view]
+    P <-->|Known source-device selection| S[Editable unscaled sketch]
+    S -->|Explicit relationship actions| R
+```
+
+The two views share one document and undo history. The document stays independent
+of Qt and ALIGN; ALIGN imports run in separate tool processes. Derived geometry stays
+in its captured run, accompanied by generation inputs, provenance and logs.
+
+```mermaid
+flowchart TB
+    D[dialog.py: document, history and linked selection]
+    D --> C[canvas.py + sketch.py: sketch interaction and local solve]
+    D --> M[model.py: version-5 floorplan persistence]
+    D --> F[constraint_editor.py + constraints.py: native forms and validation]
+    D --> P[preview.py: physical view]
+    D --> A[align_dialog.py: settings and run controls]
+    A --> R[align_runner.py: snapshots and process lifecycle]
+    R --> W[_align_worker.py: isolated ALIGN execution]
+    W --> G[geometry.py: validated physical result]
+    G --> P
+```
+
+The source boundaries are [document/model](../src/floorplan/model.py),
+[editor/history](../src/floorplan/dialog.py), [canvas](../src/floorplan/canvas.py),
+[local relationships](../src/floorplan/sketch.py),
+[constraint forms](../src/floorplan/constraint_editor.py),
+[native validation](../src/floorplan/constraints.py),
+[preview widget](../src/floorplan/preview.py),
+[run controls](../src/floorplan/align_dialog.py),
+[runner](../src/floorplan/align_runner.py),
+[isolated worker](../src/floorplan/_align_worker.py) and
+[geometry adapter](../src/floorplan/geometry.py).
+The adapter reads ALIGN 0.9.8's scaled placement candidates, captured layer
+scale and compiler `GroupBlocks` lineage. It validates and normalizes bounds,
+mirrors, selected templates, source membership and available pin/net data to
+schema-1 `preview.json`, in µm with physical y pointing up. Membership follows
+authoritative topology records; unknown mappings remain marked incomplete.
 
 ## Checks
 

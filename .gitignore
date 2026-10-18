@@ -17,6 +17,7 @@ ENV/
 verify_roar.py
 roar_cad.egg-info/
 tests/
+!src/floorplan/tests/
 
 
 

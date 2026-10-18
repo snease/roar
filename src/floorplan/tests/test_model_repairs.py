@@ -144,7 +144,7 @@ class ModelRepairTests(unittest.TestCase):
         for version in (1, 2, 3):
             state = project.to_dict()
             state['version'] = version
-            for key in ('source_mode', 'run_options', 'constraint_enabled'):
+            for key in ('source_mode', 'run_options', 'constraint_enabled', 'constraint_ids', 'sketch'):
                 state.pop(key)
             if version < 3:
                 state.pop('align_profile')

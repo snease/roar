@@ -1,22 +1,31 @@
 # OTA floorplan example
 
 This bundle demonstrates a ten-transistor current-mirror OTA using the
-constraint editor and the supported SKY130A ALIGN backend. The sizes are
+graphical floorplanner and the supported SKY130A ALIGN backend. The sizes are
 synthetic layout examples, not an optimized or simulation-qualified design.
 
-1. Open ROAR's floorplan editor with the layout button in the main header.
+1. Launch ROAR in your existing GUI environment (`python src/roar.py` or
+   `python -m roar_api` from the checkout root; Python 3.10 or newer). Open the
+   floorplan editor with the layout button in the main header.
 2. Choose **Open floorplan…** and select `cm_ota.roar.floorplan` here.
-3. Inspect the **Devices**, **Parameters**, and **Constraints** tabs. The
-   companion contains captured sizes and explicit bindings to `cm_ota_sizes.roar`.
-   Use **Captured sizes (no updates)** to work with those captured values, or select
-   **Saved ROAR file** to refresh from the adjacent sizing snapshot.
-4. Use **Save as…** to keep your edited example in your own working directory.
-5. To generate placement, open **Placement → ALIGN settings…**, choose the
-   separate ALIGN Python and supported backend, and use **Test installation**.
-   Then choose **Generate placement and open ALIGN**.
+3. Use **Captured sizes (no updates)** to keep the companion's saved values.
+   To use its linked `cm_ota_sizes.roar` live, choose **Open another ROAR design…**
+   (**Saved ROAR file** in a standalone editor). Inspect **Devices** and
+   **Parameters** for the captured sizes and explicit bindings.
+4. On **Floorplan**, arrange the unscaled sketch. Try **Align**, **Order**,
+   **Make row**, or **Make symmetric…** to create a native rule, then inspect
+   it in **Constraints**. Dragging and snapping alone create no native rules;
+   **Group for drawing…** only moves labeled members together. Undo, then
+   **Save as…** and reopen to check your saved arrangement.
+5. To generate physical geometry, open **Placement → ALIGN settings…**, choose
+   the separate ALIGN Python and supported backend, and use **Test installation**.
+   Choose **Generate preview** on **Floorplan** to compare a physical candidate
+   beside the sketch. No browser is opened. Inspect dimensions, select a source
+   device, and choose a net under **Connections**.
 
-The browser shows placement candidates. This flow stops before routing and
-does not produce a DRC/LVS-qualified final layout.
+Changing sizes or enabled rules marks the captured preview **Earlier inputs**; generate again to apply them. Drawing-only edits keep the
+preview current. **Open in ALIGN browser…** remains an explicit optional action.
+This flow stops before routing and does not produce a DRC/LVS-qualified final layout.
 
 | File | Purpose |
 | --- | --- |

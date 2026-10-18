@@ -1,0 +1,59 @@
+{
+  "description": "Unmodified small JSON/SPICE artifacts from the successful pinned native SKY130 placement acceptance capture; no GDS or executable backend content.",
+  "align_version": "0.9.8",
+  "backend_revision": "427b3b94242fdcf8009e418f6bbe14286fc71334",
+  "command": [
+    "/home/steve/.local/share/roar-eda/align-venv/bin/schematic2layout.py",
+    "../input",
+    "-p",
+    "/home/steve/.local/share/roar-eda/ALIGN-pdk-sky130-vibeic/SKY130_PDK",
+    "-n",
+    "1",
+    "--placer_sa_iterations",
+    "100",
+    "--seed",
+    "0",
+    "--flow_stop",
+    "3_pnr:place"
+  ],
+  "unit_check": {
+    "native_leaf_bbox": [
+      0,
+      0,
+      2580,
+      13440
+    ],
+    "scale_factor": 1,
+    "leaf_size_um": [
+      2.58,
+      13.44
+    ],
+    "top_size_um": [
+      25.8,
+      13.44
+    ],
+    "reference": "ALIGN align/pnr/render_placement.py scale_placement_verilog multiplies by ScaleFactor/2; placer.startup_gui uses 0.001/2 to convert original hN units to micrometres."
+  },
+  "artifacts": [
+    {
+      "original": "/home/steve/.local/share/roar-eda/validation/acceptance-fixtures/ota_baseline/run/3_pnr/Results/CURRENT_MIRROR_OTA_0.scaled_placement_verilog.json",
+      "fixture": "3_pnr/Results/CURRENT_MIRROR_OTA_0.scaled_placement_verilog.json",
+      "sha256": "ec301ef1be8f8e8944f9a2be71a26815794d7cacb52f84e871d853e7025fec34"
+    },
+    {
+      "original": "/home/steve/.local/share/roar-eda/validation/acceptance-fixtures/ota_baseline/run/3_pnr/inputs/layers.json",
+      "fixture": "3_pnr/inputs/layers.json",
+      "sha256": "baf138788e3a48e7d2e8d7035f54abf9518cad3b1ce1a7f55ac3160b5f35743f"
+    },
+    {
+      "original": "/home/steve/.local/share/roar-eda/validation/acceptance-fixtures/ota_baseline/run/1_topology/current_mirror_ota.const.json",
+      "fixture": "1_topology/current_mirror_ota.const.json",
+      "sha256": "a29b1ab85451c9b26f0cbcb10bc57ca4bee8c4453ffc0a7cd3a414e4c25a4d3d"
+    },
+    {
+      "original": "/home/steve/.local/share/roar-eda/validation/acceptance-fixtures/ota_baseline/input/current_mirror_ota.sp",
+      "fixture": "input/current_mirror_ota.sp",
+      "sha256": "e38c68e1d7e7560b0edb9ed4c67ecb1f49a11c5632fc62b4e9dc5e9c8a881857"
+    }
+  ]
+}

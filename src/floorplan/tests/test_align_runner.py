@@ -9,6 +9,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -50,6 +51,12 @@ print('captured child log: '+mode,flush=True)
 write('generating')
 if mode=='fail' and m['active']['mode']=='generate':
     write('failed','intentional backend failure'); sys.exit(2)
+if m['active']['mode']=='preview':
+    if mode=='fail':
+        write('failed','intentional backend failure'); sys.exit(2)
+    if mode=='good':
+        (p.parent/'preview.json').write_bytes((pathlib.Path(__file__).parent/'preview-fixture.json').read_bytes())
+        write('completed'); sys.exit(0)
 if mode not in ('pending','ignore'):
     dump=p.parent/'3_pnr'/'__placer_dump__.json'
     if m['active']['mode']=='generate':
@@ -377,8 +384,149 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(adopted.poll(self.project).stale)
         self.assertTrue(adopted.open_last(self.project).stale)
 
+    def test_preview_history_survives_changed_unsaved_inputs_failure_cancel_and_save_as(self):
+        from roar_api.floorplan.geometry import build_preview
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        data = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
+        (self.base / 'preview-fixture.json').write_text(json.dumps(data))
+        runner = AlignRunner(self.config)
+        self.addCleanup(runner.shutdown)
+        runner.start(self.project, preview=True)
+        first = self.until(runner, 'completed')
+        self.assertTrue(first.has_preview)
+        self.assertIsNone(first.url)
+        self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        self.project.run_options['seed'] = 42
+        (self.base / 'mode').write_text('fail')
+        runner.start(self.project, preview=True)
+        self.until(runner, 'failed')
+        self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        self.assertTrue(runner.last_preview(self.project).stale)
+        self.project.run_options['seed'] = 43
+        (self.base / 'mode').write_text('pending')
+        runner.start(self.project, preview=True)
+        self.until(runner, 'generating')
+        runner.stop()
+        self.until(runner, 'stopped')
+        self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        # A new controller can adopt the unsaved capture after a document save.
+        runner = AlignRunner(self.config, self.base / 'adopted.floorplan')
+        self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        destination = self.base / 'saved.floorplan'
+        with runner.save_as_transaction(destination):
+            self.project.save(destination)
+        reopened = AlignRunner(self.config, destination)
+        self.assertEqual(reopened.last_preview(self.project).run_dir, first.run_dir)
+        self.assertTrue(reopened.last_preview(self.project).stale)
+        (self.base / 'mode').write_text('good')
+        reopened.start(self.project, preview=True)
+        second = self.until(reopened, 'completed')
+        self.assertNotEqual(second.run_dir, first.run_dir)
+        self.assertEqual(reopened.last_preview(self.project).run_dir, second.run_dir)
+        self.assertFalse(reopened.last_preview(self.project).stale)
+
+    def test_generation_fingerprint_ignores_authoring_provenance_but_tracks_effective_inputs(self):
+        original = project_fingerprint(self.project)
+        snapshot = self.project.to_dict()
+        snapshot['source_path'] = '/different/source.sp'
+        snapshot['constraint_ids'] = ['replacement-' + str(i) for i in range(len(snapshot['constraints']))]
+        for parameter in snapshot['parameters'].values():
+            parameter['source'] = 'different sizing provenance'
+            parameter['binding'] = {'instance': 'M1', 'attribute': 'W', 'source': 'live'}
+        clone = FloorplanProject.from_dict(snapshot)
+        sketch = clone.sketch
+        sketch['positions'][clone.devices[0].name] = [40, 60]
+        clone.set_sketch(sketch)
+        self.assertEqual(project_fingerprint(clone), original)
+        clone.set_constraints(clone.constraints + [{'constraint': 'Boundary', 'max_width': 100}],
+                              enabled=[True] * len(clone.constraints) + [False])
+        self.assertEqual(project_fingerprint(clone), original)
+        clone.constraints[-1]['max_width'] = 200
+        self.assertEqual(project_fingerprint(clone), original)
+        clone.set_constraint_enabled(len(clone.constraints) - 1, True)
+        self.assertNotEqual(project_fingerprint(clone), original)
+        changes = [lambda p: setattr(p.devices[0], 'width_um', 1.23),
+                   lambda p: setattr(p.devices[0], 'model', 'different_model'),
+                   lambda p: p.devices[0].parameters.update(M=3),
+                   lambda p: p.run_options.update(seed=9),
+                   lambda p: setattr(p, 'align_profile', 'different_profile')]
+        for change in changes:
+            clone = FloorplanProject.from_dict(self.project.to_dict())
+            change(clone)
+            self.assertNotEqual(project_fingerprint(clone), original)
+
+    def test_staleness_tracks_backend_contents_and_tool_configuration(self):
+        backend = Path(self.config.backend_path)
+        backend.mkdir()
+        (backend / 'models.sp').write_text('original models')
+        self.runner.start(self.project)
+        self.until(self.runner, 'serving')
+        self.assertFalse(self.runner.poll(self.project).stale)
+        self.runner.config = dataclasses.replace(self.config, port=9010)
+        self.assertFalse(self.runner.poll(self.project).stale)
+        self.runner.config = dataclasses.replace(self.config, python='/different/python')
+        self.assertTrue(self.runner.poll(self.project).stale)
+        self.runner.config = self.config
+        (backend / 'models.sp').write_text('changed models')
+        self.assertTrue(self.runner.poll(self.project).stale)
+
+    def test_generation_fingerprint_normalizes_numeric_dimension_representation(self):
+        self.project.devices[0].width_um = 2.0
+        self.project.devices[0].length_um = 1.0
+        original = project_fingerprint(self.project)
+        self.project.devices[0].width_um = 2
+        self.project.devices[0].length_um = 1
+        self.assertEqual(project_fingerprint(self.project), original)
+        for invalid in (True, '2'):
+            self.project.devices[0].width_um = invalid
+            self.assertNotEqual(project_fingerprint(self.project), original)
+
 
 class WorkerErrorTests(unittest.TestCase):
+    def test_preview_runs_headless_placement_and_publishes_validated_geometry_without_viewer(self):
+        from roar_api.floorplan import _align_worker
+        from roar_api.floorplan.geometry import load_preview
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'capture'
+            shutil.copytree(fixture, root)
+            manifest = json.loads((root / 'manifest.json').read_text())
+            manifest.update(active={'token': 'preview-token', 'mode': 'preview', 'backend_path': directory},
+                            input_dir=str(root / 'input'),
+                            generation_config={'profile': PROFILE, 'run_options': {'seed': 17}})
+            path = root / 'run.json'
+            path.write_text(json.dumps(manifest))
+            calls = []
+            modules = {
+                'align': SimpleNamespace(__version__=PROFILE['align_version'],
+                                         schematic2layout=lambda **kwargs: calls.append(kwargs)),
+                'dash': SimpleNamespace(__version__='2.18.2'),
+                'align.gui.mockup': None, 'werkzeug.serving': None,
+            }
+            with patch.dict(sys.modules, modules), \
+                    patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', 'preview-token']), \
+                    patch.object(_align_worker.signal, 'signal'), \
+                    patch.object(_align_worker, 'native_preflight') as preflight, \
+                    patch.object(_align_worker, 'validate_viewer_assets', side_effect=AssertionError('viewer invoked')), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(_align_worker.main(), 0)
+                preflight.assert_called_once()
+                self.assertFalse(calls[0]['gui'])
+                self.assertEqual(calls[0]['flow_stop'], '3_pnr:place')
+                self.assertEqual(calls[0]['seed'], 17)
+                preview = load_preview(root / 'preview.json')
+                self.assertEqual(preview['candidates'][0]['bbox'], [0, 0, 25.8, 13.44])
+                status = json.loads((root / 'status.json').read_text())
+                self.assertEqual(status['status'], 'completed')
+                self.assertIsNone(status['url'])
+                # A bad native capture must not publish a partial replacement.
+                (root / 'preview.json').unlink()
+                shutil.rmtree(root / '3_pnr' / 'Results')
+                self.assertEqual(_align_worker.main(), 1)
+                self.assertFalse((root / 'preview.json').exists())
+                self.assertFalse(list(root.glob('preview.*.tmp')))
+                self.assertEqual(json.loads((root / 'status.json').read_text())['status'], 'failed')
+
     def test_viewer_credential_is_not_the_process_argument_token(self):
         from roar_api.floorplan import _align_worker
         with tempfile.TemporaryDirectory() as directory:

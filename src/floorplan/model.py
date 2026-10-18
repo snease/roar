@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from uuid import uuid4
 
 try:
     from parse_netlist import MOSFETInstance, _parse_parameters, _split_tokens, parse_spice_netlist
@@ -594,6 +595,56 @@ class FloorplanProject:
             self.set_mos_parameters(device.name, width, length, nf)
 
     @property
+    def sketch(self):
+        """Detached drawing state; changing it requires :meth:`set_sketch`."""
+        from .sketch import validate_sketch
+        if not hasattr(self, '_sketch'):
+            self._sketch = validate_sketch(self, {'positions': {}, 'groups': []})
+        return deepcopy(self._sketch)
+
+    def set_sketch(self, state):
+        from .sketch import validate_sketch
+        self._sketch = validate_sketch(self, state)
+
+    @staticmethod
+    def _check_constraint_ids(ids, count):
+        if (not isinstance(ids, list) or len(ids) != count or
+                any(not isinstance(value, str) or not value.strip() or len(value) > 128 for value in ids) or
+                len(set(ids)) != count):
+            raise ValueError('Constraint IDs must be unique nonempty strings matching the constraint rows')
+        return list(ids)
+
+    def _reconcile_constraint_ids(self, candidate, *, keep_edits=False):
+        previous = getattr(self, '_constraint_id_rows', [])
+        old_ids = getattr(self, '_constraint_ids', [])
+        available = set(range(len(previous)))
+        result = [None] * len(candidate)
+        for index, row in enumerate(candidate):
+            match = next((i for i in sorted(available) if previous[i] == row), None)
+            if match is not None:
+                result[index] = old_ids[match]
+                available.remove(match)
+        if keep_edits and len(candidate) == len(previous):
+            for index in range(len(candidate)):
+                if result[index] is None and index in available:
+                    result[index] = old_ids[index]
+                    available.remove(index)
+        return [value or uuid4().hex for value in result]
+
+    @property
+    def constraint_ids(self):
+        """IDs outside native records, reconciled after direct list assignment.
+
+        Explicit editor operations should pass IDs to ``set_constraints`` when
+        inserting/deleting/reordering and editing rows together. Direct native
+        list assignment retains identities only for equal existing records.
+        """
+        if getattr(self, '_constraint_id_rows', None) != self.constraints:
+            self._constraint_ids = self._reconcile_constraint_ids(self.constraints)
+            self._constraint_id_rows = deepcopy(self.constraints)
+        return list(getattr(self, '_constraint_ids', []))
+
+    @property
     def active_constraints(self):
         return [constraint for constraint, enabled in zip(self.constraints, self._constraint_flags()) if enabled]
 
@@ -612,7 +663,7 @@ class FloorplanProject:
         flags[index] = enabled
         self.constraint_enabled = flags
 
-    def set_constraints(self, constraints, enabled=None):
+    def set_constraints(self, constraints, enabled=None, constraint_ids=None):
         candidate = deepcopy(constraints)
         if not isinstance(candidate, list) or any(not isinstance(c, dict) for c in candidate):
             raise ValueError('Constraints must be a list of native ALIGN dictionaries')
@@ -621,16 +672,23 @@ class FloorplanProject:
             raise ValueError('Constraint enabled states must match the constraint rows')
         self._validate_constraints([constraint for constraint, flag in zip(candidate, flags) if flag],
                                    row_numbers=[i + 1 for i, flag in enumerate(flags) if flag])
+        self.constraint_ids  # Reconcile any preceding direct assignment first.
+        ids = (self._reconcile_constraint_ids(candidate, keep_edits=True) if constraint_ids is None else
+               self._check_constraint_ids(constraint_ids, len(candidate)))
         self.constraints, self.constraint_enabled = candidate, flags
+        self._constraint_ids, self._constraint_id_rows = ids, deepcopy(candidate)
 
     def add_constraint(self, constraint):
         self.set_constraints(self.constraints + [constraint], self._constraint_flags() + [True])
 
     def remove_constraint(self, index):
         flags = self._constraint_flags()
+        ids = self.constraint_ids
         del self.constraints[index]
         del flags[index]
+        del ids[index]
         self.constraint_enabled = flags
+        self._constraint_ids, self._constraint_id_rows = ids, deepcopy(self.constraints)
 
     def validate(self):
         self._validate_netlist_identifiers()
@@ -687,25 +745,28 @@ class FloorplanProject:
     def to_dict(self):
         if self.source_mode not in ('saved', 'live', 'linked'):
             raise ValueError('Sizing source mode must be saved, live, or linked')
-        return {'version': 4, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
+        return {'version': 5, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
                 'top': self.top, 'dimension_unit': self.dimension_unit, 'width_convention': self.width_convention,
                 'devices': [{'name': d.name, 'width_um': d.width_um, 'length_um': d.length_um, 'nf': d.nf}
                             for d in self.devices if d.kind == 'mos'], 'constraints': deepcopy(self.constraints),
                 'parameters': deepcopy(self._parameters), 'overrides': deepcopy(self._overrides),
                 'roar_project_path': self.roar_project_path, 'align_profile': self.align_profile,
                 'source_mode': self.source_mode, 'run_options': _run_options(self.run_options),
-                'constraint_enabled': self._constraint_flags()}
+                'constraint_enabled': self._constraint_flags(),
+                'constraint_ids': self.constraint_ids, 'sketch': self.sketch}
 
     @classmethod
     def from_dict(cls, state):
         expected = {'version', 'source_netlist', 'source_path', 'top', 'dimension_unit', 'width_convention', 'devices', 'constraints'}
-        if isinstance(state, dict) and state.get('version') in (2, 3, 4):
+        if isinstance(state, dict) and state.get('version') in (2, 3, 4, 5):
             expected |= {'parameters', 'overrides', 'roar_project_path'}
-        if isinstance(state, dict) and state.get('version') in (3, 4):
+        if isinstance(state, dict) and state.get('version') in (3, 4, 5):
             expected.add('align_profile')
-        if isinstance(state, dict) and state.get('version') == 4:
+        if isinstance(state, dict) and state.get('version') in (4, 5):
             expected |= {'source_mode', 'run_options', 'constraint_enabled'}
-        if not isinstance(state, dict) or state.get('version') not in (1, 2, 3, 4) or set(state) != expected:
+        if isinstance(state, dict) and state.get('version') == 5:
+            expected |= {'constraint_ids', 'sketch'}
+        if not isinstance(state, dict) or state.get('version') not in (1, 2, 3, 4, 5) or set(state) != expected:
             raise ValueError('Unsupported or malformed floorplan project version/fields')
         project = cls.from_text(state['source_netlist'], state['top'], state['dimension_unit'], state['width_convention'])
         project.source_path = state['source_path']
@@ -720,7 +781,7 @@ class FloorplanProject:
             raise ValueError('Sizing source mode must be saved, live, or linked')
         project.source_mode = source_mode
         project.run_options = _run_options(state.get('run_options', {}))
-        if state['version'] in (2, 3, 4):
+        if state['version'] in (2, 3, 4, 5):
             link = state['roar_project_path']
             if link is not None and (not isinstance(link, str) or not Path(link).is_absolute()):
                 raise ValueError('In-memory ROAR project links must be absolute; use load() for relative sidecar links')
@@ -773,7 +834,7 @@ class FloorplanProject:
             raise ValueError('Saved sizes do not match the source circuit instances')
         for row in sizes:
             device = project._device(row['name'])
-            if state['version'] in (2, 3, 4):
+            if state['version'] in (2, 3, 4, 5):
                 actual = {'name': device.name, 'width_um': device.width_um, 'length_um': device.length_um, 'nf': device.nf}
                 if row != actual:
                     raise ValueError(f'{device.name}: saved sizes conflict with source parameters or overrides')
@@ -787,6 +848,10 @@ class FloorplanProject:
         if not isinstance(flags, list) or len(flags) != len(constraints) or any(type(value) is not bool for value in flags):
             raise ValueError('Saved constraint enabled states must match the constraint rows')
         project.constraint_enabled = list(flags)
+        if state['version'] == 5:
+            project._constraint_ids = cls._check_constraint_ids(state['constraint_ids'], len(constraints))
+            project._constraint_id_rows = deepcopy(constraints)
+            project.set_sketch(state['sketch'])
         return project
 
     def save(self, path):
@@ -815,7 +880,7 @@ class FloorplanProject:
     def load(cls, path):
         path = Path(path).expanduser().resolve()
         state = json.loads(path.read_text(encoding='utf-8'))
-        if isinstance(state, dict) and state.get('version') in (2, 3, 4) and state.get('roar_project_path'):
+        if isinstance(state, dict) and state.get('version') in (2, 3, 4, 5) and state.get('roar_project_path'):
             state['roar_project_path'] = str((path.parent / state['roar_project_path']).resolve())
         return cls.from_dict(state)
 

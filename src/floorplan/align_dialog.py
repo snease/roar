@@ -1,6 +1,7 @@
 """Qt controls for isolated, managed ALIGN placement runs."""
 
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ import re
 import shutil
 import tempfile
 
-from PyQt6.QtCore import QEvent, QProcess, QProcessEnvironment, QSettings, QTimer, QUrl, Qt
+from PyQt6.QtCore import QEvent, QProcess, QProcessEnvironment, QSettings, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
@@ -338,6 +339,8 @@ class PlacementRunDialog(QDialog):
 class PlacementPanel(QWidget):
     """Poll the headless runner without importing ALIGN or blocking Qt."""
 
+    previewReady = pyqtSignal(object, object)
+
     def __init__(self, project_provider, path_provider, profile_setter, parent=None,
                  *, settings=None, runner_factory=AlignRunner,
                  browser_opener=None, config=None, validator=validate_ota_project,
@@ -371,6 +374,9 @@ class PlacementPanel(QWidget):
         self._open_when_ready = False
         self._browser_error = ""
         self._input_error = ""
+        self._preview_identity = None
+        self._preview_data = None
+        self._preview_state = None
         self._closing = False
         self._owner = parent
         self._main_window = parent.parentWidget().window() if parent and parent.parentWidget() else None
@@ -385,10 +391,10 @@ class PlacementPanel(QWidget):
         self.profile_label = _label()
         layout.addWidget(self.profile_label)
         buttons = QHBoxLayout()
-        self.generate_button = QPushButton("Generate placement and open ALIGN")
-        self.generate_button.clicked.connect(lambda: self._guard(self.generate))
+        self.generate_button = QPushButton("Generate physical preview")
+        self.generate_button.clicked.connect(lambda: self._guard(self.generate_preview))
         buttons.addWidget(self.generate_button)
-        self.open_last_button = QPushButton("Open last placement")
+        self.open_last_button = QPushButton("Open in ALIGN browser…")
         self.open_last_button.clicked.connect(lambda: self._guard(self.open_last))
         buttons.addWidget(self.open_last_button)
         self.log_button = QPushButton('View last run / log…')
@@ -451,6 +457,7 @@ class PlacementPanel(QWidget):
             self._input_error = str(exc)
             runner = self._ensure_runner()
             self._apply_state(runner.last_run())
+            self._refresh_preview(None)
             historical = runner.last_placement()
             self.generate_button.setEnabled(self._active())
             self.open_last_button.setEnabled(historical is not None and not (self._active() and self._state.status != 'serving'))
@@ -478,7 +485,7 @@ class PlacementPanel(QWidget):
         if self._active():
             self._poll_timer.start()
         self.generate_button.setEnabled(self._active() or not error)
-        self.generate_button.setText("Show active ALIGN run…" if self._active() else "Generate placement and open ALIGN")
+        self.generate_button.setText("Show active ALIGN run…" if self._active() else "Generate physical preview")
         self.generate_button.setToolTip(error)
         self.settings_button.setEnabled(not self._active())
         state = runner.last_placement(project)
@@ -489,6 +496,29 @@ class PlacementPanel(QWidget):
             self.status.setText(error)
         elif self._state is None:
             self.status.clear()
+        self._refresh_preview(project)
+
+    def _refresh_preview(self, project):
+        state = self._ensure_runner().last_preview(project)
+        if state is None:
+            if self._preview_data is not None:
+                self._preview_identity = self._preview_data = self._preview_state = None
+                self.previewReady.emit(None, None)
+            return
+        if project is None:
+            # Invalid table text cannot establish that captured geometry is current.
+            state = replace(state, stale=True)
+        path = Path(state.run_dir) / 'preview.json'
+        stat = path.stat()
+        identity = (str(path), stat.st_mtime_ns, stat.st_size)
+        changed = identity != self._preview_identity
+        if changed:
+            from .geometry import load_preview
+            data = load_preview(path)
+            self._preview_data, self._preview_identity = data, identity
+        if changed or state != self._preview_state:
+            self._preview_state = state
+            self.previewReady.emit(self._preview_data, state)
 
     def _show_view(self):
         if self._view is None:
@@ -503,7 +533,10 @@ class PlacementPanel(QWidget):
             self._show_view()
             self._apply_state(state)
 
-    def generate(self):
+    def generate_preview(self):
+        self.generate(preview=True)
+
+    def generate(self, *, preview=False):
         if self._active():
             self._managed = True
             self._show_view()
@@ -515,10 +548,11 @@ class PlacementPanel(QWidget):
         project.validate()
         self.config.validate()
         self._closing = False
-        self._open_when_ready = True
+        self._open_when_ready = not preview
         self._browser_error = ""
         self._show_view()
-        state = self._ensure_runner().start(project)
+        runner = self._ensure_runner()
+        state = runner.start(project, preview=True) if preview else runner.start(project)
         self._managed = True
         self._apply_state(state)
         self._poll_timer.start()
@@ -708,6 +742,8 @@ class PlacementPanel(QWidget):
         self._managed = False
         self._browser_error = ""
         self._input_error = ""
+        self._preview_identity = self._preview_data = self._preview_state = None
+        self.previewReady.emit(None, None)
         self._closing = False
         if self._view is not None:
             self._view.status.setText("No active ALIGN run for this floorplan.")
