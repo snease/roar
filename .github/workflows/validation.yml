@@ -24,21 +24,24 @@ jobs:
       - name: Set validation artifact directory
         run: echo "ROAR_CHECK_OUTPUT_DIR=${RUNNER_TEMP}/roar-checks" >> "$GITHUB_ENV"
       - name: Install the pinned runtime and backend (headless CI setup)
+        id: setup
         run: ./bin/setup_roar.sh
       - name: Install the locked GUI-free package test environment
+        id: headless
         run: ./.pixi/bin/pixi install --no-config --locked -e headless
       - name: Floorplan tests (Python 3.11, offscreen Qt)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e default test-floorplan
       - name: Build and installed-wheel core/missing-GUI smoke
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.headless.outcome == 'success' }}
         run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e headless check-package
       - name: Native schema and placement checks (Python 3.10, no routing)
         # The small native placement cases also include the schema check.
         # Run on every PR to cover indirect changes to native exports.
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e align check-align-placement
       - name: Native viewer layout, assets, callbacks and access controls
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e default check-align-viewer
       - name: Retain validation logs and receipts
         if: always()

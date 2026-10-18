@@ -1,3 +1,6 @@
 [submodule "eda/ALIGN-pdk-sky130"]
 	path = eda/ALIGN-pdk-sky130
 	url = https://github.com/ALIGN-analoglayout/ALIGN-pdk-sky130
+[submodule "characterization/sky130/align/ALIGN-public"]
+	path = characterization/sky130/align/ALIGN-public
+	url = https://github.com/ALIGN-analoglayout/ALIGN-public
