@@ -41,10 +41,13 @@ elif name in ('curl', 'wget'):
     else:
         shutil.copyfile(os.environ['MOCK_ARCHIVE'], target)
 elif name == 'pixi':
-    stage = args[args.index('--environment') + 1] if args[0] == 'install' else 'configure'
-    assert args[0] in ('install', 'run'), args
+    stage = args[args.index('--environment') + 1] if args[0] == 'install' else ('clean' if args[0] == 'clean' else 'configure')
+    assert args[0] in ('install', 'run', 'clean'), args
     if os.environ.get('FAIL_STAGE') == stage:
         sys.exit(23)
+    if args[0] == 'clean':
+        checkout = pathlib.Path(args[args.index('--manifest-path') + 1]).parent
+        shutil.rmtree(checkout / '.pixi/envs' / args[args.index('--environment') + 1])
 else:
     raise AssertionError(('Unexpected command', name, args))
 '''
@@ -223,6 +226,40 @@ class SetupScriptTests(unittest.TestCase):
                 self.assertEqual(len(self.calls('pixi')), expected_calls)
                 self.assertNotIn('Setup passed', result.stdout)
                 self.log.unlink()
+
+    def test_legacy_qt_migration_resets_only_gui_and_can_be_retried(self):
+        self.make_executable(self.pixi)
+        runtime = self.checkout / '.pixi'
+        legacy = runtime / 'envs/default/lib/python3.11/site-packages/PyQt6/Qt6/qsci/api'
+        legacy.mkdir(parents=True)
+        (legacy / 'leftover.api').write_text('old QScintilla data')
+        preserved = [runtime / 'envs/align/keep', runtime / 'align-backend/keep',
+                     self.checkout / 'runs/keep', self.checkout / 'example.roar.floorplan']
+        for path in preserved:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('preserve')
+        receipt = runtime / 'roar-runtime.json'
+        receipt.write_text('old readiness')
+        self.env['FAIL_STAGE'] = 'clean'
+        result = self.run_setup()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(receipt.exists())
+        self.assertTrue(legacy.exists())
+        self.assertEqual([call['args'][0] for call in self.calls('pixi')], ['clean'])
+        self.log.unlink()
+        self.env.pop('FAIL_STAGE')
+        result = self.run_setup()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls('pixi')
+        self.assertEqual(calls[0]['args'], ['clean', '--no-config', '--manifest-path',
+            str(self.checkout / 'pyproject.toml'), '--environment', 'default'])
+        self.assertEqual([call['args'][0] for call in calls], ['clean', 'install', 'install', 'run'])
+        self.assertFalse(legacy.exists())
+        for path in preserved:
+            self.assertEqual(path.read_text(), 'preserve')
+        self.log.unlink()
+        self.assertEqual(self.run_setup().returncode, 0)
+        self.assertNotIn('clean', [call['args'][0] for call in self.calls('pixi')])
 
     def test_managed_commands_ignore_old_runtime_environment_but_preserve_display_override(self):
         inherited = ('VIRTUAL_ENV', 'PYTHONHOME', 'PYTHONPATH', 'LD_LIBRARY_PATH',

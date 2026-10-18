@@ -43,6 +43,12 @@ SKY130 backend, then checks the configuration. ALIGN's Python and backend paths
 are configured automatically; ordinary use needs no path entry in the GUI.
 A failed step stops setup and reports the problem.
 
+When upgrading a checkout that used the older PyPI Qt packages, setup rebuilds
+the managed GUI environment once through Pixi to remove obsolete Qt plugin
+paths. The separate ALIGN environment, backend assets, projects and desktop
+preferences are preserved. If migration fails, resolve the reported error and
+rerun the same setup command.
+
 The managed launcher uses these paths by default. Existing saved external paths
 do not silently replace them. **ALIGN settings** offers **Managed by ROAR** and
 **Custom installation** choices; saved custom paths and your placement runs
@@ -141,8 +147,10 @@ for the managed runtime.
 A CAD-managed Python environment remains supported. This bypasses the managed
 launcher and requires your administrator to supply Qt/OpenGL/X11 libraries and
 a compatible desktop connection. See the
-[Qt 6.9 platform dependencies](https://doc.qt.io/qt-6.9/linux-requirements.html).
-With an installed Python 3.11 and its `venv` support:
+[Qt 6.11 platform dependencies](https://doc.qt.io/qt-6.11/linux-requirements.html).
+Unlike the managed conda-forge runtime, the current PyPI Qt wheels require
+glibc 2.34 or newer on Linux x86-64. With an installed Python 3.11 and its
+`venv` support:
 
 ```sh
 python3.11 -m venv "$HOME/roar-gui"
@@ -172,24 +180,52 @@ updates even when the workstation's OS packages are current. Package locks and
 checksums make changes reviewable; they do not establish that third-party code
 is safe. Local editable ROAR code and backend code remain trusted inputs.
 
-The October 2026 dependency review updated PyQt6 to 6.9.1 (Qt 6.9.2),
-Dash to 3.4.0, Flask to 3.1.3 and Werkzeug to 3.1.9. Python advisory scans of
-the locked GUI, ALIGN and headless environments found no matches after these
-updates. That scan does not cover native libraries bundled inside wheels.
-Dash 4.4.1 requires Pydantic 2, which conflicts with ALIGN 0.9.8's Pydantic 1
-requirement; upgrade those together only after native viewer validation.
+### Qt Runtime Selection
 
-**Known native dependency limitation:** Qt 6.9.2 remains affected by
-[SVG recursion and use-after-free vulnerabilities](https://www.qt.io/blog/security-advisory-uncontrolled-recursion-and-use-after-free-vulnerabilities-in-qt-svg-module-impact-qt)
-and an [SVG marker vulnerability](https://www.qt.io/blog/security-advisory-type-confusion-and-heap-buffer-overflow-vulnerability-in-qt-svg-marker-handling).
-ROAR has no direct user-SVG loading feature, but that does not establish that
-all Qt image-loading paths are unreachable. Only trusted SVG content should
-reach Qt. The published PyPI Qt wheels containing these fixes require glibc
-2.34; no Qt 6.9.3 wheel is available. Resolving this requires a patched runtime
-package or an explicitly reviewed increase to the Linux baseline. The current
-update preserves the documented glibc 2.28 baseline and does not close this
-native security item. Recheck upstream advisories and wheel availability when
-updating the runtime.
+The managed GUI uses conda-forge's PyQt6 6.11.0, Qt 6.11.2 and QScintilla
+2.14.1. This replaces the older bundled PyPI Qt libraries while retaining
+Python 3.11, glibc 2.28 and kernel 4.18 as the managed runtime targets.
+
+| Approach investigated | Result |
+| --- | --- |
+| **Conda-forge Qt 6.11.2 stack — selected** | A compatible Python 3.11 solve, SVG rendering, editor widget and real WSLg/OpenGL checks pass. No locally maintained Qt build is needed. |
+| PyPI Qt 6.11.2 wheels | Suitable for expert manual installs, but require glibc 2.34 on Linux x86-64. |
+| Qt 6.12 | Current published PyQt6 and QScintilla packages constrain Qt below 6.12. Revisit when compatible bindings are available; do not bypass the solver's constraints. |
+| Custom patched Qt build | Adds a native build and security-maintenance burden; unnecessary for the identified SVG fixes. |
+
+Pixi's inline `qt6-main` → `PyQt6-Qt6` mapping lets conda satisfy the GUI
+extra's native Qt requirement, preventing a second Qt wheel from being
+installed. The GUI extra also requires Qt >=6.11.2 for manual pip installs.
+Keep the binding, editor and native library versions compatible when updating.
+The conda packages expose more multimedia dependencies than the PyPI wheels;
+the reviewed GUI artifacts total approximately 339 MiB of cold downloads,
+about 90 MiB more than the previous lock. Users still run the same setup command.
+
+### Security Review Scope
+
+Qt 6.11.2 contains the fixes for the identified
+[SVG recursion/use-after-free issues](https://www.qt.io/blog/security-advisory-uncontrolled-recursion-and-use-after-free-vulnerabilities-in-qt-svg-module-impact-qt)
+(CVE-2025-10728 and CVE-2025-10729) and
+[SVG marker issue](https://www.qt.io/blog/security-advisory-type-confusion-and-heap-buffer-overflow-vulnerability-in-qt-svg-marker-handling)
+(CVE-2026-6210). The loaded native Qt version and library paths were checked,
+alongside real SVG rendering and desktop tests; a clean Python-package audit
+alone does not establish native-library security.
+
+**Remaining upstream advisory:**
+[CVE-2026-15037](https://www.qt.io/blog/security-advisory-cve-2026-15037-xml-injection)
+affects QDom XML serialization before Qt 6.12. ROAR does not use QDom/QtXml
+serialization; no affected application path was found in the October 2026
+review. This is not a claim that Qt 6.11.2 is free of every advisory. Recheck
+the [Qt vulnerability list](https://wiki.qt.io/List_of_known_vulnerabilities_in_Qt_products)
+and move to a compatible patched stack when available. Any future QDom use
+must account for the advisory's invalid-character policy.
+
+The ALIGN environment uses Dash 3.4.0, Flask 3.1.3 and Werkzeug 3.1.9 after
+the Python dependency review. Dash 4.4.1 requires Pydantic 2, which conflicts
+with ALIGN 0.9.8's Pydantic 1 requirement; upgrade those together only after
+native viewer validation.
+
+### Runtime Manager
 
 Pixi was chosen because this desktop needs Python packages and native graphics
 and placement libraries together. `venv` or `uv` would still leave the native

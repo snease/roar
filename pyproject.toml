@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 dependencies = ["numpy", "pandas", "sympy", "matplotlib"]
 
 [project.optional-dependencies]
-gui = ["PyQt6==6.9.1", "PyQt6-QScintilla", "jedi", "pyqtgraph>=0.13", "PyOpenGL", "colorama", "pyqtdarktheme", "kiwisolver>=1.4"]
+gui = ["PyQt6==6.11.0", "PyQt6-Qt6>=6.11.2,<6.12", "PyQt6-QScintilla", "jedi", "pyqtgraph>=0.13", "PyOpenGL", "colorama", "pyqtdarktheme", "kiwisolver>=1.4"]
 
 [project.scripts]
 roar = "roar_api.__main__:main"
@@ -32,13 +32,23 @@ channels = ["conda-forge"]
 platforms = [{ name = "linux-runtime", platform = "linux-64", glibc = "2.28", linux = "4.18" }]
 requires-pixi = "==0.75.0"
 
+# The conda runtime supplies the native Qt library required by the GUI extra.
+# This prevents Pixi from also installing the PyPI Qt wheel (glibc >=2.34).
+[tool.pixi.workspace.conda-pypi-map]
+conda-forge = { mapping = { qt6-main = "PyQt6-Qt6" } }
+
+[tool.pixi.feature.gui.dependencies]
+pyqt6 = "==6.11.0"
+qt6-main = "==6.11.2"
+qscintilla2 = "==2.14.1"
+
 [tool.pixi.dependencies]
 python = "3.11.*"
 pip = "*"
 # Editable installation uses these locked build tools as well.
 setuptools = ">=64"
 wheel = "*"
-# Qt's PyPI wheels need these native desktop libraries outside Python itself.
+# Native desktop and OpenGL libraries are managed alongside the Qt stack.
 libegl = "*"
 libgl = "*"
 libglx = "*"

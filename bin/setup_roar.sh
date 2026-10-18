@@ -96,6 +96,16 @@ unset VIRTUAL_ENV PYTHONHOME PYTHONPATH LD_LIBRARY_PATH LD_PRELOAD
 unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH
 unset ROAR_ALIGN_PYTHON ROAR_ALIGN_PDK_FIXED ROAR_MANAGED_RUNTIME
 export ROAR_HOME="$repo_dir" PYTHONNOUSERSITE=1
+# A failed install or migration must not leave an earlier readiness receipt.
+rm -f -- "$repo_dir/.pixi/roar-runtime.json"
+# Old PyPI QScintilla can leave data under PyQt6/Qt6 after uninstall. PyQt
+# mistakes that directory for a bundled Qt and cannot find the conda plugins.
+# Let Pixi rebuild only the GUI environment; backend assets and runs are separate.
+if [[ -d "$repo_dir/.pixi/envs/default/lib/python3.11/site-packages/PyQt6/Qt6" ]]; then
+    printf '\nMigrating the GUI environment from bundled PyPI Qt to conda-forge Qt...\n'
+    "$pixi_bin" clean --no-config --manifest-path "$manifest" --environment default ||
+        fail 'Could not reset the old GUI environment for the Qt migration. Resolve the Pixi error above, then rerun setup.'
+fi
 for environment in default align; do
     printf '\nInstalling locked %s environment...\n' "$environment"
     "$pixi_bin" install --no-config --manifest-path "$manifest" --locked --environment "$environment" ||
