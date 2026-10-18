@@ -390,6 +390,10 @@ circuit-wide boundary, aspect ratio, packing or compiler setting. For circuit
 spacing, use either one general row or separate horizontal and vertical rows;
 overlaps are rejected because ALIGN can overwrite earlier settings. A net's
 placement weight must likewise be set in only one enabled row.
+Use one enabled `PowerPorts` row and one enabled `GroundPorts` row, each listing
+all ports for that role in the desired order with one propagation setting.
+Repeated rows are rejected even for different ports: ALIGN preprocessing uses
+only the last row's list, which can change source/drain correction and device removal.
 **Check constraints** also runs
 native combined checks when ALIGN is configured. Generation repeats native
 preflight before making primitives. These checks do not prove physical

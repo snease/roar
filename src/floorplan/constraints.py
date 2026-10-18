@@ -67,6 +67,8 @@ HELP = {
     'SymmetricNets': 'Match two nets about a shared axis. Order connected pins in corresponding pairs; every selected pin must belong to its net. ALIGN can derive additional device symmetry.',
     'ConfigureCompiler': 'Control automatic circuit transformations. Defaults match ALIGN 0.9.8; changing these can alter grouping and generated layouts.',
     'DoNotIdentify': 'Prevent these devices from being combined into recognized circuit patterns. Other compiler transformations are controlled separately.',
+    'PowerPorts': 'List all power ports in one enabled row; ALIGN preprocessing uses only the last PowerPorts row. Port order selects the first port for the top-level power grid. Choose one propagation setting for the whole list.',
+    'GroundPorts': 'List all ground ports in one enabled row; ALIGN preprocessing uses only the last GroundPorts row. Port order selects the first port for the top-level ground grid. Choose one propagation setting for the whole list.',
     'ClockPorts': 'Mark clock nets so ALIGN excludes them from ordinary signal symmetry inference.',
     'NetPriority': 'Give selected nets more weight in placement wirelength optimization. Larger weights favor shorter connections; this is a preference, not a length or matching guarantee. Unspecified nets have weight 1.',
 }
@@ -318,6 +320,11 @@ def _check_combinations(constraints, row_numbers):
             for net in constraint['nets']:
                 reserve(f'placement weight for net {net.upper()}', row,
                         'Set each net’s placement weight in only one enabled NetPriority or NetConst row.')
+        if kind in ('PowerPorts', 'GroundPorts'):
+            # ALIGN 0.9.8's source/drain correction and dummy-device removal
+            # use only the last row's ports, even when the lists are disjoint.
+            reserve(kind, row, f'Keep one enabled row for {kind}; combine its ports in that row '
+                    'and choose one propagation setting. ALIGN preprocessing uses only the last row.')
         if kind in ('PowerPorts', 'GroundPorts', 'ClockPorts'):
             for port in constraint['ports']:
                 previous = roles.setdefault(port.upper(), (kind, row))

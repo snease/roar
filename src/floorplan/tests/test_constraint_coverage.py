@@ -98,6 +98,54 @@ class ConstraintCoverageTests(unittest.TestCase):
                 {'constraint': 'GroundPorts', 'ports': ['s']},
             ])
 
+    def test_repeated_supply_rows_are_rejected_atomically_in_either_order(self):
+        self.project.set_constraints([{'constraint': 'ClockPorts', 'ports': ['g']}])
+        before = self.project.to_dict()
+        for kind in ('PowerPorts', 'GroundPorts'):
+            first = {'constraint': kind, 'ports': ['s']}
+            for ports in (['b'], ['S']):
+                for propagation in ({}, {'propagate': True}, {'propagate': False}):
+                    second = dict(constraint=kind, ports=ports, **propagation)
+                    for rules in ([first, second], [second, first]):
+                        with self.subTest(rules=rules):
+                            with self.assertRaisesRegex(ValueError, f'Constraints 1 and 2: overlapping {kind}.*one enabled row'):
+                                self.project.set_constraints(rules)
+                            self.assertEqual(self.project.to_dict(), before)
+
+    def test_imported_supply_rows_remain_editable_but_cannot_export_until_repaired(self):
+        for kind in ('PowerPorts', 'GroundPorts'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                self.project.constraints = [
+                    {'constraint': kind, 'ports': ['s']},
+                    {'constraint': 'FutureRule'},
+                    {'constraint': kind, 'ports': ['b'], 'propagate': False},
+                ]
+                self.project.constraint_enabled = [True, False, True]
+                saved = self.project.save(Path(directory) / 'draft.roar.floorplan')
+                reopened = FloorplanProject.load(saved)
+                self.assertEqual(reopened.to_dict(), self.project.to_dict())
+                destination = Path(directory) / 'export'
+                with self.assertRaisesRegex(ValueError, f'Constraints 1 and 3: overlapping {kind}'):
+                    reopened.export_align(destination)
+                self.assertFalse(destination.exists())
+                reopened.set_constraint_enabled(0, False)
+                _, path = reopened.export_align(destination)
+                self.assertEqual(json.loads(path.read_text()), [self.project.constraints[2]])
+                self.assertEqual(reopened.constraints, self.project.constraints)
+
+    def test_supply_lists_preserve_port_order_and_propagation_on_export(self):
+        for propagate in (True, False):
+            with self.subTest(propagate=propagate), tempfile.TemporaryDirectory() as directory:
+                rules = [
+                    {'constraint': 'PowerPorts', 'ports': ['d2', 'd1'], 'propagate': propagate},
+                    {'constraint': 'GroundPorts', 'ports': ['s', 'b'], 'propagate': propagate},
+                    {'constraint': 'ClockPorts', 'ports': ['g']},
+                ]
+                self.project.set_constraints(rules)
+                reopened = FloorplanProject.from_dict(self.project.to_dict())
+                _, path = reopened.export_align(directory)
+                self.assertEqual(json.loads(path.read_text()), rules)
+
     def test_disabled_rows_do_not_shift_error_row_numbers(self):
         self.project.constraints = [
             {'constraint': 'UnknownImportedRule'},
