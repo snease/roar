@@ -4,6 +4,13 @@ Use Design for headless input/serialization, Technologies for LUT discovery,
 and Session for live Qt plots. Equations are trusted input, not a sandbox.
 """
 
+import sys as _sys
+
+if _sys.version_info < (3, 10):
+    raise ImportError("ROAR requires Python 3.10 or newer; this is Python {}.{}.{} ({}).\n"
+                      "Activate your ROAR environment, check python3 --version, and retry."
+                      .format(*_sys.version_info[:3], _sys.executable))
+
 from pathlib import Path as _Path
 
 # Source checkouts keep floorplan in src/; wheels place it inside roar_api.

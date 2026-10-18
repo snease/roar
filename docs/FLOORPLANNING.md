@@ -15,6 +15,9 @@ WSL. The Python API works with the headless installation, `pip install -e .`.
 If your environment already has ROAR's GUI dependencies, pull the branch and
 restart ROAR; no reinstall is needed to find the floorplan editor. Both
 `python src/roar.py` and `python -m roar_api` work from the checkout root.
+Activate that environment before launching; `python3 --version` must report
+Python 3.10 or newer. If an older system Python is selected, reactivate the
+existing ROAR environment rather than reinstalling ROAR.
 
 ## A companion to the ROAR design
 

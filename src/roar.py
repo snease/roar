@@ -6,6 +6,11 @@ import sys
 
 
 def main() -> int:
+    if sys.version_info < (3, 10):
+        print("ROAR requires Python 3.10 or newer; this is Python {}.{}.{} ({}).\n"
+              "Activate your ROAR environment, check python3 --version, and retry."
+              .format(*sys.version_info[:3], sys.executable), file=sys.stderr)
+        return 1
     # Preserve the historical script entry point, using the public package.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, root)
