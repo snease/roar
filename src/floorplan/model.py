@@ -17,6 +17,7 @@ import unicodedata
 from uuid import uuid4
 
 from .documents import load_document, validate_document
+from .run_options import validate_run_options as _run_options
 
 try:
     from parse_netlist import MOSFETInstance, _parse_parameters, _split_tokens, parse_spice_netlist
@@ -38,6 +39,10 @@ _PARAMETER = re.compile(r"([A-Za-z_]\w*)\s*=\s*('[^']*'|[^\s'=]+)")
 # (.). Bus indices, hierarchical names, ground 0, and ordinary SPICE punctuation
 # remain usable. Source text is retained separately and never executed.
 _NETLIST_IDENTIFIER = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.!<>\[\]/+\-]*', re.ASCII)
+# ALIGN 0.9.8 recognizes NUMBER before NAME and casts it through float, then
+# int for integral values. Keep its narrower grammar separate from sizing:
+# for example 01 and 1. are NAME tokens and retain their spelling.
+_ALIGN_NET_NUMBER = re.compile(r'([+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:e[+-]?\d+)?)(meg|[tgxkmunpf])?', re.I)
 
 
 def _netlist_identifier(value, label):
@@ -46,6 +51,24 @@ def _netlist_identifier(value, label):
         raise ValueError(f'{label}: unsupported netlist identifier {value!r}; use letters, digits, underscores, '
                          'bus indices, or ordinary net-name punctuation without comments or expressions')
     return value
+
+
+def _align_net_identifier(value, label):
+    _netlist_identifier(value, label)
+    match = _ALIGN_NET_NUMBER.fullmatch(value)
+    if match:
+        # Match the native suffix search order too: G precedes MEG, so its
+        # failed float conversion leaves a NUMBER such as 1MEG unchanged.
+        suffix = next((s for s in ('t', 'g', 'x', 'meg', 'k', 'm', 'u', 'n', 'p', 'f')
+                       if value.lower().endswith(s)), '')
+        try:
+            number = float(value[:-len(suffix)] if suffix else value) * (1e6 if suffix == 'x' else _SUFFIX[suffix])
+        except ValueError:
+            return
+        normalized = str(int(number) if number.is_integer() else number).upper()
+        if normalized != value.upper():
+            raise ValueError(f'{label}: ALIGN 0.9.8 changes net name {value!r} to {normalized!r}; '
+                             'choose a name that preserves its spelling before export or generation')
 
 
 def _assignments(section, label):
@@ -108,19 +131,6 @@ def _multiplicity(value, label='M'):
         raise ValueError(f'{label} must be a positive integer')
     return int(number)
 
-
-def _run_options(options):
-    if not isinstance(options, dict) or set(options) - {'nvariants', 'placer_sa_iterations', 'seed', 'lambda_coeff'}:
-        raise ValueError('Unknown or malformed ALIGN run options')
-    for key, value in options.items():
-        if key == 'lambda_coeff':
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0.01 <= value <= 1000:
-                raise ValueError('lambda_coeff must be a finite number from 0.01 to 1000')
-        else:
-            lower, upper = (0, 2147483647) if key == 'seed' else (1, 100 if key == 'nvariants' else 1000000)
-            if type(value) is not int or not lower <= value <= upper:
-                raise ValueError(f'{key} must be an integer from {lower} to {upper}')
-    return deepcopy(options)
 
 
 def _convention(value):
@@ -738,7 +748,7 @@ class FloorplanProject:
         if not isinstance(self.ports, list) or not self.ports:
             raise ValueError('Circuit ports must be nonempty and unique')
         for port in self.ports:
-            _netlist_identifier(port, 'Circuit port')
+            _align_net_identifier(port, 'Circuit port')
         if len({port.upper() for port in self.ports}) != len(self.ports):
             raise ValueError('Circuit ports must be nonempty and unique')
         names = set()
@@ -752,7 +762,7 @@ class FloorplanProject:
             if not isinstance(device.terminals, (tuple, list)) or len(device.terminals) != (4 if device.kind == 'mos' else 2):
                 raise ValueError(f'{device.name}: wrong number of terminals')
             for terminal in device.terminals:
-                _netlist_identifier(terminal, f'{device.name} terminal')
+                _align_net_identifier(terminal, f'{device.name} terminal')
             if device.kind == 'mos':
                 _netlist_identifier(device.model, f'{device.name} model')
                 if not isinstance(device.parameters, dict) or set(device.parameters) - {'M'}:

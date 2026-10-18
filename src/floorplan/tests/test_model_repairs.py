@@ -152,6 +152,34 @@ class ModelRepairTests(unittest.TestCase):
             self.assertEqual(restored.devices[1].value, '500')
         self.assertIn('.5k', project.source_netlist)
 
+    def test_align_rejects_numeric_net_spelling_changes_without_losing_drafts(self):
+        for name, alias in (('1.0', '1'), ('1e3', '1000'), ('1k', '1000'), ('1X', '1000000'),
+                            ('9007199254740993', '9007199254740992'), ('1e999', 'INF'), ('1e-999', '0')):
+            for location in ('port', 'internal'):
+                source = CIRCUIT.replace('IN', alias)
+                source = source.replace('OUT', name) if location == 'port' else source.replace('M1 OUT', f'M1 {name}')
+                with self.subTest(name=name, location=location), tempfile.TemporaryDirectory() as directory:
+                    project = FloorplanProject.from_text(source)
+                    saved = Path(directory) / 'draft.roar.floorplan'
+                    project.save(saved)
+                    restored = FloorplanProject.load(saved)
+                    self.assertEqual(restored.source_netlist, source)
+                    self.assertEqual(restored.devices[0].terminals[0], name)
+                    destination = Path(directory) / 'export'
+                    with self.assertRaisesRegex(ValueError, 'ALIGN 0.9.8.*net name'):
+                        restored.export_align(destination)
+                    self.assertFalse(destination.exists())
+
+    def test_align_preserves_safe_numeric_net_spellings(self):
+        for name in ('0', '1', '01', '1.', '1meg', '1.5', '0.0001', '9007199254740992', '100000000000000000000'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                gate = '1' if name == '01' else '01'
+                project = FloorplanProject.from_text(CIRCUIT.replace('IN', gate).replace('OUT', name))
+                netlist, _ = project.export_align(directory)
+                restored = FloorplanProject.from_netlist(netlist)
+                self.assertEqual(restored.ports, project.ports)
+                self.assertEqual(restored.devices[0].terminals, project.devices[0].terminals)
+
     def test_nf_one_and_odd_values_are_repairable_drafts(self):
         for nf in (1, 3):
             project = FloorplanProject.from_text(CIRCUIT.replace('NF=2', f'NF={nf}'))

@@ -316,7 +316,7 @@ def _check_combinations(constraints, row_numbers):
         for axis in axes.get(kind, ()):
             reserve(f'{axis} circuit spacing', row,
                     'Use either one Circuit spacing row or separate Horizontal and Vertical circuit spacing rows. ALIGN can overwrite overlapping settings.')
-        if kind == 'NetPriority' or (kind == 'NetConst' and 'criticality' in constraint):
+        if kind == 'NetPriority' or (kind == 'NetConst' and constraint.get('criticality') is not None):
             for net in constraint['nets']:
                 reserve(f'placement weight for net {net.upper()}', row,
                         'Set each net’s placement weight in only one enabled NetPriority or NetConst row.')

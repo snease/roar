@@ -7,27 +7,7 @@ import unittest
 from roar_api.floorplan import FloorplanProject
 from roar_api.floorplan.constraints import net_pins
 
-NETLIST = '''.subckt pair d1 d2 g s b
-M1 d1 g s b sky130_fd_pr__nfet_01v8 W=1u L=0.15u NF=2
-M2 d2 g s b sky130_fd_pr__nfet_01v8 W=1u L=0.15u NF=2
-.ends pair
-'''
-CASES = [
-    {'constraint': 'Boundary', 'max_width': 50, 'max_height': 40, 'halo_horizontal': 1.5, 'halo_vertical': 2},
-    {'constraint': 'AspectRatio', 'ratio_low': 0.5, 'ratio_high': 2, 'weight': 2},
-    {'constraint': 'Spread', 'instances': ['M1', 'M2'], 'direction': 'horizontal', 'distance': 420},
-    {'constraint': 'BlockDistance', 'abs_distance': 420},
-    {'constraint': 'HorizontalDistance', 'abs_distance': 420},
-    {'constraint': 'VerticalDistance', 'abs_distance': 280},
-    {'constraint': 'SameTemplate', 'instances': ['M1', 'M2']},
-    {'constraint': 'AlignInOrder', 'instances': ['M1', 'M2'], 'line': 'center', 'direction': 'vertical', 'abut': False},
-    {'constraint': 'PortLocation', 'ports': ['d1'], 'location': 'TC'},
-    {'constraint': 'SymmetricNets', 'net1': 'd1', 'net2': 'd2', 'pins1': ['M1/D', 'd1'], 'pins2': ['M2/D', 'd2'], 'direction': 'V'},
-    {'constraint': 'ClockPorts', 'ports': ['g'], 'propagate': False},
-    {'constraint': 'DoNotIdentify', 'instances': ['M1']},
-    {'constraint': 'ConfigureCompiler', 'merge_series_devices': False, 'merge_parallel_devices': False, 'auto_constraint': False},
-    {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 3},
-]
+from roar_api.floorplan.tests.constraint_cases import CASES, EXPORT_ONLY, NETLIST
 
 
 class ConstraintCoverageTests(unittest.TestCase):
@@ -45,13 +25,7 @@ class ConstraintCoverageTests(unittest.TestCase):
                 self.assertEqual(reopened.constraints, [rule])
 
     def test_native_export_without_form_is_not_rejected_as_unknown(self):
-        for rule in [
-            {'constraint': 'NetConst', 'nets': ['d1'], 'shield': 's', 'criticality': 3},
-            {'constraint': 'MultiConnection', 'nets': ['d1'], 'multiplier': 2},
-            {'constraint': 'DoNotRoute', 'nets': ['s']},
-            {'constraint': 'DoNotUseLib', 'libraries': ['DP_NMOS'], 'propagate': True},
-            {'constraint': 'Route', 'min_layer': 'M1', 'max_layer': 'M4', 'customize': [{'nets': ['d1'], 'match': True}]},
-        ]:
+        for rule in EXPORT_ONLY:
             with self.subTest(kind=rule['constraint']):
                 self.project.set_constraints([rule])
                 self.project.validate()
@@ -208,6 +182,22 @@ class ConstraintCoverageTests(unittest.TestCase):
             {'constraint': 'VerticalDistance', 'abs_distance': 420},
         ])
         self.project.validate()
+
+    def test_netconst_only_reserves_placement_weight_for_nonnull_criticality(self):
+        for fields in ({}, {'criticality': None}, {'criticality': 2}):
+            for weight_rule in (
+                {'constraint': 'NetPriority', 'nets': ['D1'], 'weight': 0},
+                {'constraint': 'NetConst', 'nets': ['D1'], 'criticality': 3},
+            ):
+                shield_rule = {'constraint': 'NetConst', 'nets': ['d1'], 'shield': 's', **fields}
+                for rules in ([shield_rule, weight_rule], [weight_rule, shield_rule]):
+                    with self.subTest(fields=fields, rules=rules):
+                        if fields.get('criticality') is not None:
+                            with self.assertRaisesRegex(ValueError, 'overlapping placement weight'):
+                                self.project.set_constraints(rules)
+                        else:
+                            self.project.set_constraints(rules)
+                            self.project.validate()
 
 
 try:

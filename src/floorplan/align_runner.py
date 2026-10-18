@@ -20,6 +20,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from .run_options import validate_run_options
+
 PROFILE = json.loads(Path(__file__).with_name('align_profile.json').read_text(encoding='utf-8'))
 PROFILE_ID = PROFILE['id']
 _ACTIVE = {'starting', 'generating', 'serving', 'stopping'}
@@ -85,6 +87,8 @@ def _ownership_lock(root):
 def _serialized(method):
     @wraps(method)
     def guarded(self, *args, **kwargs):
+        if method.__name__ in {'shutdown', 'log_tail'} and self._run_dir is None:
+            return method(self, *args, **kwargs)
         if (method.__name__ in {'last_run', 'last_placement', 'last_preview', 'poll'} and self._run_dir is None
                 and (not self.config.run_root or not self._root.is_dir())):
             return None
@@ -96,17 +100,7 @@ def _serialized(method):
 def run_options(project):
     options = dict(PROFILE['run_defaults'], lambda_coeff=1.0)
     options.update(getattr(project, 'run_options', {}))
-    allowed = {'nvariants', 'placer_sa_iterations', 'seed', 'lambda_coeff'}
-    if set(options) - allowed:
-        raise ValueError('Unknown ALIGN run options: ' + ', '.join(sorted(set(options) - allowed)))
-    for key, low, high in [('nvariants', 1, 100), ('placer_sa_iterations', 1, 1000000), ('seed', 0, 2147483647)]:
-        value = options[key]
-        if type(value) is not int or not low <= value <= high:
-            raise ValueError(f'{key} must be an integer from {low} to {high}')
-    value = options['lambda_coeff']
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0.01 <= value <= 1000:
-        raise ValueError('Area / wirelength weight must be a finite number from 0.01 to 1000')
-    return options
+    return validate_run_options(options)
 
 
 def _write_json(path, value):
@@ -378,10 +372,22 @@ class AlignRunner:
         captured_tool = manifest.get('generation_config', {}).get('tool_identity')
         return not matches or (captured_tool is not None and captured_tool != _tool_identity(self.config))
 
+    def _read_pointer(self, key, owners):
+        """Ignore history entries transferred away from this index's owner."""
+        path = self._index(key)
+        pointer = json.loads(path.read_text()) if path.is_file() else {}
+        for field in ('run_dir', 'placement_dir', 'preview_dir', 'last_attempt'):
+            if field not in pointer:
+                continue
+            record = Path(pointer[field]) / 'run.json' if pointer[field] else None
+            if (record is None or not record.is_file()
+                    or json.loads(record.read_text()).get('project_path') not in owners):
+                del pointer[field]
+        return pointer
+
     def _pointer(self, manifest):
         key = self.project_path or 'snapshot:' + manifest['fingerprint']
-        path = self._index(key)
-        return json.loads(path.read_text()) if path.is_file() else {}
+        return self._read_pointer(key, (self.project_path,))
 
     def _remember(self, manifest, placement=False, operation=False, preview=False):
         directory = self._root / 'last_runs'
@@ -403,19 +409,17 @@ class AlignRunner:
             _write_json(path, pointer)
 
     def _locate(self, project):
-        if self._run_dir is not None:
+        if self._owned_manifest() is not None:
             return
         keys = [self.project_path] if self.project_path else []
         if project is not None:
             keys.append('snapshot:' + project_fingerprint(project))
             keys.append('snapshot:' + _legacy_fingerprint(project))
         for key in keys:
-            pointer = self._index(key)
-            if not pointer.is_file():
+            pointer = self._read_pointer(key, (None, self.project_path))
+            if not pointer.get('run_dir'):
                 continue
-            directory = Path(json.loads(pointer.read_text())['run_dir'])
-            if not (directory / 'run.json').is_file():
-                continue
+            directory = Path(pointer['run_dir'])
             manifest = json.loads((directory / 'run.json').read_text())
             if manifest.get('project_path') not in (None, self.project_path):
                 continue
@@ -430,6 +434,21 @@ class AlignRunner:
                 finally:
                     self.project_path = target
             return
+
+    def _owned_manifest(self):
+        """Check cached ownership while the caller holds the ownership lock."""
+        if self._run_dir is None:
+            return None
+        manifest = json.loads((self._run_dir / 'run.json').read_text())
+        if manifest.get('project_path') == self.project_path:
+            return manifest
+        # Another controller transferred this run. A direct child still needs
+        # reaping when its new owner stops it, without retaining control here.
+        process = self._process
+        self._run_dir = self._process = self._verified_ready = None
+        if process is not None:
+            threading.Thread(target=process.wait, daemon=True).start()
+        return None
 
     @_serialized
     def last_run(self, project=None):
@@ -475,12 +494,14 @@ class AlignRunner:
 
     def _check_save_as(self, path):
         target = str(Path(path).expanduser().resolve()) if path else None
-        if target and self._index(target).is_file():
-            existing = json.loads(self._index(target).read_text())
+        existing = self._read_pointer(target, (None, target)) if target else {}
+        if existing.get('run_dir'):
             directory = Path(existing['run_dir'])
             record = directory / 'run.json'
-            if directory != self._run_dir and record.is_file() and _alive(json.loads(record.read_text()), directory):
-                raise ValueError('The Save As target already has an active ALIGN run')
+            if directory != self._run_dir and record.is_file():
+                manifest = json.loads(record.read_text())
+                if manifest.get('project_path') in (None, target) and _alive(manifest, directory):
+                    raise ValueError('The Save As target already has an active ALIGN run')
 
     @contextmanager
     def save_as_transaction(self, path):
@@ -495,6 +516,7 @@ class AlignRunner:
             self.project_path = target
             return
         with _ownership_lock(self._root):
+            self._owned_manifest()
             self._check_save_as(path)
             original_path = self.project_path
             target = Path(path).expanduser().resolve()
@@ -529,6 +551,7 @@ class AlignRunner:
     @_serialized
     def rebind_project_path(self, path):
         """Transfer a Save As association without interrupting its worker."""
+        manifest = self._owned_manifest()
         target = str(Path(path).expanduser().resolve()) if path else None
         if target == self.project_path:
             return
@@ -536,7 +559,6 @@ class AlignRunner:
         if self._run_dir is None:
             self.project_path = target
             return
-        manifest = json.loads((self._run_dir / 'run.json').read_text())
         pointer = self._pointer(manifest)
         for directory in {str(self._run_dir), pointer.get('placement_dir'), pointer.get('preview_dir'), pointer.get('last_attempt')} - {None}:
             run_path = Path(directory) / 'run.json'
@@ -647,8 +669,11 @@ class AlignRunner:
         manifest = json.loads((self._run_dir / 'run.json').read_text())
         previous_directory = self._pointer(manifest).get('placement_dir')
         if previous_directory and self._has_dump(previous_directory):
-            self._run_dir = Path(previous_directory)
-            manifest = json.loads((self._run_dir / 'run.json').read_text())
+            directory = Path(previous_directory)
+            manifest = json.loads((directory / 'run.json').read_text())
+            if manifest.get('project_path') != self.project_path:
+                raise ValueError('No captured ALIGN placement exists for this floorplan')
+            self._run_dir = directory
         for relative, expected in manifest['input_hashes'].items():
             path = self._run_dir / relative
             if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -669,9 +694,9 @@ class AlignRunner:
 
     @_serialized
     def poll(self, project=None):
-        if self._run_dir is None:
+        manifest = self._owned_manifest()
+        if manifest is None:
             return None
-        manifest = json.loads((self._run_dir / 'run.json').read_text())
         active = manifest.get('active') or {}
         progress = json.loads((self._run_dir / 'status.json').read_text()) if (self._run_dir / 'status.json').is_file() else {}
         if progress.get('token') != active.get('token'):
@@ -712,12 +737,13 @@ class AlignRunner:
                     status, url = 'starting', None
         if status != 'serving':
             url = None
+        pointer = self._pointer(manifest)
         return RunState(str(self._run_dir), status, url, progress.get('error'), str(self._run_dir / 'align.log'),
                         manifest['fingerprint'], self._stale(manifest, project),
                         alive and status != 'stopping', self._has_dump(self._run_dir) or
-                        self._has_dump(self._pointer(manifest).get('placement_dir', self._run_dir)),
+                        self._has_dump(pointer.get('placement_dir', self._run_dir)),
                         self._has_preview(self._run_dir) or
-                        self._has_preview(self._pointer(manifest).get('preview_dir', self._run_dir)))
+                        self._has_preview(pointer.get('preview_dir', self._run_dir)))
 
     def _signal(self, manifest, sig):
         if self._process_alive(manifest):
@@ -730,18 +756,19 @@ class AlignRunner:
 
     @_serialized
     def stop(self):
-        if self._run_dir is None:
+        manifest = self._owned_manifest()
+        if manifest is None:
             raise ValueError('No ALIGN run to stop')
-        manifest = json.loads((self._run_dir / 'run.json').read_text())
         if self._process_alive(manifest):
             manifest['active']['stop_requested'] = time.time()
             _write_json(self._run_dir / 'run.json', manifest)
             self._signal(manifest, signal.SIGTERM)
         return self.poll()
 
+    @_serialized
     def shutdown(self):
         """Bounded final teardown; does not rely on a Qt/event-loop timer."""
-        if self._run_dir is None:
+        if self._owned_manifest() is None:
             return None
         self.stop()
         manifest = json.loads((self._run_dir / 'run.json').read_text())
@@ -758,8 +785,9 @@ class AlignRunner:
 
     close = shutdown
 
+    @_serialized
     def log_tail(self, max_chars=12000):
-        if self._run_dir is None:
+        if self._owned_manifest() is None:
             return ''
         path = self._run_dir / 'align.log'
         if not path.is_file():

@@ -362,6 +362,153 @@ class RunnerTests(unittest.TestCase):
         old = AlignRunner(self.config, self.base / 'project.floorplan')
         self.assertIsNone(old.last_run(self.project))
 
+    def transferred_run(self, direct_child):
+        source = Path(tempfile.mkdtemp(dir=self.base)) / 'source.floorplan'
+        initiator = AlignRunner(self.config, source)
+        self.addCleanup(initiator.shutdown)
+        initiator.start(self.project)
+        state = self.until(initiator, 'serving')
+        observer = AlignRunner(self.config, source)
+        self.addCleanup(observer.shutdown)
+        observer.last_run(self.project)
+        stale, owner = (initiator, observer) if direct_child else (observer, initiator)
+        owner.rebind_project_path(source.with_name('destination.floorplan'))
+        return stale, owner, state
+
+    def test_transferred_run_detaches_cached_reads_and_reopen(self):
+        for direct_child in (False, True):
+            for operation in ('poll', 'last_run', 'last_placement', 'last_preview', 'log_tail', 'open_last'):
+                with self.subTest(direct_child=direct_child, operation=operation):
+                    stale, owner, state = self.transferred_run(direct_child)
+                    manifest_path = Path(state.run_dir) / 'run.json'
+                    manifest = manifest_path.read_bytes()
+                    source_index = stale._index(stale.project_path)
+                    original_index = source_index.read_bytes()
+                    if operation == 'open_last':
+                        with self.assertRaisesRegex(ValueError, 'No captured ALIGN placement'):
+                            stale.open_last(self.project)
+                    else:
+                        result = getattr(stale, operation)() if operation == 'log_tail' else getattr(stale, operation)(self.project)
+                        self.assertEqual(result, '' if operation == 'log_tail' else None)
+                    self.assertIsNone(stale._run_dir)
+                    self.assertIsNone(stale._process)
+                    self.assertEqual(manifest_path.read_bytes(), manifest)
+                    self.assertEqual(source_index.read_bytes(), original_index)
+                    self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_transferred_run_cannot_be_stopped_or_shutdown_from_old_controller(self):
+        for direct_child in (False, True):
+            for operation in ('stop', 'shutdown'):
+                with self.subTest(direct_child=direct_child, operation=operation):
+                    stale, owner, state = self.transferred_run(direct_child)
+                    manifest_path = Path(state.run_dir) / 'run.json'
+                    manifest = manifest_path.read_bytes()
+                    if operation == 'stop':
+                        with self.assertRaisesRegex(ValueError, 'No ALIGN run to stop'):
+                            stale.stop()
+                    else:
+                        self.assertIsNone(stale.shutdown())
+                    self.assertEqual(manifest_path.read_bytes(), manifest)
+                    self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_transferred_controller_can_start_new_source_run(self):
+        for direct_child in (False, True):
+            with self.subTest(direct_child=direct_child):
+                stale, owner, transferred = self.transferred_run(direct_child)
+                stale.start(self.project)
+                new = self.until(stale, 'serving')
+                self.assertNotEqual(new.run_dir, transferred.run_dir)
+                self.assertEqual(owner.last_run(self.project).run_dir, transferred.run_dir)
+                self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_transferred_child_is_reaped_after_its_new_owner_stops_it(self):
+        stale, owner, state = self.transferred_run(direct_child=True)
+        process = stale._process
+        self.assertIsNone(stale.poll(self.project))
+        owner.shutdown()
+        deadline = time.monotonic() + 1
+        while process.returncode is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertIsNotNone(process.returncode)
+        self.assertFalse((Path('/proc') / str(process.pid)).exists())
+
+    def test_transferred_source_index_does_not_block_save_as(self):
+        stale, owner, state = self.transferred_run(direct_child=False)
+        source = Path(stale.project_path)
+        draft = AlignRunner(self.config)
+        with draft.save_as_transaction(source):
+            self.project.save(source)
+        self.assertEqual(FloorplanProject.load(source).top, self.project.top)
+        self.assertIsNone(draft.last_run(self.project))
+        self.assertEqual(owner.poll(self.project).run_dir, state.run_dir)
+        self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_transferred_controller_cannot_rebind_other_projects_history(self):
+        for direct_child in (False, True):
+            for transaction in (False, True):
+                with self.subTest(direct_child=direct_child, transaction=transaction):
+                    stale, owner, state = self.transferred_run(direct_child)
+                    manifest_path = Path(state.run_dir) / 'run.json'
+                    manifest = manifest_path.read_bytes()
+                    target = Path(stale.project_path).with_name('third.floorplan')
+                    if transaction:
+                        with stale.save_as_transaction(target):
+                            self.project.save(target)
+                    else:
+                        stale.rebind_project_path(target)
+                    self.assertEqual(stale.project_path, str(target))
+                    self.assertIsNone(stale.last_run(self.project))
+                    self.assertFalse(stale._index(str(target)).exists())
+                    self.assertEqual(manifest_path.read_bytes(), manifest)
+                    self.assertEqual(owner.last_placement(self.project).run_dir, state.run_dir)
+                    self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_new_attempt_does_not_inherit_or_reopen_transferred_history(self):
+        from roar_api.floorplan.geometry import build_preview
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        preview = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
+        for named in (False, True):
+            for mode in ('fail', 'pending'):
+                for operation in ('inspect', 'reopen'):
+                    with self.subTest(named=named, mode=mode, operation=operation):
+                        source = Path(tempfile.mkdtemp(dir=self.base)) / 'source.floorplan' if named else None
+                        owner = AlignRunner(self.config, source)
+                        self.addCleanup(owner.shutdown)
+                        (self.base / 'mode').write_text('good')
+                        owner.start(self.project)
+                        original = self.until(owner, 'serving')
+                        directory = Path(original.run_dir)
+                        (directory / 'preview.json').write_text(json.dumps(preview))
+                        owner.shutdown()
+                        owner.rebind_project_path(directory / 'destination.floorplan')
+                        manifest_path = directory / 'run.json'
+                        original_manifest = manifest_path.read_bytes()
+                        attempt = AlignRunner(self.config, source)
+                        self.addCleanup(attempt.shutdown)
+                        (self.base / 'mode').write_text(mode)
+                        attempt.start(self.project)
+                        if mode == 'pending':
+                            self.until(attempt, 'generating')
+                            attempt.stop()
+                        state = self.until(attempt, 'stopped' if mode == 'pending' else 'failed')
+                        if operation == 'reopen':
+                            with self.assertRaisesRegex(ValueError, 'no generated placement'):
+                                attempt.open_last(self.project)
+                        else:
+                            self.assertFalse(state.has_placement)
+                            self.assertFalse(state.has_preview)
+                            self.assertIsNone(attempt.last_placement(self.project))
+                            self.assertIsNone(attempt.last_preview(self.project))
+                            pointer = json.loads(attempt._index(attempt.project_path or
+                                'snapshot:' + state.fingerprint).read_text())
+                            self.assertNotIn('placement_dir', pointer)
+                            self.assertNotIn('preview_dir', pointer)
+                            self.assertEqual(pointer['run_dir'], state.run_dir)
+                            self.assertEqual(pointer['last_attempt'], state.run_dir)
+                        self.assertEqual(manifest_path.read_bytes(), original_manifest)
+                        self.assertEqual(owner.last_placement(self.project).run_dir, original.run_dir)
+                        self.assertEqual(owner.last_preview(self.project).run_dir, original.run_dir)
+
     def test_stale_reopen_keeps_artifacts_and_last_placement_after_failure(self):
         self.runner.start(self.project)
         good = self.until(self.runner, 'serving')
@@ -420,6 +567,7 @@ class RunnerTests(unittest.TestCase):
         unsaved.start(self.project)
         state = self.until(unsaved, 'serving')
         adopted = AlignRunner(self.config, self.base / 'newly_saved.floorplan')
+        self.addCleanup(adopted.shutdown)
         self.assertEqual(adopted.last_run(self.project).run_dir, state.run_dir)
         self.project.set_parameter('w1_2', None)
         self.assertIsInstance(project_fingerprint(self.project), str)
@@ -544,7 +692,7 @@ class WorkerErrorTests(unittest.TestCase):
             modules = {
                 'align': SimpleNamespace(__version__=PROFILE['align_version'],
                                          schematic2layout=lambda **kwargs: calls.append(kwargs)),
-                'dash': SimpleNamespace(__version__='2.18.2'),
+                'dash': SimpleNamespace(__version__=str(PROFILE['dash_major']) + '.0.0'),
                 'align.gui.mockup': None, 'werkzeug.serving': None,
             }
             with patch.dict(sys.modules, modules), \
@@ -577,7 +725,7 @@ class WorkerErrorTests(unittest.TestCase):
             path = Path(directory) / 'run.json'
             activation = 'public-process-activation'
             path.write_text(json.dumps({'active': {'token': activation, 'mode': 'generate', 'backend_path': directory, 'port': 0},
-                'generation_config': {'profile': PROFILE, 'run_options': {'nvariants': 7, 'seed': 19}},
+                'generation_config': {'profile': dict(PROFILE, dash_major=2), 'run_options': {'nvariants': 7, 'seed': 19}},
                 'input_dir': directory, 'top': 'test'}))
             placer, captured = SimpleNamespace(), {}
             def schematic2layout(**kwargs):
@@ -596,7 +744,7 @@ class WorkerErrorTests(unittest.TestCase):
                 return SimpleNamespace(server_port=9012, serve_forever=serve, server_close=lambda: None)
             modules = {
                 'align': SimpleNamespace(__version__=PROFILE['align_version'], schematic2layout=schematic2layout),
-                'dash': SimpleNamespace(__version__='2.18.2'), 'align.pnr': SimpleNamespace(placer=placer),
+                'dash': SimpleNamespace(__version__=str(PROFILE['dash_major']) + '.0.0'), 'align.pnr': SimpleNamespace(placer=placer),
                 'align.gui.mockup': SimpleNamespace(AppWithCallbacksAndState=application),
                 'werkzeug.serving': SimpleNamespace(make_server=server),
             }
@@ -668,7 +816,7 @@ class WorkerErrorTests(unittest.TestCase):
                 placer.run_gui(tagged_bboxes={}, module_name='TEST', lambda_coeff=1, port=0)
             modules = {
                 'align': SimpleNamespace(__version__=PROFILE['align_version'], schematic2layout=schematic2layout),
-                'dash': SimpleNamespace(__version__='2.18.2'),
+                'dash': SimpleNamespace(__version__=str(PROFILE['dash_major']) + '.0.0'),
                 'align.pnr': SimpleNamespace(placer=placer),
                 'align.gui.mockup': SimpleNamespace(AppWithCallbacksAndState=lambda **kwargs: SimpleNamespace(app=SimpleNamespace(server=object()))),
                 'werkzeug.serving': SimpleNamespace(make_server=lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError(errno.EPERM, 'Operation not permitted'))),

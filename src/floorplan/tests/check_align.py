@@ -27,34 +27,7 @@ from align.schema.parser import SpiceParser
 from align.compiler.user_const import ConstraintParser
 from align.pnr.write_constraint import PnRConstraintWriter
 
-PAIR = '''.subckt pair d1 d2 g s b
-M1 d1 g s b sky130_fd_pr__nfet_01v8 W=1u L=0.15u NF=2
-M2 d2 g s b sky130_fd_pr__nfet_01v8 W=1u L=0.15u NF=2
-.ends pair
-'''
-CAPABILITIES = [
-    {'constraint': 'Boundary', 'max_width': 50, 'max_height': 40, 'halo_horizontal': 1.5, 'halo_vertical': 2},
-    {'constraint': 'AspectRatio', 'ratio_low': 0.5, 'ratio_high': 2, 'weight': 2},
-    {'constraint': 'Spread', 'instances': ['M1', 'M2'], 'direction': 'horizontal', 'distance': 420},
-    {'constraint': 'BlockDistance', 'abs_distance': 420},
-    {'constraint': 'HorizontalDistance', 'abs_distance': 420},
-    {'constraint': 'VerticalDistance', 'abs_distance': 280},
-    {'constraint': 'SameTemplate', 'instances': ['M1', 'M2']},
-    {'constraint': 'AlignInOrder', 'instances': ['M1', 'M2'], 'line': 'center', 'direction': 'vertical', 'abut': False},
-    {'constraint': 'PortLocation', 'ports': ['d1'], 'location': 'TC'},
-    {'constraint': 'SymmetricNets', 'net1': 'd1', 'net2': 'd2', 'pins1': ['M1/D', 'd1'], 'pins2': ['M2/D', 'd2'], 'direction': 'V'},
-    {'constraint': 'ClockPorts', 'ports': ['g'], 'propagate': False},
-    {'constraint': 'DoNotIdentify', 'instances': ['M1']},
-    {'constraint': 'ConfigureCompiler', 'merge_series_devices': False, 'merge_parallel_devices': False, 'auto_constraint': False},
-    {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 2},
-]
-EXPORT_ONLY = [
-    {'constraint': 'NetConst', 'nets': ['d1'], 'shield': 's', 'criticality': 3},
-    {'constraint': 'MultiConnection', 'nets': ['d1'], 'multiplier': 2},
-    {'constraint': 'DoNotRoute', 'nets': ['s']},
-    {'constraint': 'DoNotUseLib', 'libraries': ['dp_nmos'], 'propagate': True},
-    {'constraint': 'Route', 'min_layer': 'm1', 'max_layer': 'm4', 'customize': [{'nets': ['d1'], 'match': True}]},
-]
+from floorplan.tests.constraint_cases import CASES as CAPABILITIES, EXPORT_ONLY, NETLIST as PAIR
 
 results = {'align_version': align.__version__, 'align_module': align.__file__,
            'pdk': str(args.pdk.resolve()), 'repo': str(args.repo.resolve()), 'cases': []}
@@ -69,6 +42,7 @@ def native(project, parent):
     top.verify()
     mapped = PnRConstraintWriter().map_valid_const(top.constraints,
         {'instances': [{'instance_name': item.name} for item in top.elements]})
+    assert top.pins == [port.upper() for port in project.ports]
     assert len(top.elements) == len(project.devices)
     for original in project.devices:
         parsed = top.get_element(original.name)
@@ -122,6 +96,56 @@ for bad in ['NF=0', 'NF=2.5', 'NF=2 M=0.5']:
         raise AssertionError('Invalid generator size accepted: ' + bad)
 results['rejected_sizes'] = ['NF=0', 'NF=2.5', 'M=0.5']
 
+# Pin spelling is topology: the native NUMBER lexer casts through float/int,
+# while NAME tokens such as 01 must remain distinct from 1.
+for index, (name, other) in enumerate([
+    ('0', '01'), ('1', '01'), ('1.', '1'), ('1meg', '1'), ('1.5', '1'), ('0.0001', '1'),
+    ('9007199254740992', '1'), ('100000000000000000000', '1'),
+]):
+    source = PAIR.replace('d1', name).replace('d2', other).replace(' g ', ' 001 ')
+    results['cases'].append(native(FloorplanProject.from_text(source), output / f'numeric-nets-{index}'))
+
+results['rejected_numeric_net_names'] = []
+for index, (name, normalized) in enumerate([
+    ('1.0', '1'), ('1e3', '1000'), ('1k', '1000'), ('1X', '1000000'),
+    ('9007199254740993', '9007199254740992'), ('1e999', 'INF'), ('1e-999', '0'),
+]):
+    for location in ('port', 'internal'):
+        source = PAIR.replace('d2', normalized)
+        source = source.replace('d1', name) if location == 'port' else source.replace('M1 d1', f'M1 {name}')
+        parser = SpiceParser()
+        parser.parse((args.pdk / 'models.sp').read_text())
+        parser.parse(source)
+        top = parser.library.find('PAIR')
+        assert top.get_element('M1').pins['D'] == normalized
+        assert top.get_element('M2').pins['D'] == normalized
+        if location == 'port':
+            assert top.pins[:2] == [normalized, normalized]
+        project = FloorplanProject.from_dict(FloorplanProject.from_text(source).to_dict())
+        destination = output / f'rejected-numeric-net-{index}-{location}'
+        try:
+            project.export_align(destination)
+        except ValueError as exc:
+            assert 'ALIGN 0.9.8 changes net name' in str(exc), str(exc)
+        else:
+            raise AssertionError('Unsafe numeric net name exported: ' + name)
+        assert not destination.exists()
+        results['rejected_numeric_net_names'].append({'name': name, 'native_name': normalized, 'location': location})
+
+for index, criticality in enumerate(({}, {'criticality': None})):
+    for weight in (0, 3):
+        project = FloorplanProject.from_text(PAIR)
+        project.set_constraints([
+            {'constraint': 'NetConst', 'nets': ['d1'], 'shield': 's', **criticality},
+            {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': weight},
+        ])
+        result = native(project, output / f'null-criticality-{index}-{weight}')
+        assert result['native_mapping'] == [
+            {'const_name': 'ShieldNet', 'net_name': 'D1', 'shield_net': 'S'},
+            {'const_name': 'CritNet', 'net_name': 'D1', 'priority': weight},
+        ]
+        results['cases'].append(result)
+
 for rule in CAPABILITIES + EXPORT_ONLY:
     project = FloorplanProject.from_text(PAIR)
     project.set_constraints([rule])
@@ -132,7 +156,7 @@ for rule in CAPABILITIES + EXPORT_ONLY:
     if kind == 'PortLocation':
         assert mapped == [{'const_name': 'PortLocation', 'location': 'TC', 'terminal_name': 'D1'}]
     elif kind == 'NetPriority':
-        assert mapped == [{'const_name': 'CritNet', 'net_name': 'D1', 'priority': 2}]
+        assert mapped == [{'const_name': 'CritNet', 'net_name': 'D1', 'priority': 3}]
     elif kind == 'NetConst':
         assert mapped == [{'const_name': 'ShieldNet', 'net_name': 'D1', 'shield_net': 'S'},
                           {'const_name': 'CritNet', 'net_name': 'D1', 'priority': 3}]
