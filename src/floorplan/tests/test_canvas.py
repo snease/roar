@@ -7,7 +7,9 @@ try:
     from PyQt6.QtGui import QFocusEvent, QMouseEvent
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QDialog, QVBoxLayout
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name != "PyQt6":
+        raise
     QApplication = None
 
 from roar_api.floorplan.model import FloorplanProject
@@ -45,7 +47,9 @@ class SketchCanvasTests(unittest.TestCase):
         self.panel.deleteLater()
         self.app.processEvents()
 
-    def press(self, name="M1", modifiers=Qt.KeyboardModifier.NoModifier):
+    def press(self, name="M1", modifiers=None):
+        if modifiers is None:
+            modifiers = Qt.KeyboardModifier.NoModifier
         position = self.panel.view.mapFromScene(self.panel.items_by_name[name].pos())
         QTest.mousePress(self.panel.view.viewport(), Qt.MouseButton.LeftButton, modifiers, position)
         self.assertIsNotNone(self.panel.view._gesture)
@@ -54,7 +58,9 @@ class SketchCanvasTests(unittest.TestCase):
     def release(self, position):
         QTest.mouseRelease(self.panel.view.viewport(), Qt.MouseButton.LeftButton, pos=position)
 
-    def pointer_move(self, position, buttons=Qt.MouseButton.LeftButton):
+    def pointer_move(self, position, buttons=None):
+        if buttons is None:
+            buttons = Qt.MouseButton.LeftButton
         event = QMouseEvent(QEvent.Type.MouseMove, QPointF(position),
                             QPointF(self.panel.view.viewport().mapToGlobal(position)),
                             Qt.MouseButton.NoButton, buttons, Qt.KeyboardModifier.NoModifier)
@@ -212,6 +218,11 @@ class SketchCanvasTests(unittest.TestCase):
         self.panel.set_project(self.project)
         positions = self.panel.display_positions()
         self.assertIn("Sketch conflict", self.panel.status.text())
+        self.panel.highlight_constraint(self.project.constraints[0])
+        self.assertIn("Sketch conflict", self.panel.status.text())
+        self.assertNotIn("enforced in sketch", self.panel.capabilities.text())
+        self.assertIn("blocked by sketch conflict", self.panel.capabilities.text())
+        self.assertIn("blocked by conflict", self.panel._relationship_items[-1].text())
         start = self.press()
         self.panel.view.preview_drag(QPointF(30, 10))
         self.release(start)
@@ -229,6 +240,47 @@ class SketchCanvasTests(unittest.TestCase):
         self.assertIn("<b>future</b>", self.panel.status.text())
         self.assertEqual(self.panel.status.textFormat(), Qt.TextFormat.PlainText)
         self.assertIn("unsupported for export", self.panel.capabilities.text())
+
+    def test_role_badges_related_rule_navigation_and_literal_tooltips(self):
+        self.project.set_device_labels({'M1': 'tail <bias>'})
+        self.project.set_constraints([
+            {'constraint': 'Align', 'instances': ['M1', 'M2'], 'line': 'h_center'},
+            {'constraint': 'SameTemplate', 'instances': ['M1', 'M2']}])
+        self.project.set_constraint_enabled(1, False)
+        self.panel.set_project(self.project)
+        self.panel.set_selection(['M1'])
+        block = self.panel.items_by_name['M1']
+        self.assertEqual(block.name, 'M1')
+        self.assertEqual(block.role, 'tail <bias>')
+        self.assertEqual(block.rule_count, 1)
+        self.assertIn('tail &lt;bias&gt;', block.toolTip())
+        self.assertIn('disabled', block.toolTip())
+        self.assertEqual(self.panel.rule_combo.count(), 3)
+        inspected, labels = [], []
+        self.panel.constraintRequested.connect(inspected.append)
+        self.panel.labelRequested.connect(labels.append)
+        self.panel.role_button.click()
+        self.panel.rule_combo.setCurrentIndex(2)
+        self.panel.inspect_button.click()
+        self.assertEqual(labels, ['M1'])
+        self.assertEqual(inspected, [1])
+        self.assertIn('Disabled', self.panel.status.text())
+
+    def test_new_document_fits_camera_but_ordinary_refresh_preserves_it(self):
+        self.panel.view.scale(3, 3)
+        zoom = self.panel.view.transform().m11()
+        self.panel.set_project(self.project)
+        self.assertAlmostEqual(self.panel.view.transform().m11(), zoom)
+        other = FloorplanProject.from_dict(self.project.to_dict())
+        other.set_sketch({'positions': {name: [p[0] + 5000, p[1] + 6000]
+                                       for name, p in other.sketch['positions'].items()}, 'groups': []})
+        self.panel.reset_document()
+        self.panel.set_project(other)
+        self.app.processEvents()
+        for item in self.panel.items_by_name.values():
+            self.assertTrue(self.panel.view.viewport().rect().contains(
+                self.panel.view.mapFromScene(item.pos())))
+        self.assertFalse(self.panel.selected_names())
 
     def test_explicit_toolbar_actions_emit_valid_native_rules_and_group_is_metadata(self):
         self.panel.set_selection(["M3", "M1", "M2"])

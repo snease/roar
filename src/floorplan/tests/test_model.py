@@ -314,7 +314,7 @@ class ProjectTests(unittest.TestCase):
         project = self.project()
         legacy = project.to_dict()
         legacy['version'] = 2
-        for key in ('align_profile', 'source_mode', 'run_options', 'constraint_enabled', 'constraint_ids', 'sketch'):
+        for key in ('align_profile', 'source_mode', 'run_options', 'constraint_enabled', 'constraint_ids', 'sketch', 'device_labels'):
             legacy.pop(key)
         restored = FloorplanProject.from_dict(legacy)
         self.assertIsNone(restored.align_profile)
@@ -323,7 +323,7 @@ class ProjectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = project.save(Path(directory) / 'ota.roar.floorplan')
             state = json.loads(path.read_text())
-            self.assertEqual(state['version'], 5)
+            self.assertEqual(state['version'], 6)
             self.assertEqual(FloorplanProject.load(path).align_profile, project.align_profile)
             self.assertEqual(FloorplanProject.load(path).devices, project.devices)
             for invalid in ('', '  ', 12, {}):

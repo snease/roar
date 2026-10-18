@@ -57,12 +57,77 @@ class WorkspaceTests(unittest.TestCase):
         self.design.set_instance_attribute("M1", "W", 3e-6)
         self.assertTrue(self.workspace.is_modified())
 
-    def test_recording_invalid_editor_data_drops_stale_document_identity(self):
+    def test_recording_unfinished_editor_tracks_identity_without_validating_sizes(self):
         self.workspace.record(self.root / "previous.roar")
         self.workspace._capture_design = lambda: {"instance_table": [{"Instance": ""}]}
+        self.workspace.record(self.root / "unfinished.json")
+        self.assertEqual(self.workspace.path, str(self.root / "unfinished.json"))
+        self.assertFalse(self.workspace.is_modified())
+        with self.assertRaises(ValueError):
+            self.workspace.snapshot()
+        self.workspace._capture_design = lambda: {"instance_table": "unreadable"}
         with self.assertRaises(ValueError):
             self.workspace.record(self.root / "unfinished.json")
         self.assertIsNone(self.workspace.path)
+
+    def test_unfinished_editor_can_be_discarded_and_failed_switch_restores_raw_rows(self):
+        state = self.design.to_state()['design_editor']
+        state['instance_table'].append({'Instance': '', 'W': 'unfinished', 'disabled': False})
+        holder = {'editor': deepcopy(state)}
+        def apply(design):
+            holder['editor'] = design.to_state()['design_editor']
+        def restore(editor):
+            holder['editor'] = deepcopy(editor)
+        workspace = DesignWorkspace(
+            capture_design=lambda: Design.from_state(holder['editor']),
+            capture_editor=lambda: holder['editor'], capture_state=lambda: {},
+            apply_design=apply, apply_editor=restore)
+        self.assertTrue(workspace.is_modified())
+        self.assertTrue(workspace.has_content())
+        with self.assertRaises(ValueError):
+            workspace.snapshot()
+        target = self.target()
+        def fail_after_apply(design):
+            apply(design)
+            raise RuntimeError('target editor failed')
+        workspace._apply_design = fail_after_apply
+        with self.assertRaisesRegex(RuntimeError, 'target editor failed'):
+            workspace.switch(target)
+        self.assertEqual(holder['editor'], state)
+        self.assertIsNone(workspace.path)
+        workspace._apply_design = apply
+        workspace.switch(target)
+        self.assertEqual(workspace.path, str(target))
+        self.assertEqual(workspace.snapshot().instances[0]['Instance'], 'M2')
+
+    def test_failed_raw_capture_cannot_be_treated_as_an_empty_editor(self):
+        original = self.root / 'current.roar'
+        self.workspace.record(original)
+        target = self.target()
+        for unreadable in ({}, {'design_editor': {}}, {'iterative_solver': {}}):
+            self.workspace._capture_editor = lambda value=unreadable: value
+            with self.subTest(value=unreadable):
+                for action in (self.workspace.editor_snapshot, self.workspace.has_content,
+                               self.workspace.is_modified, lambda: self.workspace.switch(target)):
+                    with self.assertRaisesRegex(ValueError, 'could not be read'):
+                        action()
+                self.assertEqual(self.workspace.path, str(original))
+                self.assertEqual(self.applies, [])
+        # A recognized table is enough: an empty or unfinished table is valid
+        # raw editor data even though the sizing snapshot may reject its rows.
+        self.workspace._capture_editor = lambda: {'instance_table': []}
+        self.assertFalse(self.workspace.has_content())
+        self.workspace._capture_editor = lambda: {'instance_table': [{'Instance': ''}]}
+        self.assertTrue(self.workspace.has_content())
+
+    def test_saved_design_loader_reports_excessive_json_as_input_errors(self):
+        path = self.root / 'malformed.roar'
+        for content in ('[' * 1500 + '0' + ']' * 1500,
+                        json.dumps({'instance_table': [{'Instance': 'M1', 'W': 10 ** 400}]}),
+                        json.dumps({'design_editor': {'instance_table': []}, 'graph_tabs': None})):
+            path.write_text(content)
+            with self.subTest(content=content[:40]), self.assertRaises(ValueError):
+                load_roar_design(path)
 
     def test_save_complete_document_is_atomic_and_sets_baseline(self):
         path = self.root / "new.roar"

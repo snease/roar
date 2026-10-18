@@ -20,6 +20,86 @@ class ModelRepairTests(unittest.TestCase):
     def project(self):
         return FloorplanProject.from_text(CIRCUIT)
 
+    def test_document_loaders_reject_excessive_depth_and_numbers_as_value_errors(self):
+        state = self.project().to_dict()
+        state['run_options'] = {'lambda_coeff': 10 ** 400}
+        with self.assertRaisesRegex(ValueError, 'numeric range'):
+            FloorplanProject.from_dict(state)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'malformed.roar.floorplan'
+            for content in ('[' * 1500 + '0' + ']' * 1500, json.dumps(state)):
+                path.write_text(content)
+                with self.assertRaises(ValueError):
+                    FloorplanProject.load(path)
+        nested = []
+        for _ in range(100):
+            nested = [nested]
+        state = self.project().to_dict()
+        state['constraints'] = [{'constraint': 'FutureRule', 'opaque': nested}]
+        with self.assertRaisesRegex(ValueError, 'complex'):
+            FloorplanProject.from_dict(state)
+
+    def test_unknown_constraint_shapes_remain_preserved_within_document_limits(self):
+        project = self.project()
+        project.constraints = [{'constraint': ['future'], 'opaque': {'nested': [None, True, 2]}}]
+        project.constraint_enabled = [False]
+        restored = FloorplanProject.from_dict(project.to_dict())
+        self.assertEqual(restored.constraints, project.constraints)
+        for key, value in (('source_netlist', None), ('source_path', []), ('top', {})):
+            state = project.to_dict()
+            state[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                FloorplanProject.from_dict(state)
+
+    def test_unnamed_live_draft_saves_captured_intent_without_stopping_live_session(self):
+        project = self.project()
+        project.source_mode = 'live'
+        with tempfile.TemporaryDirectory() as directory:
+            path = project.save(Path(directory) / 'draft.roar.floorplan')
+            self.assertEqual(project.source_mode, 'live')
+            self.assertEqual(FloorplanProject.load(path).source_mode, 'saved')
+            project.roar_project_path = Path(directory) / 'named.roar'
+            project.save(path)
+            self.assertEqual(FloorplanProject.load(path).source_mode, 'live')
+
+    def test_device_role_labels_roundtrip_without_changing_native_inputs(self):
+        project = self.project()
+        original = project.to_dict()
+        project.set_device_labels({'m1': 'Input pair', 'R1': 'Load'})
+        self.assertEqual(project.device_labels, {'M1': 'Input pair', 'R1': 'Load'})
+        detached = project.device_labels
+        detached.clear()
+        self.assertEqual(project.device_labels['M1'], 'Input pair')
+        restored = FloorplanProject.from_dict(project.to_dict())
+        self.assertEqual(restored.device_labels, project.device_labels)
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = FloorplanProject.from_dict(original).export_align(Path(directory) / 'before')
+            labeled = restored.export_align(Path(directory) / 'after')
+            self.assertEqual([p.read_text() for p in baseline], [p.read_text() for p in labeled])
+        for labels in ({'missing': 'Role'}, {'M1': ''}, {'M1': ' '}, {'M1': 'x' * 65},
+                       {'M1': 'two\nlines'}, {'M1': 'zero\u200bwidth'}, {'M1': 1},
+                       {'M1': 'one', 'm1': 'two'}):
+            with self.subTest(labels=labels), self.assertRaises(ValueError):
+                restored.set_device_labels(labels)
+            self.assertEqual(restored.device_labels, project.device_labels)
+        for version in range(1, 6):
+            legacy = deepcopy(original)
+            legacy['version'] = version
+            legacy.pop('device_labels')
+            if version < 5:
+                for key in ('constraint_ids', 'sketch'):
+                    legacy.pop(key)
+            if version < 4:
+                for key in ('source_mode', 'run_options', 'constraint_enabled'):
+                    legacy.pop(key)
+            if version < 3:
+                legacy.pop('align_profile')
+            if version < 2:
+                for key in ('parameters', 'overrides', 'roar_project_path'):
+                    legacy.pop(key)
+            with self.subTest(version=version):
+                self.assertEqual(FloorplanProject.from_dict(legacy).device_labels, {})
+
     def test_annotation_and_token_injection_rejected_in_every_identifier(self):
         # ALIGN evaluates annotation text. Reject it before constructing any
         # native input, including when hidden inside a subcircuit port token.
@@ -144,7 +224,7 @@ class ModelRepairTests(unittest.TestCase):
         for version in (1, 2, 3):
             state = project.to_dict()
             state['version'] = version
-            for key in ('source_mode', 'run_options', 'constraint_enabled', 'constraint_ids', 'sketch'):
+            for key in ('source_mode', 'run_options', 'constraint_enabled', 'constraint_ids', 'sketch', 'device_labels'):
                 state.pop(key)
             if version < 3:
                 state.pop('align_profile')

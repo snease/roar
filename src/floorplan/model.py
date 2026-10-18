@@ -13,7 +13,10 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import unicodedata
 from uuid import uuid4
+
+from .documents import load_document, validate_document
 
 try:
     from parse_netlist import MOSFETInstance, _parse_parameters, _split_tokens, parse_spice_netlist
@@ -602,6 +605,27 @@ class FloorplanProject:
             self._sketch = validate_sketch(self, {'positions': {}, 'groups': []})
         return deepcopy(self._sketch)
 
+    @property
+    def device_labels(self):
+        """Optional design-role labels; instance names remain native identities."""
+        return dict(getattr(self, '_device_labels', {}))
+
+    def set_device_labels(self, labels):
+        if not isinstance(labels, dict):
+            raise ValueError('Device labels must map instance names to text')
+        candidate = {}
+        for name, label in labels.items():
+            if not isinstance(name, str):
+                raise ValueError('Device labels must name existing instances')
+            canonical = self._device(name).name
+            if canonical in candidate:
+                raise ValueError(f'Duplicate device label for {canonical}')
+            if (not isinstance(label, str) or not label.strip() or len(label) > 64 or
+                    any(unicodedata.category(char).startswith('C') for char in label)):
+                raise ValueError('Device labels must be nonempty text up to 64 characters without control characters')
+            candidate[canonical] = label
+        self._device_labels = candidate
+
     def set_sketch(self, state):
         from .sketch import validate_sketch
         self._sketch = validate_sketch(self, state)
@@ -745,7 +769,7 @@ class FloorplanProject:
     def to_dict(self):
         if self.source_mode not in ('saved', 'live', 'linked'):
             raise ValueError('Sizing source mode must be saved, live, or linked')
-        return {'version': 5, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
+        return {'version': 6, 'source_netlist': self.source_netlist, 'source_path': self.source_path,
                 'top': self.top, 'dimension_unit': self.dimension_unit, 'width_convention': self.width_convention,
                 'devices': [{'name': d.name, 'width_um': d.width_um, 'length_um': d.length_um, 'nf': d.nf}
                             for d in self.devices if d.kind == 'mos'], 'constraints': deepcopy(self.constraints),
@@ -753,21 +777,30 @@ class FloorplanProject:
                 'roar_project_path': self.roar_project_path, 'align_profile': self.align_profile,
                 'source_mode': self.source_mode, 'run_options': _run_options(self.run_options),
                 'constraint_enabled': self._constraint_flags(),
-                'constraint_ids': self.constraint_ids, 'sketch': self.sketch}
+                'constraint_ids': self.constraint_ids, 'sketch': self.sketch,
+                'device_labels': self.device_labels}
 
     @classmethod
     def from_dict(cls, state):
+        validate_document(state)
         expected = {'version', 'source_netlist', 'source_path', 'top', 'dimension_unit', 'width_convention', 'devices', 'constraints'}
-        if isinstance(state, dict) and state.get('version') in (2, 3, 4, 5):
+        if isinstance(state, dict) and state.get('version') in (2, 3, 4, 5, 6):
             expected |= {'parameters', 'overrides', 'roar_project_path'}
-        if isinstance(state, dict) and state.get('version') in (3, 4, 5):
+        if isinstance(state, dict) and state.get('version') in (3, 4, 5, 6):
             expected.add('align_profile')
-        if isinstance(state, dict) and state.get('version') in (4, 5):
+        if isinstance(state, dict) and state.get('version') in (4, 5, 6):
             expected |= {'source_mode', 'run_options', 'constraint_enabled'}
-        if isinstance(state, dict) and state.get('version') == 5:
+        if isinstance(state, dict) and state.get('version') in (5, 6):
             expected |= {'constraint_ids', 'sketch'}
-        if not isinstance(state, dict) or state.get('version') not in (1, 2, 3, 4, 5) or set(state) != expected:
+        if isinstance(state, dict) and state.get('version') == 6:
+            expected.add('device_labels')
+        if (not isinstance(state, dict) or type(state.get('version')) is not int or
+                state['version'] not in (1, 2, 3, 4, 5, 6) or set(state) != expected):
             raise ValueError('Unsupported or malformed floorplan project version/fields')
+        if not isinstance(state['source_netlist'], str) or not isinstance(state['top'], str):
+            raise ValueError('Saved source netlist and circuit name must be text')
+        if state['source_path'] is not None and not isinstance(state['source_path'], str):
+            raise ValueError('Saved source path must be text or null')
         project = cls.from_text(state['source_netlist'], state['top'], state['dimension_unit'], state['width_convention'])
         project.source_path = state['source_path']
         profile = state.get('align_profile')
@@ -781,7 +814,7 @@ class FloorplanProject:
             raise ValueError('Sizing source mode must be saved, live, or linked')
         project.source_mode = source_mode
         project.run_options = _run_options(state.get('run_options', {}))
-        if state['version'] in (2, 3, 4, 5):
+        if state['version'] in (2, 3, 4, 5, 6):
             link = state['roar_project_path']
             if link is not None and (not isinstance(link, str) or not Path(link).is_absolute()):
                 raise ValueError('In-memory ROAR project links must be absolute; use load() for relative sidecar links')
@@ -828,13 +861,13 @@ class FloorplanProject:
             project.devices = project._rebuild(parameters)
         sizes = state['devices']
         expected_names = {device.name for device in project.devices if device.kind == 'mos'}
-        if not isinstance(sizes, list) or any(not isinstance(row, dict) or set(row) != {'name', 'width_um', 'length_um', 'nf'} for row in sizes):
+        if not isinstance(sizes, list) or any(not isinstance(row, dict) or set(row) != {'name', 'width_um', 'length_um', 'nf'} or not isinstance(row['name'], str) for row in sizes):
             raise ValueError('Malformed saved MOS sizes')
         if len(sizes) != len(expected_names) or {row['name'] for row in sizes} != expected_names:
             raise ValueError('Saved sizes do not match the source circuit instances')
         for row in sizes:
             device = project._device(row['name'])
-            if state['version'] in (2, 3, 4, 5):
+            if state['version'] in (2, 3, 4, 5, 6):
                 actual = {'name': device.name, 'width_um': device.width_um, 'length_um': device.length_um, 'nf': device.nf}
                 if row != actual:
                     raise ValueError(f'{device.name}: saved sizes conflict with source parameters or overrides')
@@ -848,10 +881,11 @@ class FloorplanProject:
         if not isinstance(flags, list) or len(flags) != len(constraints) or any(type(value) is not bool for value in flags):
             raise ValueError('Saved constraint enabled states must match the constraint rows')
         project.constraint_enabled = list(flags)
-        if state['version'] == 5:
+        if state['version'] in (5, 6):
             project._constraint_ids = cls._check_constraint_ids(state['constraint_ids'], len(constraints))
             project._constraint_id_rows = deepcopy(constraints)
             project.set_sketch(state['sketch'])
+        project.set_device_labels(state.get('device_labels', {}))
         return project
 
     def save(self, path):
@@ -861,6 +895,10 @@ class FloorplanProject:
         if self.source_path and path == Path(self.source_path):
             raise ValueError('Project save cannot overwrite the source netlist')
         state = self.to_dict()
+        # An unnamed live design has no identity to match on a later reopen.
+        # Keep the current session live, while saving a portable captured draft.
+        if state['source_mode'] == 'live' and not self.roar_project_path:
+            state['source_mode'] = 'saved'
         if self.roar_project_path:
             state['roar_project_path'] = os.path.relpath(self.roar_project_path, path.parent)
         content = json.dumps(state, indent=2, allow_nan=False) + '\n'
@@ -879,8 +917,10 @@ class FloorplanProject:
     @classmethod
     def load(cls, path):
         path = Path(path).expanduser().resolve()
-        state = json.loads(path.read_text(encoding='utf-8'))
-        if isinstance(state, dict) and state.get('version') in (2, 3, 4, 5) and state.get('roar_project_path'):
+        state = load_document(path)
+        if isinstance(state, dict) and state.get('version') in (2, 3, 4, 5, 6) and state.get('roar_project_path'):
+            if not isinstance(state['roar_project_path'], str):
+                raise ValueError('Saved ROAR project link must be text or null')
             state['roar_project_path'] = str((path.parent / state['roar_project_path']).resolve())
         return cls.from_dict(state)
 

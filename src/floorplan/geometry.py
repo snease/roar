@@ -43,10 +43,12 @@ def _number(value, where):
 
 
 def _name(value, where):
+    # Circuit identifiers are data, not artifact paths. In particular SPICE
+    # allows slash-separated net/instance names; _confined handles file paths.
     if (not isinstance(value, str) or not value or len(value) > 1024
-            or any(ord(c) < 32 for c in value) or '\\' in value or '/' in value
-            or value in ('.', '..')):
-        _fail(f'{where}: invalid identifier')
+            or any(ord(c) < 32 for c in value) or '\\' in value
+            or any(part in ('.', '..') for part in value.split('/'))):
+        _fail(f'{where}: invalid identifier {str(value)[:120]!r}')
     return value
 
 

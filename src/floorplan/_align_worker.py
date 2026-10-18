@@ -1,7 +1,6 @@
 """Executed as a file by the separate ALIGN Python; never imports ROAR/Qt."""
 import argparse
 import errno
-from http.cookies import SimpleCookie, CookieError
 import json
 import os
 from pathlib import Path
@@ -11,15 +10,13 @@ import secrets
 import sys
 import traceback
 import uuid
-from urllib.parse import parse_qs
 
 
 class ProtectedViewer:
     """Authenticate every native Dash route, including assets and callbacks."""
-    def __init__(self, application, token):
-        self.application, self.token = application, token
+    def __init__(self, application, path_prefix):
+        self.application, self.path_prefix = application, path_prefix
         self.port = None
-        self.cookie_name = 'roar_align_' + token[:16]
 
     def __call__(self, environ, start_response):
         host = f'127.0.0.1:{self.port}'
@@ -34,28 +31,34 @@ class ProtectedViewer:
             return reject('403 Forbidden', 'Cross-origin requests are not permitted.')
         if environ.get('HTTP_SEC_FETCH_SITE') == 'cross-site':
             return reject('403 Forbidden', 'Open the viewer from ROAR.')
-        query_token = parse_qs(environ.get('QUERY_STRING', '')).get('token', [''])[0]
-        if (environ.get('REQUEST_METHOD') == 'GET' and environ.get('PATH_INFO') == '/'
-                and secrets.compare_digest(query_token.encode(), self.token.encode())):
-            # Strip the secret from subsequent resource URLs and referrers.
-            cookie = f'{self.cookie_name}={self.token}; Path=/; HttpOnly; SameSite=Strict'
-            start_response('303 See Other', headers + [('Location', '/'), ('Set-Cookie', cookie)])
-            return [b'Opening the authenticated placement viewer.']
-        cookie = SimpleCookie()
-        try:
-            cookie.load(environ.get('HTTP_COOKIE', ''))
-        except CookieError:
-            return reject('403 Forbidden', 'Open the viewer from ROAR to authenticate.')
-        value = cookie[self.cookie_name].value if self.cookie_name in cookie else ''
-        bearer = environ.get('HTTP_AUTHORIZATION', '')
-        if not (secrets.compare_digest(value.encode(), self.token.encode())
-                or secrets.compare_digest(bearer.encode(), ('Bearer ' + self.token).encode())):
+        # Cookies are shared by every port on 127.0.0.1. Keep the capability in
+        # this viewer's URL instead, including all Dash assets and callbacks.
+        prefix = environ.get('PATH_INFO', '')[:len(self.path_prefix)]
+        if not secrets.compare_digest(prefix.encode(), self.path_prefix.encode()):
             return reject('403 Forbidden', 'Open the viewer from ROAR to authenticate.')
         def secured_start(status, response_headers, exc_info=None):
             response_headers = [(k, v) for k, v in response_headers
                                 if k.lower() not in {'cache-control', 'referrer-policy', 'x-frame-options'}]
             return start_response(status, response_headers + headers[1:], exc_info)
         return self.application(environ, secured_start)
+
+
+def _viewer_application(factory, path_prefix, **kwargs):
+    """Configure native Dash routes before its constructor registers them."""
+    names = ('DASH_URL_BASE_PATHNAME', 'DASH_ROUTES_PATHNAME_PREFIX',
+             'DASH_REQUESTS_PATHNAME_PREFIX', 'DASH_APP_NAME')
+    previous = {key: os.environ.get(key) for name in names for key in (name, name.lower())}
+    try:
+        for key in previous:
+            os.environ.pop(key, None)
+        os.environ['DASH_URL_BASE_PATHNAME'] = path_prefix
+        return factory(**kwargs)
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def validate_viewer_assets():
@@ -145,13 +148,13 @@ def main():
         def native_gui(*, tagged_bboxes, module_name, lambda_coeff, port):
             # Upstream startup_gui prepares the real native metrics/geometries.
             # Only its HTTP hosting is adapted: local, no debugger/reloader.
-            application = AppWithCallbacksAndState(tagged_bboxes=tagged_bboxes,
-                module_name=module_name, lambda_coeff=lambda_coeff)
             # Process ownership tokens are visible in /proc command lines.
             # Viewer credentials are independent and only stored in the private
             # run directory, never passed in process arguments.
-            viewer_secret = secrets.token_hex(32)
-            protected = ProtectedViewer(application.app.server, viewer_secret)
+            path_prefix = f'/roar-align/{secrets.token_hex(32)}/'
+            application = _viewer_application(AppWithCallbacksAndState, path_prefix,
+                tagged_bboxes=tagged_bboxes, module_name=module_name, lambda_coeff=lambda_coeff)
+            protected = ProtectedViewer(application.app.server, path_prefix)
             try:
                 server = make_server('127.0.0.1', port, protected, threaded=True)
             except OSError as error:
@@ -169,7 +172,7 @@ def main():
             try:
                 protected.port = server.server_port
                 print('ROAR placement viewer: stopping closes this viewer; this flow does not run routing or produce final GDS.', flush=True)
-                status('serving', url=f'http://127.0.0.1:{server.server_port}/?token={viewer_secret}')
+                status('serving', url=f'http://127.0.0.1:{server.server_port}{path_prefix}')
                 server.serve_forever()
             finally:
                 server.server_close()

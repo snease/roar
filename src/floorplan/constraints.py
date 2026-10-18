@@ -267,6 +267,8 @@ def validate_constraints(project, constraints, *, row_numbers=None):
                         names([constraint['shield']], set(nets), 'Shield net')
                     if constraint.get('criticality') is not None:
                         _number(constraint['criticality'], 'Net criticality', integer=True)
+                        if constraint['criticality'] == 0:
+                            raise ValueError('ALIGN 0.9.8 ignores NetConst criticality 0; use NetPriority with weight 0 for a zero placement weight')
             elif kind == 'Route':
                 def route_fields(values, keys):
                     if not isinstance(values, dict) or set(values) - keys:

@@ -20,6 +20,21 @@ from roar_api.floorplan import FloorplanProject
 from roar_api.floorplan.align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, project_fingerprint, validate_ota_project
 
 
+class ViewerReadinessTests(unittest.TestCase):
+    def test_readiness_preserves_capability_prefix(self):
+        from roar_api.floorplan.align_runner import _ready
+        captured = []
+        def open_request(request, timeout):
+            captured.append(request.full_url)
+            response = io.StringIO('{"layout": {}}')
+            response.status = 200
+            return response
+        with patch('roar_api.floorplan.align_runner.urllib.request.build_opener',
+                   return_value=SimpleNamespace(open=open_request)):
+            self.assertTrue(_ready('http://127.0.0.1:12345/roar-align/' + 'a' * 64 + '/'))
+        self.assertEqual(captured, ['http://127.0.0.1:12345/roar-align/' + 'a' * 64 + '/_dash-layout'])
+
+
 def _race_start(config, snapshot, path, barrier, results):
     runner = AlignRunner(config, path)
     launch = runner._launch
@@ -186,6 +201,33 @@ class RunnerTests(unittest.TestCase):
             self.project.save(target)
         self.assertTrue(target.is_file())
         self.assertFalse(root.exists())
+
+    def test_configured_draft_save_ignores_unavailable_runs_without_history(self):
+        blocker = self.base / 'former-directory'
+        blocker.write_text('The old storage location is no longer a directory.')
+        readonly = self.base / 'readonly-runs'
+        readonly.mkdir()
+        readonly.chmod(0o555)
+        self.addCleanup(readonly.chmod, 0o755)
+        for index, root in enumerate((self.base / 'missing-runs', blocker / 'runs', readonly)):
+            with self.subTest(root=root):
+                runner = AlignRunner(dataclasses.replace(self.config, run_root=str(root)))
+                target = self.base / f'offline-{index}.floorplan'
+                with runner.save_as_transaction(target):
+                    self.project.save(target)
+                self.assertEqual(FloorplanProject.load(target).top, self.project.top)
+                self.assertEqual(runner.project_path, str(target))
+                self.assertFalse((root / '.ownership.lock').is_file())
+
+    def test_draft_without_loaded_history_still_checks_active_save_target(self):
+        self.runner.start(self.project)
+        draft = AlignRunner(self.config)
+        target = Path(self.runner.project_path)
+        target.write_text('original destination')
+        with self.assertRaisesRegex(ValueError, 'already has an active ALIGN run'):
+            with draft.save_as_transaction(target):
+                target.write_text('must not be written')
+        self.assertEqual(target.read_text(), 'original destination')
 
     def test_run_options_are_captured_and_invalid_settings_rejected(self):
         self.project.run_options = {'nvariants': 7, 'placer_sa_iterations': 500, 'seed': 42, 'lambda_coeff': 2.5}
@@ -427,6 +469,8 @@ class RunnerTests(unittest.TestCase):
 
     def test_generation_fingerprint_ignores_authoring_provenance_but_tracks_effective_inputs(self):
         original = project_fingerprint(self.project)
+        self.project.set_device_labels({self.project.devices[0].name: 'diffpair_inn'})
+        self.assertEqual(project_fingerprint(self.project), original)
         snapshot = self.project.to_dict()
         snapshot['source_path'] = '/different/source.sp'
         snapshot['constraint_ids'] = ['replacement-' + str(i) for i in range(len(snapshot['constraints']))]
@@ -539,32 +583,48 @@ class WorkerErrorTests(unittest.TestCase):
             def schematic2layout(**kwargs):
                 captured['options'] = kwargs
                 placer.run_gui(tagged_bboxes={}, module_name='TEST', lambda_coeff=1, port=0)
+            def application(**kwargs):
+                captured['prefix'] = os.environ['DASH_URL_BASE_PATHNAME']
+                self.assertNotIn('DASH_ROUTES_PATHNAME_PREFIX', os.environ)
+                self.assertNotIn('dash_requests_pathname_prefix', os.environ)
+                self.assertNotIn('DASH_APP_NAME', os.environ)
+                return SimpleNamespace(app=SimpleNamespace(server=object()), sel='TEST_0')
             def server(host, port, application, **kwargs):
                 captured['viewer'] = application
-                return SimpleNamespace(server_port=9012, serve_forever=lambda: None, server_close=lambda: None)
+                def serve():
+                    captured['status'] = json.loads(path.with_name('status.json').read_text())
+                return SimpleNamespace(server_port=9012, serve_forever=serve, server_close=lambda: None)
             modules = {
                 'align': SimpleNamespace(__version__=PROFILE['align_version'], schematic2layout=schematic2layout),
                 'dash': SimpleNamespace(__version__='2.18.2'), 'align.pnr': SimpleNamespace(placer=placer),
-                'align.gui.mockup': SimpleNamespace(AppWithCallbacksAndState=lambda **kwargs: SimpleNamespace(app=SimpleNamespace(server=object()), sel='TEST_0')),
+                'align.gui.mockup': SimpleNamespace(AppWithCallbacksAndState=application),
                 'werkzeug.serving': SimpleNamespace(make_server=server),
             }
             with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', activation]), \
+                    patch.dict(os.environ, {'DASH_ROUTES_PATHNAME_PREFIX': '/old/',
+                        'dash_requests_pathname_prefix': '/old/', 'DASH_APP_NAME': 'old-app'}), \
                     patch.object(_align_worker.signal, 'signal'), patch.object(_align_worker, 'validate_viewer_assets'), contextlib.redirect_stdout(io.StringIO()):
+                environment = dict(os.environ)
                 self.assertEqual(_align_worker.main(), 0)
-            self.assertNotEqual(captured['viewer'].token, activation)
-            self.assertEqual(len(captured['viewer'].token), 64)
+                self.assertEqual(dict(os.environ), environment)
+            prefix = captured['viewer'].path_prefix
+            self.assertNotIn(activation, prefix)
+            self.assertRegex(prefix, r'^/roar-align/[0-9a-f]{64}/$')
+            self.assertEqual(captured['prefix'], prefix)
+            self.assertEqual(captured['status']['url'], 'http://127.0.0.1:9012' + prefix)
             self.assertEqual(captured['options']['nvariants'], 7)
             self.assertEqual(captured['options']['seed'], 19)
 
     def test_viewer_protects_layout_assets_and_callbacks_with_host_origin_and_authentication(self):
         from roar_api.floorplan._align_worker import ProtectedViewer
-        token = 'a' * 32
+        token = 'a' * 64
+        prefix = f'/roar-align/{token}/'
         calls = []
         def application(environ, start):
             calls.append(environ['PATH_INFO'])
             start('200 OK', [('Content-Type', 'application/json')])
             return [b'{"private": "placement"}']
-        viewer = ProtectedViewer(application, token)
+        viewer = ProtectedViewer(application, prefix)
         viewer.port = 9012
         def request(path='/', **updates):
             environ = {'HTTP_HOST': '127.0.0.1:9012', 'PATH_INFO': path, 'REQUEST_METHOD': 'GET', 'QUERY_STRING': ''}
@@ -577,19 +637,24 @@ class WorkerErrorTests(unittest.TestCase):
         for path in ('/', '/_dash-layout', '/assets/test.js', '/_dash-update-component'):
             self.assertEqual(request(path)['status'], '403 Forbidden')
         self.assertEqual(calls, [])
-        self.assertEqual(request('/_dash-layout', HTTP_HOST='untrusted.example:9012', HTTP_AUTHORIZATION='Bearer ' + token)['status'], '403 Forbidden')
-        self.assertEqual(request('/_dash-layout', HTTP_ORIGIN='http://evil.example', HTTP_AUTHORIZATION='Bearer ' + token)['status'], '403 Forbidden')
-        authenticated = request(QUERY_STRING='token=' + token)
-        self.assertEqual(authenticated['status'], '303 See Other')
-        self.assertEqual(authenticated['headers']['Location'], '/')
-        cookie = authenticated['headers']['Set-Cookie']
-        self.assertIn('HttpOnly', cookie)
-        self.assertIn('SameSite=Strict', cookie)
-        for path in ('/', '/_dash-layout', '/assets/test.js', '/_dash-update-component'):
-            response = request(path, HTTP_COOKIE=cookie.split(';')[0], REQUEST_METHOD='POST' if 'update' in path else 'GET')
+        for headers in ({'HTTP_HOST': 'untrusted.example:9012'},
+                        {'HTTP_ORIGIN': 'http://evil.example'},
+                        {'HTTP_ORIGIN': 'http://127.0.0.1:8080'},
+                        {'HTTP_SEC_FETCH_SITE': 'cross-site'}):
+            self.assertEqual(request(prefix + '_dash-layout', **headers)['status'], '403 Forbidden')
+        for path in (prefix[:-1], prefix.replace(token, 'b' * 64), '/_dash-layout'):
+            response = request(path, HTTP_COOKIE=f'roar_align_{token[:16]}={token}',
+                               HTTP_AUTHORIZATION='Bearer ' + token, QUERY_STRING='token=' + token)
+            self.assertEqual(response['status'], '403 Forbidden')
+            self.assertNotIn('Set-Cookie', response['headers'])
+        for path in ('', '_dash-layout', 'assets/test.js', '_dash-update-component'):
+            response = request(prefix + path, HTTP_ORIGIN='http://127.0.0.1:9012',
+                               REQUEST_METHOD='POST' if 'update' in path else 'GET')
             self.assertEqual(response['status'], '200 OK')
             self.assertEqual(response['headers']['Referrer-Policy'], 'no-referrer')
-        self.assertEqual(request('/_dash-layout', HTTP_AUTHORIZATION='Bearer ' + token)['status'], '200 OK')
+            self.assertEqual(response['headers']['Cache-Control'], 'no-store')
+            self.assertNotIn('Set-Cookie', response['headers'])
+        self.assertEqual(calls, [prefix + path for path in ('', '_dash-layout', 'assets/test.js', '_dash-update-component')])
 
     def test_loopback_permission_error_preserves_placement_and_explains_reopen(self):
         from roar_api.floorplan import _align_worker

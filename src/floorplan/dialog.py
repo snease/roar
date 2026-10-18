@@ -14,7 +14,7 @@ from PyQt6.QtCore import Qt, QTimer, QItemSelectionModel
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
     QMessageBox, QPlainTextEdit, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem,
     QSplitter, QVBoxLayout, QWidget,
 )
@@ -24,6 +24,7 @@ from .constraint_editor import ConstraintEditorDialog, constraint_summary, edita
 from .constraints import FIELDS
 
 from .workspace import editor_signature, load_roar_design
+from .documents import load_document
 
 
 def _floorplan_example_directory():
@@ -115,9 +116,9 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
         candidate.source_mode = "linked"
         return candidate, design, "linked"
     if workspace is not None:
-        current = workspace.snapshot()
         from roar_api import Design
-        has_current = editor_signature(current) != editor_signature(Design())
+        has_current = (workspace.has_content() if hasattr(workspace, 'has_content') else
+                       editor_signature(workspace.snapshot()) != editor_signature(Design()))
         choice = "switch"
         if has_current or workspace.path or workspace.is_modified():
             choice = _source_switch_choice(parent, workspace, path)
@@ -127,6 +128,7 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
                 return _choose_source(parent, project, "saved", path, workspace, snapshot_provider)
             if choice == "current":
                 # Validate mappings before asking to save an unnamed design.
+                current = workspace.snapshot()
                 _refresh_source_bindings(project, current, "live")
                 if not workspace.path and not _save_workspace(parent, workspace, path):
                     return None
@@ -233,6 +235,8 @@ class OpenFloorplanDialog(QDialog):
             self.design_path.setText(self._suggested_design)
         if not self._manual_source:
             mode = self._candidate.source_mode if self._candidate else "saved"
+            if mode == "live" and not self._suggested_design:
+                mode = "saved"  # Legacy live drafts have no persisted source identity.
             self.source_mode.setCurrentIndex(self.source_mode.findData(mode))
         self._update_status()
 
@@ -252,6 +256,8 @@ class OpenFloorplanDialog(QDialog):
             message = "Associated ROAR file is missing; captured floorplan sizes are available."
         elif self._manual_design and self.design_path.text().strip() != self._suggested_design:
             message = "Association will change to the selected ROAR file."
+        elif mode == "saved" and not self._suggested_design and self._candidate is not None:
+            message = "No saved ROAR association. Captured sizes are preserved; select a ROAR sizing source explicitly to resume updates."
         if valid and mode == "linked" and self.workspace is not None:
             message += " Opening this file changes the active ROAR design and keeps its sizes live. If already active, its current unsaved sizes are used."
         elif valid and mode == "live" and self._suggested_design:
@@ -422,7 +428,8 @@ class FloorplanDialog(QDialog):
                               ("Open floorplan…", self._open_project),
                               ("Save", self._save_project),
                               ("Save as…", lambda: self._save_project(save_as=True)),
-                              ("Export ALIGN inputs…", self._export_align)):
+                              ("Export ALIGN inputs…", self._export_align),
+                              ("Export handoff…", self._export_handoff)):
             button = self._button(title, action)
             if title == "Export ALIGN inputs…":
                 button.setToolTip("Export a sized netlist and placement constraints together for ALIGN.")
@@ -472,6 +479,8 @@ class FloorplanDialog(QDialog):
         self.sketch_panel.sketchEdited.connect(lambda state: self._guard(lambda: self._sketch_edited(state)))
         self.sketch_panel.relationshipRequested.connect(lambda rule: self._guard(lambda: self._sketch_relationship(rule)))
         self.sketch_panel.selectionChanged.connect(self._canvas_selection)
+        self.sketch_panel.labelRequested.connect(lambda name: self._guard(lambda: self._edit_device_label(name)))
+        self.sketch_panel.constraintRequested.connect(self._show_constraint)
         from .preview import PreviewPanel
         self.preview_panel = PreviewPanel(self)
         self.preview_panel.selectionChanged.connect(lambda names: self._canvas_selection(names, physical=True))
@@ -542,6 +551,30 @@ class FloorplanDialog(QDialog):
             self._refresh_sketch()
         self._record_edit()
         self.status.setText("Sketch saved in this floorplan. Drawing positions do not change ALIGN constraints.")
+
+    def _edit_device_label(self, name):
+        self._require_project()
+        canonical = self.project._device(name).name
+        label, accepted = QInputDialog.getText(
+            self, "Device role", f"Role label for {canonical} (blank clears it):",
+            text=self.project.device_labels.get(canonical, ""))
+        if not accepted:
+            return
+        candidate = self._collect_project()
+        labels = candidate.device_labels
+        if label.strip():
+            labels[canonical] = label.strip()
+        else:
+            labels.pop(canonical, None)
+        candidate.set_device_labels(labels)
+        self.project = candidate
+        self._render()
+        self._record_edit()
+
+    def _show_constraint(self, row):
+        if self.project is not None and 0 <= row < len(self.project.constraints):
+            self.constraints_table.selectRow(row)
+            self.tabs.setCurrentWidget(self.constraints_table.parentWidget())
 
     @staticmethod
     def _arrange_sketch(project, *, required=False):
@@ -637,6 +670,8 @@ class FloorplanDialog(QDialog):
         self._dirty = self._document_state(state) != self._document_state(self._saved_state)
         self._update_document_title()
         self._update_history_buttons()
+        if not automatic and self._source_error and self._source_mode != "saved":
+            self._live_source_update()
 
     def _update_history_buttons(self):
         self.undo_button.setEnabled(bool(self._undo_states))
@@ -1271,6 +1306,8 @@ class FloorplanDialog(QDialog):
         selected_symbol = self.parameter_symbol.currentText()
         try:
             project = self.project
+            if hasattr(self.preview_panel, "set_device_labels"):
+                self.preview_panel.set_device_labels(project.device_labels)
             self._update_document_title()
             self.devices_table.setRowCount(len(project.devices))
             self.devices_table.setColumnHidden(7, not any(device.kind == "resistor" for device in project.devices))
@@ -1343,6 +1380,7 @@ class FloorplanDialog(QDialog):
 
     def set_project(self, project, path=None, design=None, source_origin=None):
         self.placement_panel.project_changed()
+        self.sketch_panel.reset_document()
         self.project = project
         self.project_path = Path(path) if path else None
         self._set_source(design, source_origin)
@@ -1487,6 +1525,57 @@ class FloorplanDialog(QDialog):
             self.project = candidate
             self.status.setText(f"Exported ALIGN inputs to {netlist.parent}.")
 
+    def _export_handoff(self):
+        """Package explicit current inputs and, optionally, a captured candidate."""
+        from .handoff import export_handoff
+        self._ensure_current_source()
+        candidate = self._collect_project()
+        candidate.validate()
+        sketch = candidate.sketch
+        sketch['positions'] = self.sketch_panel.display_positions()
+        candidate.set_sketch(sketch)
+        options = QDialog(self)
+        options.setWindowTitle("Export handoff")
+        layout = QVBoxLayout(options)
+        note = QLabel("Creates a ZIP with captured device sizes, native ALIGN inputs, role labels, "
+                      "constraints and a sketch SVG. Extract it and open index.html to review.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        include = QCheckBox("Include displayed physical candidate and its captured inputs")
+        available = self.preview_panel.data is not None
+        include.setEnabled(available)
+        include.setChecked(available)
+        layout.addWidget(include)
+        if available:
+            state = self.preview_panel.state
+            message = ("Earlier inputs: the displayed placement is kept with its original sizes and rules, "
+                       "separately from your current inputs." if getattr(state, 'stale', False) else
+                       "Includes the currently selected candidate; connectivity is not routing.")
+            status = QLabel(message)
+            status.setWordWrap(True)
+            layout.addWidget(status)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Choose ZIP…")
+        buttons.accepted.connect(options.accept)
+        buttons.rejected.connect(options.reject)
+        layout.addWidget(buttons)
+        accepted = options.exec() == QDialog.DialogCode.Accepted
+        with_preview = include.isChecked()
+        options.deleteLater()
+        if not accepted:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export handoff ZIP", f"{candidate.top}-handoff.zip", "ZIP archive (*.zip)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += '.zip'
+        if Path(path).suffix.lower() != '.zip':
+            raise ValueError("Use a .zip filename for the handoff bundle.")
+        export_handoff(candidate, path, preview=self.preview_panel.data if with_preview else None,
+                       state=self.preview_panel.state if with_preview else None,
+                       candidate_index=self.preview_panel.candidate_combo.currentIndex() if with_preview else 0)
+        self.status.setText(f"Exported handoff to {path}. Extract the ZIP and open index.html to review.")
+
     def _source_selected(self, *_args):
         self._guard(lambda: self._activate_source(self.source_mode.currentData()))
 
@@ -1502,9 +1591,14 @@ class FloorplanDialog(QDialog):
             self._render()
             self._record_edit()
         except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
-            self._source_error = str(exc)
             self.source_mode.setCurrentIndex(self.source_mode.findData(self._source_mode))
-            self.snapshot_label.setText("Sizing source error: " + str(exc))
+            # A failed attempt to choose another source leaves the old source
+            # usable. Only an error rereading that source makes it stale.
+            same_source = mode == self._source_mode and (mode != "linked" or not path or
+                Path(path).expanduser().resolve() == Path(candidate.roar_project_path or "").resolve())
+            if same_source:
+                self._source_error = str(exc)
+                self.snapshot_label.setText("Sizing source error: " + str(exc))
             raise
 
     def _read_roar(self):
@@ -1581,7 +1675,7 @@ class FloorplanDialog(QDialog):
         if not path:
             return
         try:
-            constraints = json.loads(Path(path).read_text(encoding="utf-8"))
+            constraints = load_document(path)
         except (json.JSONDecodeError, UnicodeError) as exc:
             raise ValueError("Choose ALIGN placement rules (.const.json). No netlist, device sizes or ROAR design are loaded by this action.") from exc
         if isinstance(constraints, dict) and "source_netlist" in constraints:

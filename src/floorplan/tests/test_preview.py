@@ -10,7 +10,9 @@ try:
     from PyQt6.QtGui import QFocusEvent, QMouseEvent
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QGraphicsItem, QTabWidget, QWidget
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name != "PyQt6":
+        raise
     QApplication = None
 
 from roar_api.floorplan.geometry import build_preview
@@ -74,6 +76,15 @@ class PreviewTests(unittest.TestCase):
         self.assertIn('not routing', panel.status.text())
         panel.net_combo.setCurrentIndex(0)
         self.assertFalse(panel._net_items)
+
+    def test_roles_preserve_geometry_and_source_selection(self):
+        before = deepcopy(self.panel.data)
+        self.panel.set_device_labels({'M1': 'diffpair <inn>'})
+        self.panel.set_selection(['M1'])
+        self.assertEqual(self.panel.data, before)
+        self.assertEqual(self.panel.selected_names(), ['M1'])
+        self.assertIn('M1: diffpair <inn>', self.panel.details.toPlainText())
+        self.assertIn('diffpair &lt;inn&gt;', self.panel.items_by_id['X_M1'].toolTip())
 
     def test_candidate_switch_handles_nonzero_origin_and_unmapped_sources(self):
         other = deepcopy(self.data['candidates'][0])

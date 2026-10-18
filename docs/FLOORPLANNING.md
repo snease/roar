@@ -13,8 +13,8 @@ are sent to ALIGN. Dragging, snapping and drawing groups save your drawing
 without changing generation inputs or making a physical result stale.
 
 The editor uses ROAR's existing Qt interface and netlist parser. Install ROAR
-with `pip install -e '.[gui]'`, then launch it normally. ALIGN, Xschem, Magic and
-a PDK are not required to author or export a project. Generating placement needs
+with `pip install -e '.[gui]'` after the desktop prerequisites below. ALIGN,
+Xschem, Magic and a PDK are not required to author or export a project. Generating placement needs
 a separate ALIGN installation and the tested SKY130 ALIGN backend on Linux or
 WSL. The Python API works with the headless installation, `pip install -e .`.
 
@@ -24,6 +24,63 @@ restart ROAR; no reinstall is needed to find the floorplan editor. Both
 Activate that environment before launching; `python3 --version` must report
 Python 3.10 or newer. If an older system Python is selected, reactivate the
 existing ROAR environment rather than reinstalling ROAR.
+
+## Set up the ROAR desktop
+
+The tested desktop baseline is Ubuntu 22.04 x86-64, Python 3.10 and PyQt6 6.8,
+including Ubuntu under WSL2. A Python virtual environment contains Python
+packages and Qt's bundled libraries; the operating system supplies EGL/OpenGL,
+X11/xcb libraries and the display server. Installing the GUI extra does not
+install those system components. For other Linux distributions, use their
+equivalents of the [Qt 6.8 platform dependencies](https://doc.qt.io/qt-6.8/linux-requirements.html).
+
+On Ubuntu 22.04, install these prerequisites once (or ask CAD support to do so):
+
+```sh
+sudo apt update
+sudo apt install python3.10 python3.10-venv \
+  libegl1 libgl1 libfontconfig1 libdbus-1-3 libglib2.0-0 libx11-xcb1 \
+  libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+  libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+  libxcb-sync1 libxcb-xfixes0 libxcb-xkb1
+```
+
+For a new GUI environment, run this from the checkout root in a bash terminal:
+
+```sh
+python3.10 -m venv "$HOME/roar-gui"
+. "$HOME/roar-gui/bin/activate"
+python -m pip install --upgrade pip
+python -m pip install -e '.[gui]'
+python -m roar_api --check-setup
+python -m roar_api
+```
+
+Use `python -m roar_api --check-setup` in an existing environment too. It checks
+GUI imports and display initialization in a child process, so a Qt startup
+failure is reported without opening ROAR. It also checks ALIGN when paths are
+saved in **ALIGN settings** or supplied through `ROAR_ALIGN_PYTHON` and
+`ROAR_ALIGN_PDK_FIXED`; saved settings take precedence. It reports optional
+viewer failures separately and exits nonzero for failed required checks.
+It does not install packages, change settings or create placement runs.
+
+Under WSL, use WSL2 with a working WSLg desktop connection; follow Microsoft's
+[Linux GUI application setup](https://learn.microsoft.com/en-us/windows/wsl/tutorials/gui-apps).
+Launch from that Ubuntu terminal so its `DISPLAY`/`WAYLAND_DISPLAY` are available.
+If the Wayland/OpenGL path fails, try `QT_QPA_PLATFORM=xcb python -m roar_api`.
+An SSH or container session also needs display access to show the editor.
+
+| Startup problem | What to do |
+| --- | --- |
+| `No module named 'PyQt6'` or another GUI package | Activate the GUI environment and install `.[gui]` with that environment's `python -m pip`. |
+| `ImportError: libEGL.so.1` or another missing `.so` | Install the native runtime packages above. Reinstalling PyQt6 into the venv does not supply these system libraries. |
+| Qt cannot load `xcb` or connect to the display | Run the setup checker; check both the native packages and desktop/WSLg connection. |
+| The checker reports `offscreen` or `minimal` | Only a headless Qt check ran. Remove that `QT_QPA_PLATFORM` override and rerun from the desktop terminal to check visible windows. |
+
+For a direct import diagnostic, run
+`python -c 'from PyQt6.QtWidgets import QApplication; print("Qt widgets import OK")'`.
+`QT_QPA_PLATFORM=offscreen` is useful for automated tests but does not repair
+missing EGL/xcb libraries or provide an interactive desktop.
 
 ## Main controls
 
@@ -36,11 +93,14 @@ configure the separate ALIGN environment when ready to generate physical geometr
 | Arrange the sketch | Select boxes or rubber-band a selection, then drag. Wheel zooms; middle-drag pans; **Fit all** restores the view. **Alt** temporarily bypasses snap guides. **Escape** cancels a drag. |
 | Keep a relationship | Select devices and use **Align**, **Order**, **Make row**, or **Make symmetric…**. These create native rules also visible in **Constraints**. A row combines center alignment with left-to-right order. |
 | Move a visual group | **Group for drawing…** adds a label and moves its members together. It does not combine circuit devices or generate ALIGN hierarchy. |
+| Name a device's function | Select one sketch box and choose **Role label…**. Labels such as `tail` appear beside the original instance ID and in physical-block details. They do not rename devices or change ALIGN inputs. Clear the label to remove it. |
 | Refine or disable a rule | Use **Constraints**. Selecting a row highlights its participants; the sketch explains whether the rule is enforced locally, exported for ALIGN to check, unsupported, or disabled. |
+| Find a device's rules | Hover over its box for rule summaries, or select it and use **Rules for selection → Inspect rule…**. Badges count enabled rules naming that device directly; whole-circuit and net rules remain in **Constraints**. Conflicts keep a visible warning until repaired or disabled. |
 | Inspect a physical result | **Generate preview** runs ALIGN through placement. Choose a **Candidate**, inspect dimensions and provenance, and select a net under **Connections**. Selection links known source devices across the views and **Devices**. |
 | Keep working after an input change | The previous result stays visible with **Earlier inputs**. Generate again after changing sizes, enabled rules, technology or run options. |
+| Give the design to a layout engineer | **Export handoff…** creates a portable ZIP of captured inputs and drawings; optionally include the displayed physical candidate with its own captured inputs. |
 
-![Floorplan views: 1 unscaled sketch, 2 explicit relationship actions, 3 physical placement from ALIGN.](images/floorplan/sketch-and-preview.png)
+![Role-labeled sketch with related-rule navigation beside physical placement from ALIGN.](images/floorplan/sketch-and-preview.png)
 
 **1** Drag the sketch boxes. **2** Create relationships that ALIGN will honor.
 **3** Compare a physical candidate; selecting devices highlights both views.
@@ -109,9 +169,11 @@ layout stay in place.
 Links are saved relative to the companion file. Moving the two files together
 preserves their association, and **Save as…** rebases the link to the same design.
 The original netlist text is embedded, so it remains available even if its
-original file moves. Versions 1–4 still open; new saves use version 5, adding
-sketch positions, drawing groups and stable rule identities to the existing
-sizes, bindings and run options. Machine paths, run history and generated
+original file moves. Versions 1–5 still open; new saves use version 6, adding
+device role labels to the sketch positions, drawing groups, stable rule identities,
+sizes, bindings and run options. An unnamed live design's floorplan saves as captured
+sizes until a source is explicitly associated; reopening never binds it to an unrelated active design.
+Machine settings, run history and generated
 geometry are stored separately from the floorplan and the `.roar` design.
 
 An asterisk in the title marks unsaved floorplan edits. Closing the editor,
@@ -459,6 +521,8 @@ stay in the project and are omitted from native exports.
 export support without graphical forms. Their fields are checked on import and
 export. `NetConst.criticality` weights placement wirelength; its shielding and
 the other routing settings take effect when routing is run outside this flow.
+ALIGN 0.9.8 ignores `NetConst.criticality=0`; use `NetPriority.weight=0`
+for zero placement weight. ROAR rejects the ignored form with that remedy.
 `PlaceOnBoundary` is recognized by ALIGN but dropped by the C++ placer used here;
 it is not offered as an effective placement control. Generator configuration,
 grouping, guard rings, capacitor arrays, placement grids, and charge-flow data
@@ -473,6 +537,26 @@ changing the floorplan. Rules with unsupported types or settings are retained
 as clearly marked, read-only rows; disable, remove or replace them before
 export. A file in the wrong format, an invalid supported rule, or cancellation
 leaves the existing constraints intact.
+
+## Portable handoff
+
+Choose **Export handoff…** after resolving sizing and enabled-constraint errors.
+Extract the ZIP and open `index.html` for the review summary. The bundle contains
+a reopenable floorplan with numeric captured sizes, native SPICE and constraint
+JSON, role labels and a sketch SVG. Source files and a ROAR sizing installation
+are not needed to reopen it. Live bindings are frozen for the recipient.
+
+When a physical candidate is included, its normalized geometry, drawing and
+original captured input set travel together. An **Earlier inputs** result stays
+separate from the current design; the report identifies the mismatch. If the
+original captured inputs are missing, export reports the problem rather than
+pairing the placement with current inputs. You can still export current inputs
+by clearing **Include displayed physical candidate**.
+
+The exporter writes only the documented artifacts. It omits run logs, machine
+settings, local source paths and viewer credentials. It needs no running ALIGN
+process or browser. The placement is a starting point for implementation;
+routing, device-level layout review and DRC/LVS remain separate work.
 
 ## Data flow and code organization
 
@@ -499,7 +583,7 @@ in its captured run, accompanied by generation inputs, provenance and logs.
 flowchart TB
     D[dialog.py: document, history and linked selection]
     D --> C[canvas.py + sketch.py: sketch interaction and local solve]
-    D --> M[model.py: version-5 floorplan persistence]
+    D --> M[model.py: version-6 floorplan persistence]
     D --> F[constraint_editor.py + constraints.py: native forms and validation]
     D --> P[preview.py: physical view]
     D --> A[align_dialog.py: settings and run controls]
@@ -507,6 +591,7 @@ flowchart TB
     R --> W[_align_worker.py: isolated ALIGN execution]
     W --> G[geometry.py: validated physical result]
     G --> P
+    D --> H[handoff.py: portable captured inputs and drawings]
 ```
 
 The source boundaries are [document/model](../src/floorplan/model.py),
@@ -525,6 +610,23 @@ mirrors, selected templates, source membership and available pin/net data to
 schema-1 `preview.json`, in µm with physical y pointing up. Membership follows
 authoritative topology records; unknown mappings remain marked incomplete.
 
+Qt Graphics View keeps sketching and selection inside the existing desktop;
+Kiwi solves the small set of local linear relationships. These are equal-box
+intent constraints, not a physical legalization engine. Native ALIGN performs
+technology-dependent placement in a separate environment. A browser-only editor
+would add a service and duplicate desktop state; a KLayout or Magic integration
+is better suited to a later physical-layout stage. The small normalized geometry
+contract leaves room for another backend without making the document depend on
+its runtime. Those integrations are deferred until a concrete implementation
+workflow needs them.
+
+Authoring and native previews start no web service. The optional ALIGN browser
+binds to loopback, checks host and origin, and requires a fresh secret URL prefix
+for every asset and callback. It uses no authentication cookies that could be
+sent to another local port. Copying diagnostics redacts that prefix. External
+ALIGN/PDK Python is still executable tooling: the separate process keeps its
+dependencies apart from ROAR, but is not an operating-system security sandbox.
+
 ## Checks
 
 After installing the GUI extra, run:
@@ -537,7 +639,9 @@ The tests cover topology, unit conversion, explicit ROAR mappings, persistence,
 export collisions, invalid input and Qt editing flows. Placement tests cover
 process ownership, cancellation, saved-result reopening, stale inputs, settings
 and browser handoff using isolated subprocesses and mocked browser opening.
-GUI tests skip when PyQt6 is absent. The core package does not import Qt or ALIGN.
+GUI tests skip only when the PyQt6 package is absent. An installed Qt with missing
+native libraries or broken imports fails the check; run `python -m roar_api --check-setup`
+for repair guidance. The core package does not import Qt or ALIGN.
 
 For an independent compatibility check, use a separately installed ALIGN and a
 SKY130 ALIGN PDK directory containing `models.sp`:

@@ -1,7 +1,9 @@
 """Placement controls use mocked processes and browser opens, always offscreen."""
 
 from dataclasses import replace
+import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -10,7 +12,9 @@ try:
     from PyQt6.QtCore import QProcess, QSettings, QTimer, QUrl, Qt
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QPushButton, QWidget
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name != "PyQt6":
+        raise
     QApplication = None
 
 from roar_api.floorplan import FloorplanProject
@@ -224,7 +228,8 @@ class PlacementPanelTests(unittest.TestCase):
         self.panel._view.close()
         self.assertFalse(self.panel.open_last_button.isEnabled())
         self.assertTrue(self.panel.log_button.isEnabled())
-        with patch.object(runner, 'log_tail', return_value='Cannot place M1\nhttp://127.0.0.1:9001/?token=secret'):
+        secret_path = '/roar-align/' + 'a' * 64 + '/'
+        with patch.object(runner, 'log_tail', return_value='Cannot place M1\nhttp://127.0.0.1:9001/?token=secret\nhttp://127.0.0.1:9002' + secret_path):
             self.panel.log_button.click()
         self.assertTrue(self.panel._view.isVisible())
         next(button for button in self.panel._view.findChildren(QPushButton)
@@ -233,6 +238,8 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertIn('Cannot place M1', report)
         self.assertIn(runner.state.run_dir, report)
         self.assertNotIn('secret', report)
+        self.assertNotIn('a' * 64, report)
+        self.assertIn('/roar-align/[redacted]/', report)
         self.assertEqual((runner.starts, runner.opens, self.opened), (1, 0, []))
 
     def test_native_check_survives_run_polling_and_is_invalidated_by_edits(self):
@@ -309,6 +316,46 @@ class PlacementPanelTests(unittest.TestCase):
             callbacks[-1]({'ok': True, 'message': 'Old installation is ready.'})
         self.assertIn('settings changed', dialog.error.text())
         dialog.deleteLater()
+
+    def test_installation_probe_resolves_paths_before_changing_directory(self):
+        from roar_api.floorplan.align_dialog import _probe
+        from PyQt6.QtCore import QEventLoop
+        fake = self.root / 'probe.py'
+        fake.write_text('import json, os, sys\n'
+                        'from pathlib import Path\n'
+                        'backend = Path(sys.argv[sys.argv.index("--backend") + 1])\n'
+                        'manifest = Path(sys.argv[sys.argv.index("--manifest") + 1])\n'
+                        'print("ROAR_PROBE " + json.dumps({"ok": backend.is_dir() and manifest.is_file(), '
+                        '"cwd": os.getcwd(), "prefix": sys.prefix}))\n')
+        backend = self.root / 'backend'
+        backend.mkdir()
+        manifest = self.root / 'run.json'
+        manifest.write_text('{}')
+        config = AlignConfig(os.path.relpath(sys.executable), os.path.relpath(backend), self.config.run_root)
+        real_path = Path
+        def script_path(value):
+            return fake.with_name('align_dialog.py') if str(value).endswith('align_dialog.py') else real_path(value)
+        fake.rename(fake.with_name('_align_probe.py'))
+        results = []
+        loop = QEventLoop()
+        def completed(result):
+            results.append(result)
+            loop.quit()
+        with patch('roar_api.floorplan.align_dialog.Path', side_effect=script_path):
+            process = _probe(self.owner, config, completed, manifest=os.path.relpath(manifest))
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+        timeout.timeout.connect(loop.quit)
+        timeout.start(5000)
+        loop.exec()
+        timeout.stop()
+        if not results:
+            process.kill()
+            process.waitForFinished(1000)
+        self.assertTrue(results, 'Installation probe did not finish')
+        self.assertTrue(results[0]['ok'], results[0])
+        self.assertEqual(results[0]['prefix'], sys.prefix)
+        self.assertNotEqual(results[0]['cwd'], os.getcwd())
 
     def test_profile_and_complete_input_gate_generation_and_missing_tools_are_actionable(self):
         self.project.align_profile = None

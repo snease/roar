@@ -14,11 +14,12 @@ from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QGraphicsItem, QGraphicsScene, QGraphicsView,
-    QHBoxLayout, QInputDialog, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QHBoxLayout, QInputDialog, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from .sketch import (BLOCK_HEIGHT, BLOCK_WIDTH, SketchConflict, capability_note,
                      sketch_capability, solve_positions)
+from .constraint_editor import constraint_summary
 
 
 def _participants(constraint):
@@ -33,9 +34,11 @@ def _participants(constraint):
 
 
 class _Block(QGraphicsItem):
-    def __init__(self, device):
+    def __init__(self, device, role=""):
         super().__init__()
         self.name = device.name
+        self.role = role
+        self.rule_count = 0
         self.detail = ""
         if device.kind == "mos" and device.width_um is not None and device.length_um is not None:
             self.detail = f"W {device.width_um:g} / L {device.length_um:g} µm"
@@ -43,8 +46,8 @@ class _Block(QGraphicsItem):
                 self.detail += f" · NF {device.nf}"
         self.highlighted = False
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-        tip = f"{device.name}\n{device.model}\n{self.detail}\nFixed sketch box; sizing is edited in Devices."
-        self.setToolTip('<qt>' + escape(tip).replace('\n', '<br>') + '</qt>')
+        self.base_tip = f"{device.name}" + (f" · {role}" if role else "")
+        self.base_tip += f"\n{device.model}\n{self.detail}\nFixed sketch box; sizing is edited in Devices."
 
     def boundingRect(self):
         return QRectF(-BLOCK_WIDTH / 2, -BLOCK_HEIGHT / 2, BLOCK_WIDTH, BLOCK_HEIGHT)
@@ -63,12 +66,18 @@ class _Block(QGraphicsItem):
         font.setBold(True)
         painter.setFont(font)
         rect = self.boundingRect().adjusted(5, 6, -5, -6)
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.name)
-        if self.detail and painter.worldTransform().m11() >= 0.8:
+        painter.drawText(rect.adjusted(0, -12 if self.role else 0, 0, 0), Qt.AlignmentFlag.AlignCenter, self.name)
+        if self.role or self.detail and painter.worldTransform().m11() >= 0.8:
             font.setBold(False)
             font.setPointSizeF(max(7, font.pointSizeF() - 2))
             painter.setFont(font)
-            painter.drawText(rect.adjusted(0, 40, 0, 0), Qt.AlignmentFlag.AlignHCenter, self.detail)
+            text = self.role or self.detail
+            text = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, int(rect.width()))
+            painter.drawText(rect.adjusted(0, 26, 0, 0), Qt.AlignmentFlag.AlignHCenter, text)
+        if self.rule_count:
+            font.setPointSizeF(7)
+            painter.setFont(font)
+            painter.drawText(rect.adjusted(0, -4, 0, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop, f"{self.rule_count} rules")
 
 
 class SketchView(QGraphicsView):
@@ -84,6 +93,7 @@ class SketchView(QGraphicsView):
         self._gesture = None
         self._pan = None
         self._guides = []
+        self._fit_on_show = False
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -114,12 +124,20 @@ class SketchView(QGraphicsView):
         event.accept()
 
     def fit_all(self):
+        self._fit_on_show = not self.isVisible()
+        if self._fit_on_show:
+            return
         bounds = self.panel.content_bounds()
         self.fitInView(bounds.adjusted(-50, -50, 50, 50), Qt.AspectRatioMode.KeepAspectRatio)
         if self.transform().m11() > 1.5:
             self.resetTransform()
             self.scale(1.5, 1.5)
         self.centerOn(bounds.center())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._fit_on_show:
+            self.fit_all()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -289,6 +307,8 @@ class SketchPanel(QWidget):
     selectionChanged = pyqtSignal(list)
     relationshipRequested = pyqtSignal(dict)
     statusMessage = pyqtSignal(str)
+    labelRequested = pyqtSignal(str)
+    constraintRequested = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -300,6 +320,8 @@ class SketchPanel(QWidget):
         self._highlighted_constraint = None
         self._highlighted_enabled = None
         self._last_selection = []
+        self._conflict = ""
+        self._fit_pending = True
         self.scene = QGraphicsScene(self)
         self.view = SketchView(self)
         self.scene.selectionChanged.connect(self._selection_changed)
@@ -348,8 +370,18 @@ class SketchPanel(QWidget):
         drawing = QHBoxLayout()
         self.group_button = self._button(drawing, "Group for drawing…", self._ask_group)
         self.ungroup_button = self._button(drawing, "Ungroup", self.ungroup_selected)
+        self.role_button = self._button(drawing, "Role label…", self._request_label)
         drawing.addStretch()
         layout.addLayout(drawing)
+        rules = QHBoxLayout()
+        rules.addWidget(QLabel("Rules for selection"))
+        self.rule_combo = QComboBox()
+        self.rule_combo.setMinimumWidth(80)
+        self.rule_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        rules.addWidget(self.rule_combo, 1)
+        self.inspect_button = self._button(rules, "Inspect rule…", self._inspect_rule)
+        self.rule_combo.currentIndexChanged.connect(self._rule_selected)
+        layout.addLayout(rules)
         layout.addWidget(self.view, 1)
         self.capabilities = QLabel("Live sketch: alignment, order, rows and block symmetry. Physical dimensions are for ALIGN to check.")
         self.capabilities.setTextFormat(Qt.TextFormat.PlainText)
@@ -369,6 +401,8 @@ class SketchPanel(QWidget):
         return button
 
     def _message(self, text):
+        if self._conflict and self._conflict not in text:
+            text = self._conflict + "\n" + text
         self.status.setText(text)
         self.statusMessage.emit(text)
 
@@ -379,16 +413,17 @@ class SketchPanel(QWidget):
     def set_project(self, project):
         """Refresh from the owner's project; preserve session selection and view."""
         selected = self.selected_names()
-        first = not self.items_by_name
+        first = self._fit_pending or not self.items_by_name
         self.view.cancel_drag()
         self.scene.blockSignals(True)
         self.scene.clear()
         self.items_by_name, self._group_items, self._relationship_items = {}, [], []
         self.project = project
+        self._conflict = ""
         self._state = deepcopy(project.sketch) if project else {"positions": {}, "groups": []}
         if project:
             for device in project.devices:
-                item = _Block(device)
+                item = _Block(device, project.device_labels.get(device.name, ""))
                 self.scene.addItem(item)
                 self.items_by_name[device.name] = item
             try:
@@ -397,15 +432,23 @@ class SketchPanel(QWidget):
             except (SketchConflict, ValueError) as exc:
                 positions = self._state["positions"]
                 message = f"Sketch conflict: {exc} Edit or disable a conflicting rule in Constraints."
+                self._conflict = message
             self._set_positions(positions)
             self._message(message)
             counts = {key: 0 for key in ("enforced", "exported", "unsupported", "disabled")}
             for constraint, enabled in zip(project.constraints, project._constraint_flags()):
                 counts[sketch_capability(constraint) if enabled else "disabled"] += 1
             self.capabilities.setText(
-                f"Rules: {counts['enforced']} enforced in sketch · {counts['exported']} for ALIGN to check · "
+                f"Rules: {counts['enforced']} {'blocked by sketch conflict' if self._conflict else 'enforced in sketch'} · {counts['exported']} for ALIGN to check · "
                 f"{counts['unsupported']} unsupported for export · {counts['disabled']} disabled. "
-                "Select a rule in Constraints to inspect its participants.")
+                "Box badges count enabled rules naming that device; hover for details.")
+            for name, item in self.items_by_name.items():
+                related = self._related_rules([name])
+                item.rule_count = sum(enabled for _, _, enabled in related)
+                details = [f"Rule {row + 1}: {' · '.join(constraint_summary(rule))} · {self._rule_status(rule, enabled)}"
+                           for row, rule, enabled in related]
+                tip = item.base_tip + "\n" + ("\n".join(details) or "No rules name this device directly.")
+                item.setToolTip('<qt>' + escape(tip).replace('\n', '<br>') + '</qt>')
         self.scene.blockSignals(False)
         self.set_selection(selected)
         if self._highlighted_constraint is not None:
@@ -413,6 +456,46 @@ class SketchPanel(QWidget):
             self.highlight_constraint(native if project and native in project.constraints else None)
         if first and self.items_by_name:
             self.view.fit_all()
+            self._fit_pending = False
+
+    def reset_document(self):
+        """A new document gets its own camera and rule selection."""
+        self.view.cancel_drag()
+        self.set_selection([])
+        self._highlighted_constraint = self._highlighted_enabled = None
+        self._fit_pending = True
+
+    def _related_rules(self, names):
+        names = {name.casefold() for name in names}
+        if not self.project:
+            return []
+        return [(row, rule, enabled) for row, (rule, enabled) in
+                enumerate(zip(self.project.constraints, self.project._constraint_flags()))
+                if names.intersection(name.casefold() for name in _participants(rule))]
+
+    def _rule_status(self, rule, enabled):
+        if not enabled:
+            return "disabled"
+        capability = sketch_capability(rule)
+        if capability == "enforced":
+            return "blocked by sketch conflict" if self._conflict else "enforced in sketch"
+        return "for ALIGN to check" if capability == "exported" else "unsupported for export"
+
+    def _request_label(self):
+        names = self.selected_names()
+        if len(names) == 1:
+            self.labelRequested.emit(names[0])
+
+    def _inspect_rule(self):
+        row = self.rule_combo.currentData()
+        if row is not None:
+            self.constraintRequested.emit(row)
+
+    def _rule_selected(self, *_args):
+        row = self.rule_combo.currentData()
+        self.inspect_button.setEnabled(row is not None)
+        if row is not None and self.project:
+            self.highlight_constraint(self.project.constraints[row], self.project._constraint_flags()[row])
 
     def selected_names(self):
         return [name for name, item in self.items_by_name.items() if item.isSelected()]
@@ -431,6 +514,18 @@ class SketchPanel(QWidget):
             button.setEnabled(len(names) >= 2)
         self.ungroup_button.setEnabled(any(set(names).intersection(group["instances"])
                                           for group in self._state.get("groups", [])))
+        self.role_button.setEnabled(len(names) == 1)
+        previous = self.rule_combo.currentData()
+        self.rule_combo.blockSignals(True)
+        self.rule_combo.clear()
+        self.rule_combo.addItem("Select a related rule…", None)
+        for row, rule, enabled in self._related_rules(names):
+            title, _names, settings = constraint_summary(rule)
+            self.rule_combo.addItem(f"{row + 1}. {title} · {settings} · {self._rule_status(rule, enabled)}", row)
+        self.rule_combo.setCurrentIndex(max(0, self.rule_combo.findData(previous)))
+        self.rule_combo.setEnabled(self.rule_combo.count() > 1)
+        self.inspect_button.setEnabled(self.rule_combo.currentData() is not None)
+        self.rule_combo.blockSignals(False)
         if names != self._last_selection:
             self._last_selection = list(names)
             self.selectionChanged.emit(names)
@@ -486,6 +581,8 @@ class SketchPanel(QWidget):
         self._draw_relationship()
         if native:
             note = capability_note(native) if enabled else "Disabled: this rule is not applied in the sketch or exported."
+            if enabled and self._conflict and sketch_capability(native) == "enforced":
+                note = "Blocked by sketch conflict; displayed positions do not satisfy all enabled rules."
             self._message(f"{native.get('constraint', 'Rule')}: {note}")
         else:
             self._message("Drag to arrange; middle drag pans; wheel zooms. Guides are temporary.")
@@ -508,7 +605,7 @@ class SketchPanel(QWidget):
         kind = native.get("constraint", "Rule")
         label = str(kind)
         lines = []
-        live = self._highlighted_enabled and sketch_capability(native) == "enforced"
+        live = self._highlighted_enabled and not self._conflict and sketch_capability(native) == "enforced"
         if kind == "Align" and live:
             line = native.get("line", "")
             label = "Align " + str(line).replace("_", " ")
@@ -542,6 +639,8 @@ class SketchPanel(QWidget):
             self._relationship_items.append(line)
         if not self._highlighted_enabled:
             label += " · disabled"
+        elif self._conflict and sketch_capability(native) == "enforced":
+            label += " · blocked by conflict"
         elif sketch_capability(native) != "enforced":
             label += " · " + ("for ALIGN to check" if sketch_capability(native) == "exported" else "unsupported for export")
         text = self.scene.addSimpleText(label)

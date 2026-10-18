@@ -12,7 +12,7 @@ import tempfile
 import unittest
 
 from roar_api.floorplan import FloorplanProject
-from parse_netlist import parse_spice_netlist
+from roar_api.floorplan.model import parse_spice_netlist
 from roar_api import Design
 
 
@@ -150,17 +150,14 @@ class CompanionWorkflowTests(unittest.TestCase):
             ".subckt OLD d g s b\nM1 d g s b sky130_fd_pr__nfet_01v8 W=1.1u L=.5u NF=2\n.ends OLD\n")
         legacy = numeric.to_dict()
         for key in ("parameters", "overrides", "roar_project_path", "align_profile",
-                    "source_mode", "run_options", "constraint_enabled", "constraint_ids", "sketch"):
+                    "source_mode", "run_options", "constraint_enabled", "constraint_ids", "sketch", "device_labels"):
             del legacy[key]
         legacy["version"] = 1
         self.assertEqual(FloorplanProject.from_dict(legacy).devices, numeric.devices)
 
     @unittest.skipUnless(importlib.util.find_spec("PyQt6"), "optional Qt source loader")
     def test_saved_source_loader_rejects_unrelated_json(self):
-        try:
-            from PyQt6 import QtWidgets  # optional desktop libraries may be unavailable
-        except ImportError as exc:
-            self.skipTest(str(exc))
+        from PyQt6 import QtWidgets  # An installed but broken Qt must fail the check.
         from roar_api.floorplan.dialog import load_roar_design
         for index, value in enumerate(({}, [], {"unrelated": 1}, self.project().to_dict())):
             path = self.folder / f"wrong-{index}.json"

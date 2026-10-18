@@ -41,7 +41,7 @@ class _PhysicalBlock(QGraphicsItem):
         self.block, self.panel = block, panel
         self.rect = _rect(block['bbox'])
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-        self.setToolTip(_tooltip(panel.block_details(block)))
+        self.setToolTip(_tooltip(panel.block_details(block, panel.device_labels)))
 
     def boundingRect(self):
         return self.rect
@@ -65,6 +65,8 @@ class _PhysicalBlock(QGraphicsItem):
         text = ', '.join(sources[:3]) if sources else 'Unmapped: ' + self.block['id']
         if len(sources) > 3:
             text += f' (+{len(sources) - 3})'
+        roles = [self.panel.device_labels[name].replace('_', ' ') for name in sources[:3]
+                 if name in self.panel.device_labels]
         painter.save()
         painter.resetTransform()
         painter.setClipRect(device_rect)
@@ -73,7 +75,9 @@ class _PhysicalBlock(QGraphicsItem):
         painter.setFont(font)
         painter.setPen(palette.color(QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text))
         text = painter.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, int(device_rect.width()))
-        painter.drawText(device_rect, Qt.AlignmentFlag.AlignCenter, text)
+        if roles and device_rect.height() > 45:
+            text += '\n' + '\n'.join(roles)
+        painter.drawText(device_rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
         painter.restore()
 
 
@@ -206,6 +210,7 @@ class PreviewPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.data = self.state = None
+        self.device_labels = {}
         self.items_by_id = {}
         self.net_lines, self._net_items = [], []
         self._last_selection = []
@@ -295,6 +300,14 @@ class PreviewPanel(QWidget):
         self.stale_badge.hide()
         self.status.setText('Read-only preview · wheel to zoom · middle-drag to pan')
         self.details.clear()
+        self._selection_changed()
+
+    def set_device_labels(self, labels):
+        """Display roles without changing captured geometry or source identity."""
+        self.device_labels = dict(labels)
+        for item in self.items_by_id.values():
+            item.setToolTip(_tooltip(self.block_details(item.block, self.device_labels)))
+            item.update()
         self._selection_changed()
 
     def set_preview(self, data, state=None):
@@ -420,7 +433,7 @@ class PreviewPanel(QWidget):
         self.status.setText(note + warning)
 
     @staticmethod
-    def block_details(block):
+    def block_details(block, device_labels=None):
         sources = ', '.join(block['source_instances']) or 'Unknown — no established source membership'
         bbox = block['bbox']
         text = (f"Source instances: {sources}\nCompiled block: {block['path']}\n"
@@ -429,6 +442,10 @@ class PreviewPanel(QWidget):
                 f"Mapping: {block['mapping_status']}")
         if block['mapping_reason']:
             text += '\n' + block['mapping_reason']
+        roles = [f"{name}: {device_labels[name]}" for name in block['source_instances']
+                 if device_labels and name in device_labels]
+        if roles:
+            text += '\nRoles: ' + '; '.join(roles)
         return text
 
     def selected_names(self):
@@ -445,7 +462,7 @@ class PreviewPanel(QWidget):
 
     def _selection_changed(self):
         names = self.selected_names()
-        self.details.setPlainText('\n\n'.join(self.block_details(item.block)
+        self.details.setPlainText('\n\n'.join(self.block_details(item.block, self.device_labels)
                                              for item in self.items_by_id.values() if item.isSelected()))
         if names != self._last_selection:
             self._last_selection = names

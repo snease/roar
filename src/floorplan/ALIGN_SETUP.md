@@ -9,7 +9,14 @@ its paths in **ALIGN settings**. Keep it separate from ROAR's Python environment
 Linux x86-64 (or Linux under WSL), Python 3.10, ALIGN 0.9.8 and Dash 2.18.2.
 The official ALIGN wheel supplies the native placer. Installing dependencies
 such as gdspy may still require a C++ compiler and Python development headers.
-With Python 3.10 and its venv module installed:
+On the tested Ubuntu 22.04 baseline, prepare those prerequisites once:
+
+```sh
+sudo apt update
+sudo apt install python3.10 python3.10-venv python3.10-dev build-essential git
+```
+
+Then create the separate ALIGN environment:
 
 ```sh
 python3.10 -m venv "$HOME/roar-align"
@@ -44,6 +51,12 @@ versions, native imports, backend files and write access to the runs folder;
 it creates that folder if needed. Optional browser-viewer failures are reported
 as warnings and do not block native previews. The check does not install tools
 or prove that a particular circuit can be placed.
+
+From an activated ROAR environment, `python -m roar_api --check-setup` also
+checks the desktop's native libraries and display, then the configured ALIGN
+paths. It reports errors without opening ROAR or changing installations.
+Missing EGL/OpenGL or xcb libraries belong to the ROAR desktop setup; installing
+ALIGN in its separate environment does not provide them.
 
 ## If setup fails
 

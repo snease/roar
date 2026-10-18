@@ -118,6 +118,7 @@ def _legacy_fingerprint(project):
     state = project.to_dict()
     state.pop('sketch', None)
     state.pop('constraint_ids', None)
+    state.pop('device_labels', None)
     state['version'] = 4
     return hashlib.sha256(json.dumps(state, sort_keys=True, separators=(',', ':'),
                                     allow_nan=False).encode()).hexdigest()
@@ -262,7 +263,7 @@ def _ready(url):
     try:
         # Bypass proxy environment variables for the worker's local server.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        request_url = urllib.parse.urlunparse(parsed._replace(path='/_dash-layout', query=''))
+        request_url = urllib.parse.urlunparse(parsed._replace(path=parsed.path.rstrip('/') + '/_dash-layout', query=''))
         token = urllib.parse.parse_qs(parsed.query).get('token', [''])[0]
         request = urllib.request.Request(request_url, headers={'Authorization': 'Bearer ' + token})
         with opener.open(request, timeout=0.35) as response:
@@ -448,12 +449,14 @@ class AlignRunner:
     @contextmanager
     def save_as_transaction(self, path):
         """Reserve ownership across a caller's atomic save, before rebinding."""
-        if (self._run_dir is None and (not self.config.run_root or
-                (not self._root.exists() and (not self.config.python or not self.config.backend_path)))):
-            # Authoring a draft does not require configuring/creating ALIGN
-            # storage. There is no history to transfer and launch is unavailable.
+        target = str(Path(path).expanduser().resolve())
+        if (self._run_dir is None and (not self.config.run_root or not any(
+                self._index(key).is_file() for key in (self.project_path, target) if key))):
+            # A draft with no recorded history needs no ALIGN storage, even
+            # when remembered tool paths or the runs directory are unavailable.
+            # Existing source/target records still use the ownership transaction.
             yield
-            self.project_path = str(Path(path).expanduser().resolve())
+            self.project_path = target
             return
         with _ownership_lock(self._root):
             self._check_save_as(path)

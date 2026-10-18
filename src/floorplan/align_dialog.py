@@ -86,9 +86,9 @@ def _probe(parent, config, completed, *, manifest=None):
     directory = tempfile.TemporaryDirectory(prefix='roar-align-check-')
     process.setWorkingDirectory(directory.name)
     arguments = ['-I', '-u', str(Path(__file__).with_name('_align_probe.py').resolve()),
-                 '--backend', str(Path(config.backend_path).expanduser())]
+                 '--backend', str(Path(config.backend_path).expanduser().resolve())]
     if manifest is not None:
-        arguments += ['--manifest', str(manifest)]
+        arguments += ['--manifest', str(Path(manifest).expanduser().resolve())]
     finished = False
     timed_out = False
     timer = QTimer(process)
@@ -119,7 +119,9 @@ def _probe(parent, config, completed, *, manifest=None):
     process.finished.connect(finish)
     process.errorOccurred.connect(lambda error: finish() if error == QProcess.ProcessError.FailedToStart else None)
     process.destroyed.connect(directory.cleanup)
-    process.start(str(Path(config.python).expanduser()), arguments)
+    # Keep the venv executable path rather than resolving its symlink to the
+    # system Python; resolve relative paths before changing the child's cwd.
+    process.start(str(Path(config.python).expanduser().absolute()), arguments)
     timer.start()
     return process
 
@@ -321,6 +323,7 @@ class PlacementRunDialog(QDialog):
         # The authenticated browser URL is for local use, not support reports.
         diagnostics = f'{text}\nRun folder: {state.run_dir}\nLog: {state.log_path}\n\nDisplayed log tail:\n{log}'
         self._diagnostics = re.sub(r'([?&]token=)[^\s&"<>]+', r'\1[redacted]', diagnostics)
+        self._diagnostics = re.sub(r'/roar-align/[0-9a-f]{64}/', '/roar-align/[redacted]/', self._diagnostics)
         if self.log.toPlainText() != log:
             scroll = self.log.verticalScrollBar()
             at_end, position = scroll.value() == scroll.maximum(), scroll.value()

@@ -7,13 +7,14 @@ from pathlib import Path
 import tempfile
 
 from roar_api import Design
+from .documents import load_document, validate_document
 
 
 def load_roar_design(path):
     """Validate a saved ROAR design, rejecting unrelated JSON documents."""
     if not str(path).strip():
         raise ValueError("Choose a saved ROAR design.")
-    state = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    state = load_document(path)
     editor = state.get("design_editor", state) if isinstance(state, dict) else None
     tables = ("instance_table", "expression_editor", "constraint_editor")
     if not isinstance(editor, dict) or not any(key in editor for key in tables):
@@ -30,7 +31,29 @@ def load_roar_design(path):
     if tabs is not None and (not isinstance(tabs, list) or
                             any(not isinstance(name, str) or not name.strip() for name in tabs)):
         raise ValueError("Invalid ROAR design: expression tabs must be names.")
-    return Design.from_state(state)
+    try:
+        return Design.from_state(state)
+    except (AttributeError, IndexError, KeyError, TypeError, RecursionError, OverflowError) as exc:
+        raise ValueError(f"Invalid ROAR design: {exc}") from None
+
+
+def _editor_state(value):
+    """Detach editor data without requiring completed, uniquely named rows."""
+    state = value.to_state() if isinstance(value, Design) else value
+    validate_document(state)
+    if not isinstance(state, dict):
+        raise ValueError("The current ROAR editor could not be read.")
+    editor = state.get("design_editor", state)
+    tables = ("expression_editor", "constraint_editor", "instance_table")
+    if not isinstance(editor, dict) or not any(table in editor for table in tables):
+        raise ValueError("The current ROAR editor could not be read.")
+    result = Design().to_state()["design_editor"]
+    result.update(deepcopy(editor))
+    for table in tables:
+        if (not isinstance(result[table], list) or
+                any(not isinstance(row, dict) for row in result[table])):
+            raise ValueError(f"Invalid ROAR editor table: {table}")
+    return result
 
 
 def editor_signature(design):
@@ -40,7 +63,7 @@ def editor_signature(design):
     cells are redundant. Empty columns and implicit row flags are GUI defaults.
     Graphs, timestamps, theme and window geometry are outside this document.
     """
-    state = design.to_state()["design_editor"]
+    state = _editor_state(design)
     if not state.get("expression_tabs"):
         state["expression_tabs"] = list(dict.fromkeys(
             row.get("_tab", "Expressions") for row in state["expression_editor"])) or ["Expressions"]
@@ -67,11 +90,16 @@ class DesignWorkspace:
     capture_design is cheap and returns a detached Design (or editor dict).
     capture_state is used only when saving a complete application document.
     apply_design replaces editor data only and must propagate failures.
+    Optional capture_editor/apply_editor preserve unfinished rows for dirty
+    tracking and rollback; they do not supply validated sizing data.
     """
-    def __init__(self, *, capture_design, capture_state, apply_design):
+    def __init__(self, *, capture_design, capture_state, apply_design,
+                 capture_editor=None, apply_editor=None):
         self._capture_design = capture_design
         self._capture_state = capture_state
         self._apply_design = apply_design
+        self._capture_editor = capture_editor
+        self._apply_editor = apply_editor
         self.path = None
         self._baseline = None
 
@@ -79,8 +107,16 @@ class DesignWorkspace:
         value = self._capture_design()
         return Design.from_state(value.to_state() if isinstance(value, Design) else value)
 
+    def editor_snapshot(self):
+        """Raw editor state for dirty tracking and lossless failed-switch rollback."""
+        capture = self._capture_editor or self._capture_design
+        return _editor_state(capture())
+
+    def has_content(self):
+        return editor_signature(self.editor_snapshot()) != editor_signature(Design())
+
     def is_modified(self):
-        current = editor_signature(self.snapshot())
+        current = editor_signature(self.editor_snapshot())
         if self._baseline is None:
             return current != editor_signature(Design())
         return current != self._baseline
@@ -88,10 +124,9 @@ class DesignWorkspace:
     def record(self, path):
         """Record a successful existing File/Load/Save operation."""
         try:
-            baseline = editor_signature(self.snapshot())
+            baseline = editor_signature(self.editor_snapshot())
         except (ValueError, TypeError):
-            # Existing editor file actions also accept unfinished table rows.
-            # Such a document cannot be used as a validated sizing source.
+            # Do not retain an old identity if the editor could not be captured.
             self.path, self._baseline = None, None
             raise
         self.path = str(Path(path).expanduser().resolve()) if path else None
@@ -102,7 +137,7 @@ class DesignWorkspace:
         design = self.snapshot()
         if target.is_file():
             load_roar_design(target)  # Never overwrite an unrelated JSON file.
-            previous = json.loads(target.read_text(encoding="utf-8"))
+            previous = load_document(target)
             complete = "design_editor" in previous
         else:
             complete = target.suffix.lower() != ".json"
@@ -133,7 +168,7 @@ class DesignWorkspace:
     def switch(self, path):
         target = Path(path).expanduser().resolve()
         desired = load_roar_design(target)  # Validate before changing the editor.
-        previous = self.snapshot()
+        previous = self.editor_snapshot()
         try:
             self._apply_design(desired)
             actual = self.snapshot()
@@ -141,8 +176,11 @@ class DesignWorkspace:
                 raise ValueError("ROAR could not load all of the selected design's editor data.")
         except Exception as error:
             try:
-                self._apply_design(previous)
-                if editor_signature(self.snapshot()) != editor_signature(previous):
+                if self._apply_editor is not None:
+                    self._apply_editor(previous)
+                else:
+                    self._apply_design(Design.from_state(previous))
+                if editor_signature(self.editor_snapshot()) != editor_signature(previous):
                     raise ValueError("restored editor data did not match")
             except Exception as rollback_error:
                 raise RuntimeError(f"Design switch failed ({error}); restoring the previous design also failed: {rollback_error}") from error

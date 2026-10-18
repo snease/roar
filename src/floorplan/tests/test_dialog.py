@@ -2,16 +2,20 @@
 
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 try:
     from PyQt6.QtCore import QSettings, QTimer, Qt, QObject, pyqtSignal
     from PyQt6.QtTest import QTest
-    from PyQt6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QPushButton, QWidget
-except ImportError:
+    from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QPushButton, QWidget
+except ModuleNotFoundError as exc:
+    if exc.name != "PyQt6":
+        raise
     QApplication = None
 
 from roar_api import Design
@@ -278,6 +282,84 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._guard(self.dialog._export_align)
         warning.assert_called_once()
         self.assertIn("File exists", self.dialog.status.text())
+
+    def test_handoff_uses_displayed_sketch_and_optional_selected_candidate(self):
+        from roar_api.floorplan.geometry import build_preview
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        preview = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
+        second = deepcopy(preview['candidates'][0])
+        second['name'] = 'SECOND_CANDIDATE'
+        preview['candidates'].append(second)
+        state = SimpleNamespace(run_dir=str(self.root), stale=True)
+        self.dialog.preview_panel.set_preview(preview, state)
+        self.dialog.preview_panel.candidate_combo.setCurrentIndex(1)
+        self.dialog.project.set_device_labels({'M1': 'Input pair'})
+        before = self.dialog.project.to_dict()
+        self.dialog.sketch_panel.items_by_name['M1'].setPos(375, 215)
+        displayed = self.dialog.sketch_panel.display_positions()
+        self.assertNotEqual(displayed, before['sketch']['positions'])
+        for include_preview in (True, False):
+            def choose(options):
+                self.assertEqual(options.windowTitle(), 'Export handoff')
+                checkbox = options.findChild(QCheckBox)
+                self.assertTrue(checkbox.isEnabled())
+                checkbox.setChecked(include_preview)
+                return QDialog.DialogCode.Accepted
+            with self.subTest(include_preview=include_preview), \
+                 patch.object(QDialog, 'exec', new=choose), \
+                 patch.object(QFileDialog, 'getSaveFileName', return_value=(str(self.root / 'review'), '')), \
+                 patch('roar_api.floorplan.handoff.export_handoff') as export:
+                self.dialog._export_handoff()
+            export.assert_called_once()
+            packaged, destination = export.call_args.args
+            self.assertEqual(destination, str(self.root / 'review.zip'))
+            self.assertEqual(packaged.sketch['positions'], displayed)
+            self.assertEqual(packaged.device_labels, {'M1': 'Input pair'})
+            self.assertEqual(self.dialog.project.to_dict(), before)
+            self.assertIs(export.call_args.kwargs['preview'], self.dialog.preview_panel.data if include_preview else None)
+            self.assertIs(export.call_args.kwargs['state'], state if include_preview else None)
+            self.assertEqual(export.call_args.kwargs['candidate_index'], 1 if include_preview else 0)
+
+    def test_handoff_cancellation_and_wrong_suffix_leave_destinations_untouched(self):
+        destination = self.root / 'existing.roar'
+        destination.write_bytes(b'existing design')
+        for accept_options, path in ((False, str(destination)), (True, ''), (True, str(destination))):
+            def choose(options):
+                self.assertFalse(options.findChild(QCheckBox).isEnabled())
+                return QDialog.DialogCode.Accepted if accept_options else QDialog.DialogCode.Rejected
+            with self.subTest(accept_options=accept_options, path=path), \
+                 patch.object(QDialog, 'exec', new=choose), \
+                 patch.object(QFileDialog, 'getSaveFileName', return_value=(path, '')) as picker, \
+                 patch('roar_api.floorplan.handoff.export_handoff') as export:
+                if accept_options and path:
+                    with self.assertRaisesRegex(ValueError, r'\.zip filename'):
+                        self.dialog._export_handoff()
+                else:
+                    self.dialog._export_handoff()
+                export.assert_not_called()
+                if not accept_options:
+                    picker.assert_not_called()
+            self.assertEqual(destination.read_bytes(), b'existing design')
+
+    def test_labeled_demo_reopens_captured_and_preserves_roles_when_linked(self):
+        path = Path(__file__).resolve().parents[3] / 'examples/floorplan/ota/cm_ota.roar.floorplan'
+        original = FloorplanProject.load(path)
+        self.assertTrue(original.device_labels)
+        options = OpenFloorplanDialog(self.parent, path)
+        self.assertEqual(options.source_mode.currentData(), 'saved')
+        options.accept()
+        self.assertIsNone(options.design)
+        self.assertEqual(options.project.device_labels, original.device_labels)
+        self.assertEqual(options.project.devices, original.devices)
+        options.deleteLater()
+        options = OpenFloorplanDialog(self.parent, path)
+        options.source_mode.setCurrentIndex(options.source_mode.findData('linked'))
+        options.accept()
+        self.assertEqual(options.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(options.source_origin, 'linked')
+        self.assertEqual(options.project.device_labels, original.device_labels)
+        self.assertEqual(options.project.devices, original.devices)
+        options.deleteLater()
 
     def test_unified_import_dialog_selects_sole_circuit_and_combines_options(self):
         source = self.root / "commented.spice"
@@ -584,6 +666,115 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._open_project()
         self.assertIs(self.dialog.project, original_project)
         self.assertIs(self.dialog.roar_design, original_source)
+
+    def test_malformed_documents_report_inline_without_escaping_qt_slots(self):
+        original = self.dialog.project.to_dict()
+        huge = self.dialog.project.to_dict()
+        huge['run_options'] = {'lambda_coeff': 10 ** 400}
+        path = self.root / 'malformed.roar.floorplan'
+        options = OpenFloorplanDialog(self.parent)
+        for content in ('[' * 1500 + '0' + ']' * 1500, json.dumps(huge)):
+            path.write_text(content)
+            options.floorplan_path.setText(str(path))
+            options.floorplan_path.editingFinished.emit()
+            self.assertTrue(options.link_status.text())
+            self.assertFalse(options.buttons.button(QDialogButtonBox.StandardButton.Open).isEnabled())
+            options.accept()
+            self.assertEqual(options.result(), QDialog.DialogCode.Rejected)
+            self.assertIsNone(options.project)
+        options.deleteLater()
+        constraints = self.root / 'malformed.const.json'
+        constraints.write_text('[' * 1500 + '0' + ']' * 1500)
+        with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(constraints), '')), \
+             patch.object(QMessageBox, 'warning') as warning:
+            self.dialog._guard(self.dialog._import_constraints)
+        warning.assert_called_once()
+        self.assertEqual(self.dialog.project.to_dict(), original)
+
+    def test_unnamed_live_source_reopens_captured_until_explicitly_selected(self):
+        source = Design().add_instance('M1_2', W=2.2e-6, L=.5e-6, NF=2)
+        workspace = FakeWorkspace(source)
+        self.dialog.workspace = workspace
+        self.dialog.snapshot_provider = workspace.snapshot
+        project = FloorplanProject.from_text(SYMBOLIC)
+        project.set_parameter('nfs', 2)
+        self.dialog.set_project(project)
+        self.dialog._activate_source('live')
+        self.dialog.binding_instance.setCurrentText('M1_2')
+        self.dialog.binding_attribute.setCurrentIndex(self.dialog.binding_attribute.findData('W'))
+        self.dialog._bind_parameter()
+        path = self.root / 'unnamed.roar.floorplan'
+        with patch.object(QFileDialog, 'getSaveFileName', return_value=(str(path), '')):
+            self.dialog._save_project()
+        self.assertEqual(self.dialog._source_mode, 'live')
+        self.assertEqual(FloorplanProject.load(path).source_mode, 'saved')
+        unrelated = self.root / 'unrelated.roar'
+        Design().add_instance('M1_2', W=3e-6, L=.5e-6, NF=2).save(unrelated)
+        workspace.switch(unrelated)
+        # Cover both new captured drafts and older files that persisted live
+        # intent without recording any source identity.
+        for legacy in (False, True):
+            if legacy:
+                state = json.loads(path.read_text())
+                state['source_mode'] = 'live'
+                path.write_text(json.dumps(state))
+            options = OpenFloorplanDialog(self.parent, path, workspace=workspace)
+            self.assertEqual(options.source_mode.currentData(), 'saved')
+            options.accept()
+            self.assertAlmostEqual(options.project.devices[0].width_um, 1.1)
+            self.assertIsNone(options.project.roar_project_path)
+            options.deleteLater()
+        options = OpenFloorplanDialog(self.parent, path, workspace=workspace)
+        options.source_mode.setCurrentIndex(options.source_mode.findData('live'))
+        options.source_mode.activated.emit(options.source_mode.currentIndex())
+        options.accept()
+        self.assertAlmostEqual(options.project.devices[0].width_um, 1.5)
+        self.assertEqual(options.project.roar_project_path, str(unrelated))
+        options.deleteLater()
+
+    def test_unfinished_current_design_can_reach_discard_and_switch(self):
+        from roar_api.floorplan.workspace import DesignWorkspace
+        raw = {'instance_table': [{'Instance': '', 'W': 'unfinished'}]}
+        holder = {'editor': raw}
+        def apply(design):
+            holder['editor'] = design.to_state()['design_editor']
+        workspace = DesignWorkspace(
+            capture_design=lambda: Design.from_state(holder['editor']),
+            capture_editor=lambda: holder['editor'], capture_state=lambda: {},
+            apply_design=apply, apply_editor=lambda state: holder.update(editor=state))
+        target = self.design.save(self.root / 'linked.roar')
+        project = self._bound_project()
+        project.roar_project_path = target
+        path = project.save(self.root / 'linked.roar.floorplan')
+        options = OpenFloorplanDialog(self.parent, path, workspace=workspace)
+        with patch('roar_api.floorplan.dialog._source_switch_choice', return_value='cancel') as choice:
+            options.accept()
+        choice.assert_called_once()
+        self.assertEqual(holder['editor'], raw)
+        with patch('roar_api.floorplan.dialog._source_switch_choice', return_value='switch'):
+            options.accept()
+        self.assertEqual(options.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(workspace.path, str(target))
+        self.assertEqual(options.source_origin, 'live')
+        options.deleteLater()
+
+    def test_role_label_editing_is_undoable_and_constraint_links_select_rows(self):
+        before = self.dialog.project.to_dict()
+        with patch('roar_api.floorplan.dialog.QInputDialog.getText', return_value=('Input pair', True)):
+            self.dialog.sketch_panel.labelRequested.emit('M1')
+        self.assertEqual(self.dialog.project.device_labels, {'M1': 'Input pair'})
+        self.dialog._undo()
+        self.assertEqual(self.dialog.project.to_dict(), before)
+        self.dialog._redo()
+        self.assertEqual(self.dialog.project.device_labels, {'M1': 'Input pair'})
+        with patch('roar_api.floorplan.dialog.QInputDialog.getText', return_value=('', True)):
+            self.dialog._edit_device_label('M1')
+        self.assertFalse(self.dialog.project.device_labels)
+        self.dialog.project.constraints = [{'constraint': 'Order', 'instances': ['M1', 'M2'], 'direction': 'left_to_right'}]
+        self.dialog._render_constraints()
+        self.dialog.sketch_panel.constraintRequested.emit(0)
+        self.assertEqual(self.dialog.constraints_table.currentRow(), 0)
+        self.assertIs(self.dialog.tabs.currentWidget(), self.dialog.constraints_table.parentWidget())
 
     def test_parameter_fields_are_shared_constant_fields_remain_editable_and_draft_saves(self):
         self.dialog.set_project(FloorplanProject.from_text(SYMBOLIC, dimension_unit="um"))

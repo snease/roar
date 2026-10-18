@@ -28,7 +28,7 @@ class SketchTests(unittest.TestCase):
         for version in (1, 2, 3, 4):
             state = project.to_dict()
             state['version'] = version
-            for key in ('sketch', 'constraint_ids'):
+            for key in ('sketch', 'constraint_ids', 'device_labels'):
                 state.pop(key)
             if version < 4:
                 for key in ('source_mode', 'run_options', 'constraint_enabled'):
@@ -45,7 +45,7 @@ class SketchTests(unittest.TestCase):
                 self.assertEqual(restored.sketch, FloorplanProject.from_dict(state).sketch)
                 if version == 4:
                     self.assertEqual(restored._constraint_flags(), [False, True])
-                self.assertEqual(restored.to_dict()['version'], 5)
+                self.assertEqual(restored.to_dict()['version'], 6)
 
     def test_save_groups_case_identity_and_constraint_ids(self):
         project = self.project()
@@ -90,7 +90,7 @@ class SketchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Constraint IDs'):
             FloorplanProject.from_dict(state)
 
-    def test_v5_saved_link_resolves_relative_to_companion(self):
+    def test_saved_link_resolves_relative_to_companion(self):
         project = self.project()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -100,7 +100,7 @@ class SketchTests(unittest.TestCase):
             project.source_mode = 'linked'
             saved = project.save(root / 'companions' / 'pair.floorplan')
             state = json.loads(saved.read_text())
-            self.assertEqual(state['version'], 5)
+            self.assertEqual(state['version'], 6)
             self.assertEqual(state['roar_project_path'], '../source.roar')
             restored = FloorplanProject.load(saved)
             self.assertEqual(restored.roar_project_path, str(linked))

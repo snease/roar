@@ -1704,7 +1704,10 @@ class ROARApp(QMainWindow):
 
     def _apply_floorplan_design(self, design):
         """Replace editor inputs only; propagate errors for workspace rollback."""
-        state = design.to_state()["design_editor"]
+        self._apply_floorplan_editor_state(design.to_state()["design_editor"])
+
+    def _apply_floorplan_editor_state(self, state):
+        """Restore editor rows, including unfinished rows during rollback."""
         previous_restoring = getattr(self, '_is_restoring_state', False)
         self._is_restoring_state = True
         try:
@@ -1712,7 +1715,7 @@ class ROARApp(QMainWindow):
             editor.expression_editor.load_table_data(state['expression_editor'], state.get('expression_tabs'))
             editor.constraint_editor.load_table_data(state['constraint_editor'])
             editor.instance_table.load_table_data(state['instance_table'])
-            editor._get_or_create_iterative_dialog().set_settings(state['iterative_solver'])
+            editor._get_or_create_iterative_dialog().set_settings(state.get('iterative_solver', {}))
             self._sync_all_instance_browser_tabs()
         finally:
             self._is_restoring_state = previous_restoring
@@ -1724,7 +1727,9 @@ class ROARApp(QMainWindow):
             self._floorplan_workspace = DesignWorkspace(
                 capture_design=self._capture_floorplan_design,
                 capture_state=self.capture_app_state,
-                apply_design=self._apply_floorplan_design)
+                apply_design=self._apply_floorplan_design,
+                capture_editor=self._capture_design_editor_state,
+                apply_editor=self._apply_floorplan_editor_state)
         return self._floorplan_workspace
 
     def _record_design_document(self, path):

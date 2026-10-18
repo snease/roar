@@ -22,6 +22,17 @@ synthetic layout examples, not an optimized or simulation-qualified design.
    Choose **Generate preview** on **Floorplan** to compare a physical candidate
    beside the sketch. No browser is opened. Inspect dimensions, select a source
    device, and choose a net under **Connections**.
+6. Use **Export handoff…** to share captured sizes, native inputs and drawings
+   in one ZIP. Including a displayed candidate also includes the inputs that
+   produced it; an older result is clearly distinguished from current inputs.
+
+The companion labels the input pair `diffpair_inn` / `diffpair_inp`, the PMOS
+mirror reference/output devices `pmirror_inn_ref` / `pmirror_inn_out` and
+`pmirror_inp_ref` / `pmirror_inp_out`, the NMOS mirror `nmirror_ref` /
+`nmirror_out`, and the bias devices `tail` / `bias_ref`. Original instance IDs
+remain visible. Select one box and choose **Role label…** to edit its role.
+Hover over a box for its directly associated rules, or use **Rules for selection →
+Inspect rule…**. Drawing groups are separate from enabled native constraints.
 
 Changing sizes or enabled rules marks the captured preview **Earlier inputs**; generate again to apply them. Drawing-only edits keep the
 preview current. **Open in ALIGN browser…** remains an explicit optional action.

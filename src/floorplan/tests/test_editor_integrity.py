@@ -18,7 +18,9 @@ try:
     from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox, QPlainTextEdit, QWidget
     from roar_api.floorplan.align_runner import AlignConfig
     from roar_api.floorplan.dialog import FloorplanDialog, OpenFloorplanDialog
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name != "PyQt6":
+        raise
     QApplication = None
 
 
@@ -154,6 +156,45 @@ class EditorIntegrityTests(unittest.TestCase):
         self.dialog._unbind_parameter()
         self.assertIsNone(self.dialog.project.parameter_rows[0]["binding"])
         self.assertEqual(self.dialog.project.devices[0].width_um, 0.25)
+
+    def test_unbinding_or_replacing_bad_binding_clears_cached_placement_error(self):
+        for repair in ('unbind', 'manual'):
+            with self.subTest(repair=repair):
+                project = FloorplanProject.from_text(CIRCUIT.replace('W=2u', 'W=shared'))
+                valid = Design().add_instance('input_pair', W=4e-6)
+                project.bind_parameter(valid, 'shared', 'input_pair', 'W', source='live')
+                self.dialog.set_project(project, design=valid, source_origin='live')
+                self.source = Design().add_instance('input_pair', L=.5e-6)
+                self.dialog._live_source_update()
+                self.assertTrue(self.dialog._source_error)
+                if repair == 'unbind':
+                    self.dialog._unbind_parameter()
+                else:
+                    self.dialog.parameter_value.setText('1.1')
+                    self.dialog.parameter_unit.setCurrentIndex(self.dialog.parameter_unit.findData('um'))
+                    self.dialog.parameter_width.setCurrentIndex(self.dialog.parameter_width.findData('per_finger'))
+                    self.dialog._set_parameter()
+                self.assertFalse(self.dialog._source_error)
+                self.dialog._collect_placement_project().validate()
+                with patch.object(self.dialog.placement_panel, '_validator'):
+                    self.dialog.placement_panel.refresh()
+                self.assertTrue(self.dialog.placement_panel.generate_button.isEnabled())
+
+    def test_corrected_device_cell_and_failed_new_source_do_not_keep_stale_errors(self):
+        self.dialog._activate_source('live')
+        self.dialog.devices_table.item(0, 3).setText('unfinished')
+        self.dialog._live_source_update()
+        self.assertTrue(self.dialog._source_error)
+        self.dialog.devices_table.item(0, 3).setText('1.1')
+        self.assertFalse(self.dialog._source_error)
+        self.dialog._collect_placement_project().validate()
+        self.dialog._activate_source('saved')
+        before = self.dialog.project.to_dict()
+        with self.assertRaises(OSError):
+            self.dialog._activate_source('linked', str(self.root / 'missing.roar'))
+        self.assertEqual(self.dialog.project.to_dict(), before)
+        self.assertFalse(self.dialog._source_error)
+        self.dialog._collect_placement_project().validate()
 
     def test_live_refresh_does_not_add_undo_commands(self):
         project = FloorplanProject.from_text(CIRCUIT.replace("W=2u", "W=shared"))

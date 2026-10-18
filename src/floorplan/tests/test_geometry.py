@@ -75,6 +75,17 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(block['concrete_name'], other['concrete_name'])
         self.assertEqual(block['bbox'], [0, 0, 5.16, 6.72])
 
+    def test_slash_in_electrical_net_name_is_data_not_a_file_path(self):
+        native = json.loads((self.root / RESULT).read_text())
+        # Native SPICE accepts hierarchical names; the adapter must preserve them.
+        native = json.loads(json.dumps(native).replace('VINN', 'STAGE/LEFT'))
+        self.write_json(RESULT, native)
+        preview = self.preview()
+        self.assertTrue(any(net['name'] == 'STAGE/LEFT'
+                            for net in preview['candidates'][0]['nets']))
+        self.write_json('preview.json', preview)
+        self.assertEqual(load_preview(self.root / 'preview.json'), preview)
+
     def nested_run(self):
         self.manifest['top'] = 'TOP'
         (self.root / self.manifest['netlist']).write_text(

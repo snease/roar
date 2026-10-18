@@ -56,6 +56,15 @@ class ConstraintCoverageTests(unittest.TestCase):
                 self.project.set_constraints([rule])
                 self.project.validate()
 
+    def test_zero_net_weight_uses_native_netpriority_instead_of_ignored_netconst(self):
+        with self.assertRaisesRegex(ValueError, 'use NetPriority with weight 0'):
+            self.project.set_constraints([{'constraint': 'NetConst', 'nets': ['d1'], 'criticality': 0}])
+        rule = {'constraint': 'NetPriority', 'nets': ['d1'], 'weight': 0}
+        self.project.set_constraints([rule])
+        with tempfile.TemporaryDirectory() as directory:
+            _, path = self.project.export_align(directory)
+            self.assertEqual(json.loads(path.read_text()), [rule])
+
     def test_export_normalizes_identifiers_missing_native_case_validators(self):
         rules = [
             {'constraint': 'PortLocation', 'ports': ['d1'], 'location': 'TC'},
@@ -156,7 +165,9 @@ class ConstraintCoverageTests(unittest.TestCase):
 try:
     from PyQt6.QtWidgets import QApplication, QDialog
     from roar_api.floorplan.constraint_editor import ConstraintEditorDialog, editable_constraint
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name != "PyQt6":
+        raise
     QApplication = None
 
 

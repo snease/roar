@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 6,
   "source_netlist": "** sch_path: /home/adair/Documents/CAD/xschem_library_adair/schematics/cm_ota.sch\n**.subckt cm_ota vdd out inp inn itail vss\n*.iopin inn\n*.iopin inp\n*.iopin out\n*.iopin vss\n*.iopin vdd\n*.iopin itail\nXM1 ds1_3 inn source source sky130_fd_pr__nfet_01v8 L=0.500 W=w1_2 nf=nf1_2 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nxM3 ds1_3 ds1_3 vdd vdd sky130_fd_pr__pfet_01v8 L=0.500 W=w3_4 nf=nf3_4 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM2 ds2_4 inp source source sky130_fd_pr__nfet_01v8 L=0.500 W=w1_2 nf=nf1_2 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nxM4 ds2_4 ds2_4 vdd vdd sky130_fd_pr__pfet_01v8 L=0.500 W=w3_4 nf=nf3_4 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nxM7 ds5_7 ds1_3 vdd vdd sky130_fd_pr__pfet_01v8 L=0.500 W=w7_8 nf=nf7_8 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM5 ds5_7 ds5_7 vss vss sky130_fd_pr__nfet_01v8 L=0.500 W=w5_6 nf=nf5_6 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM6 out ds5_7 vss vss sky130_fd_pr__nfet_01v8 L=0.500 W=w5_6 nf=nf5_6 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nxM8 out ds2_4 vdd vdd sky130_fd_pr__pfet_01v8 L=0.500 W=w7_8 nf=nf7_8 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM9 source itail vss vss sky130_fd_pr__nfet_01v8 L=0.500 W=w9_10 nf=nf9_10 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\nXM10 itail itail vss vss sky130_fd_pr__nfet_01v8 L=0.500 W=w9_10 nf=nf1_2 ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'\n+ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W' sa=0 sb=0 sd=0 mult=1\n**.ends\n.end\n",
   "source_path": null,
   "top": "cm_ota",
@@ -265,5 +265,86 @@
   },
   "overrides": {},
   "roar_project_path": "cm_ota_sizes.roar",
-  "align_profile": "sky130-ota-vibeic-v1"
+  "align_profile": "sky130-ota-vibeic-v1",
+  "source_mode": "saved",
+  "run_options": {},
+  "constraint_enabled": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "constraint_ids": [
+    "01b6e2ed5c404c778d608fd14a6da018",
+    "da373b27d2174239a66e30528ab5c152",
+    "a568513a2ac84efda209a86fc9cf9c12",
+    "078d7117ca4348298c7828564af5e241",
+    "6110e7873fb14bb288cc144d54710e91",
+    "33860c1b8dc24515a6bc10f590960295",
+    "d720025253bb498e9df98442e9f136c3",
+    "4a6f40f52e7c4ca399405c04d4f711e8",
+    "ba4b04f2d33f4cb4876f9afb900a976a"
+  ],
+  "sketch": {
+    "positions": {
+      "XM1": [
+        0.0,
+        0.0
+      ],
+      "xM3": [
+        180.0,
+        0.0
+      ],
+      "XM2": [
+        360.0,
+        0.0
+      ],
+      "xM4": [
+        540.0,
+        0.0
+      ],
+      "xM7": [
+        0.0,
+        120.0
+      ],
+      "XM5": [
+        180.0,
+        120.0
+      ],
+      "XM6": [
+        360.0,
+        120.0
+      ],
+      "xM8": [
+        540.0,
+        120.0
+      ],
+      "XM9": [
+        0.0,
+        240.0
+      ],
+      "XM10": [
+        180.0,
+        240.0
+      ]
+    },
+    "groups": []
+  },
+  "device_labels": {
+    "XM1": "diffpair_inn",
+    "XM2": "diffpair_inp",
+    "xM3": "pmirror_inn_ref",
+    "xM7": "pmirror_inn_out",
+    "xM4": "pmirror_inp_ref",
+    "xM8": "pmirror_inp_out",
+    "XM5": "nmirror_ref",
+    "XM6": "nmirror_out",
+    "XM9": "tail",
+    "XM10": "bias_ref"
+  }
 }
