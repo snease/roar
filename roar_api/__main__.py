@@ -22,7 +22,10 @@ def main():
     if check_setup(gui_only=True, quiet=True, prepare_launch=True, output=sys.stderr):
         return 1
     design = Design.load(options.design) if options.design else None
-    return Session(design, home=options.home).run()
+    session = Session(design, home=options.home)
+    if options.design:
+        session.app._record_design_document(options.design)
+    return session.run()
 
 
 if __name__ == "__main__":

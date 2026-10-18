@@ -15,7 +15,7 @@ Offscreen checks alone do not establish that a visible desktop works.
 
 You do not need a preinstalled Python, `sudo`, Conda shell commands or virtual
 environment activation for the normal setup. Pixi supplies Python 3.11 for
-ROAR and Python 3.10 for the separate ALIGN process. **Python 3.11 compatibility
+ROAR and Python 3.11 for the separate ALIGN process. **Python 3.11 compatibility
 remains a requirement** for ROAR code and dependency changes.
 
 ## Installation Steps
@@ -172,6 +172,12 @@ Pixi adds the Python interpreters and native dependencies, and `pixi.lock`
 records the resolved artifacts. Keep the lock in version control and review
 its changes with dependency updates. Users rerun setup to install that reviewed
 runtime; launch never resolves a new one.
+
+Both managed environments use Python 3.11. ALIGN uses its official 0.9.8
+CPython 3.11 wheel, preserving the native placer version and glibc 2.28 target.
+Python 3.10 reached end of life in October 2026; Python 3.11 receives security
+fixes until October 2027 according to the [Python support schedule](https://devguide.python.org/versions/).
+Review interpreter support alongside dependency updates before that date.
 
 Maintainers should update the pinned Pixi version/checksum deliberately and
 verify Python 3.11 compatibility, desktop startup, floorplan tests and a real

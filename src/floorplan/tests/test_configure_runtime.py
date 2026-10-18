@@ -52,7 +52,7 @@ class ConfigureRuntimeTests(unittest.TestCase):
     def children(self):
         return [subprocess.CompletedProcess([], 0, '{}', ''),
                 subprocess.CompletedProcess([], 0, 'ROAR_PROBE ' + json.dumps({
-                    'ok': True, 'browser_viewer': True, 'align': '0.9.8', 'python': '3.10.22'}), '')]
+                    'ok': True, 'browser_viewer': True, 'align': '0.9.8', 'python': '3.11.17'}), '')]
 
     def configure(self, children, gui_result=0):
         with patch.object(sys, 'executable', str(self.gui)), patch.object(sys, 'version_info', (3, 11, 0)), patch.object(sys, 'path', sys.path[:]), patch.dict(os.environ, {}, clear=True), patch.object(runtime.subprocess, 'run', side_effect=children) as run, patch.object(doctor, 'check_setup', return_value=gui_result), contextlib.redirect_stdout(io.StringIO()):
@@ -74,6 +74,8 @@ class ConfigureRuntimeTests(unittest.TestCase):
             'provision': ([subprocess.CompletedProcess([], 1, '', 'download failed')], 0),
             'probe': ([self.children()[0], subprocess.CompletedProcess([], 1, '', 'native import failed')], 0),
             'viewer': ([self.children()[0], subprocess.CompletedProcess([], 0, 'ROAR_PROBE {"ok": true, "browser_viewer": false}', '')], 0),
+            'align-python': ([self.children()[0], subprocess.CompletedProcess([], 0,
+                'ROAR_PROBE {"ok": true, "browser_viewer": true, "python": "3.10.22"}', '')], 0),
             'display': (self.children(), 1),
             'timeout': ([subprocess.TimeoutExpired(['align-python'], 300)], 0),
         }

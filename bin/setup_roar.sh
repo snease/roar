@@ -7,7 +7,7 @@ usage() {
 Usage: ./bin/setup_roar.sh
 
 Install this checkout's pinned Pixi and locked environments: Python 3.11 for
-ROAR and Python 3.10 for ALIGN. Then configure and check the managed runtime.
+ROAR and Python 3.11 for ALIGN. Then configure and check the managed runtime.
 Requires Linux x86_64, a desktop display, curl or wget, tar, gzip, and sha256sum.
 Downloads are stored in the checkout and Pixi's package cache. No sudo, system
 Python, shell activation, or shell profile changes are needed.
@@ -24,7 +24,7 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 while (($#)); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        --python|--python=*) fail '--python is obsolete: Pixi manages Python 3.11 for ROAR and Python 3.10 for ALIGN. Run setup without this option.' ;;
+        --python|--python=*) fail '--python is obsolete: Pixi manages separate Python 3.11 environments for ROAR and ALIGN. Run setup without this option.' ;;
         --skip-system-packages) fail '--skip-system-packages is obsolete: setup no longer installs system packages. Run setup without this option.' ;;
         *) fail "Unknown option: $1. Run ./bin/setup_roar.sh --help." ;;
     esac

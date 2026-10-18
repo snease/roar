@@ -35,7 +35,7 @@ jobs:
       - name: Build and installed-wheel core/missing-GUI smoke
         if: ${{ !cancelled() && steps.headless.outcome == 'success' }}
         run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e headless check-package
-      - name: Native schema and placement checks (Python 3.10, no routing)
+      - name: Native schema and placement checks (Python 3.11, no routing)
         # The small native placement cases also include the schema check.
         # Run on every PR to cover indirect changes to native exports.
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}

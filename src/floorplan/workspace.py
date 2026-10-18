@@ -1,5 +1,6 @@
 """Design-document operations used by the floorplan editor, without Qt."""
 from copy import deepcopy
+from contextlib import nullcontext
 from datetime import datetime
 import json
 import os
@@ -92,14 +93,17 @@ class DesignWorkspace:
     apply_design replaces editor data only and must propagate failures.
     Optional capture_editor/apply_editor preserve unfinished rows for dirty
     tracking and rollback; they do not supply validated sizing data.
+    save_context(path, complete) surrounds a save commit and may yield False
+    to cancel it; record and switch never invoke this optional GUI hook.
     """
     def __init__(self, *, capture_design, capture_state, apply_design,
-                 capture_editor=None, apply_editor=None):
+                 capture_editor=None, apply_editor=None, save_context=None):
         self._capture_design = capture_design
         self._capture_state = capture_state
         self._apply_design = apply_design
         self._capture_editor = capture_editor
         self._apply_editor = apply_editor
+        self._save_context = save_context
         self.path = None
         self._baseline = None
 
@@ -150,7 +154,17 @@ class DesignWorkspace:
             state["saved_at"] = datetime.now().isoformat()
         else:
             state = editor
-        content = json.dumps(state, indent=2, allow_nan=False) + "\n"
+        return design if self.save_document(target, state) else None
+
+    def save_document(self, path, state, *, indent=2):
+        """Atomically save a File action's raw document, including unfinished rows.
+
+        A GUI save context may save a companion before the document commits.
+        Loading/recording another document deliberately does not use this hook.
+        """
+        target = Path(path).expanduser().resolve()
+        baseline = editor_signature(self.editor_snapshot())
+        content = json.dumps(state, indent=indent, allow_nan=False) + "\n"
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
@@ -158,12 +172,17 @@ class DesignWorkspace:
                                              prefix="." + target.name + ".", delete=False) as stream:
                 temporary = Path(stream.name)
                 stream.write(content)
-            os.replace(temporary, target)
+            context = (self._save_context(str(target), "design_editor" in state)
+                       if self._save_context is not None else nullcontext())
+            with context as ready:
+                if ready is False:
+                    return False
+                os.replace(temporary, target)
+                self.path, self._baseline = str(target), baseline
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        self.path, self._baseline = str(target), editor_signature(design)
-        return design
+        return True
 
     def switch(self, path):
         target = Path(path).expanduser().resolve()

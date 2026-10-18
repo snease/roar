@@ -95,6 +95,8 @@ def configure(root):
         if probe.returncode or not result.get('ok') or not result.get('browser_viewer'):
             raise ValueError('Managed ALIGN check failed:\n' +
                              str(result.get('message') or probe.stderr or probe.stdout)[-2500:])
+        if str(result.get('python', '')).split('.')[:2] != ['3', '11']:
+            raise ValueError('The managed ALIGN runtime requires Python 3.11. Restore pixi.lock and rerun setup.')
         print(f'PASS: Managed ALIGN {result["align"]}, Python {result["python"]}; backend and viewer assets checked.')
     if check_setup(gui_only=True):
         raise ValueError('Desktop startup check failed. Follow the diagnostic above and rerun setup.')

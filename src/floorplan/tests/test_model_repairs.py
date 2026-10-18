@@ -225,6 +225,92 @@ class ModelRepairTests(unittest.TestCase):
             project.set_mos_multiplicity('M1', 2)
         self.assertEqual(project.to_dict(), before)
 
+    def test_saved_numeric_strings_are_normalized_before_rebuild_and_export(self):
+        state = self.project().to_dict()
+        state['overrides'] = {'M1': {'width_um': '1.1', 'length_um': '.25',
+                                      'nf': '4', 'multiplicity': '3'}}
+        state['devices'][0].update(width_um='1.1', length_um='.25', nf='4')
+        original = deepcopy(state)
+        restored = FloorplanProject.from_dict(state)
+        self.assertEqual(state, original)
+        self.assertEqual(restored.to_dict()['overrides']['M1'],
+                         {'width_um': 1.1, 'length_um': .25, 'nf': 4, 'multiplicity': 3})
+        device = restored.devices[0]
+        self.assertIs(type(device.width_um), float)
+        self.assertIs(type(device.length_um), float)
+        self.assertIs(type(device.nf), int)
+        self.assertIs(type(device.parameters['M']), int)
+        restored.validate()
+        with tempfile.TemporaryDirectory() as directory:
+            netlist, _ = restored.export_align(directory)
+            exported = FloorplanProject.from_netlist(netlist)
+            self.assertAlmostEqual(exported.devices[0].width_um, 1.1)
+            self.assertAlmostEqual(exported.devices[0].length_um, .25)
+            self.assertEqual(exported.devices[0].nf, 4)
+            self.assertEqual(exported.devices[0].parameters['M'], 3)
+
+        # NF must be converted before total source width is divided by it.
+        state = FloorplanProject.from_text(CIRCUIT, width_convention='total').to_dict()
+        state['overrides'] = {'M1': {'nf': '4'}}
+        state['devices'][0].update(width_um='.25', nf='4')
+        restored = FloorplanProject.from_dict(state)
+        self.assertEqual(restored.devices[0].width_um, .25)
+        restored.set_mos_multiplicity('M1', 2)
+        self.assertEqual(restored.devices[0].nf, 4)
+
+    def test_saved_sizes_and_overrides_reject_invalid_numeric_fields(self):
+        # One-valued fields expose Python's True == 1 equality trap.
+        project = FloorplanProject.from_text(CIRCUIT.replace('NF=2', 'NF=1'))
+        for field in ('width_um', 'length_um', 'nf', 'multiplicity'):
+            for value in (True, False, [], {}, 'expression', 0, -1):
+                state = project.to_dict()
+                state['overrides'] = {'M1': {field: value}}
+                with self.subTest(location='overrides', field=field, value=value), self.assertRaises(ValueError):
+                    FloorplanProject.from_dict(state)
+                if field != 'multiplicity':
+                    state = project.to_dict()
+                    state['devices'][0][field] = value
+                    with self.subTest(location='devices', field=field, value=value), self.assertRaises(ValueError):
+                        FloorplanProject.from_dict(state)
+        for location in ('overrides', 'devices'):
+            state = project.to_dict()
+            if location == 'overrides':
+                state[location] = {'M1': {'nf': '1.5'}}
+            else:
+                state[location][0]['nf'] = '1.5'
+            with self.subTest(location=location), self.assertRaises(ValueError):
+                FloorplanProject.from_dict(state)
+
+    def test_legacy_numeric_snapshots_and_unresolved_drafts_still_load(self):
+        for version in range(1, 7):
+            state = self.project().to_dict()
+            state['version'] = version
+            for introduced, keys in ((6, ('device_labels',)), (5, ('constraint_ids', 'sketch')),
+                                     (4, ('source_mode', 'run_options', 'constraint_enabled')),
+                                     (3, ('align_profile',)),
+                                     (2, ('parameters', 'overrides', 'roar_project_path'))):
+                if version < introduced:
+                    for key in keys:
+                        state.pop(key)
+            for field in ('width_um', 'length_um', 'nf'):
+                state['devices'][0][field] = str(state['devices'][0][field])
+            with self.subTest(version=version):
+                restored = FloorplanProject.from_dict(state)
+                restored.validate()
+                state['devices'][0]['nf'] = True
+                with self.assertRaises(ValueError):
+                    FloorplanProject.from_dict(state)
+
+        project = FloorplanProject.from_text(CIRCUIT.replace('W=1u L=0.5u NF=2',
+                                                             'W=width L=length NF=fingers'))
+        restored = FloorplanProject.from_dict(project.to_dict())
+        self.assertIsNone(restored.devices[0].width_um)
+        self.assertIsNone(restored.devices[0].length_um)
+        self.assertIsNone(restored.devices[0].nf)
+        for symbol, value in (('width', '1u'), ('length', '.5u'), ('fingers', 2)):
+            restored.set_parameter(symbol, value)
+        restored.validate()
+
     def test_binding_can_be_repaired_and_unbound_without_old_source(self):
         project = FloorplanProject.from_text(CIRCUIT.replace('W=1u L=0.5u', 'W=width L=length'))
         old = Design().add_instance('old', W=4e-6, L=.5e-6)

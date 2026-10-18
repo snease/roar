@@ -844,7 +844,7 @@ class FloorplanProject:
                     raise ValueError('Malformed ROAR parameter binding')
                 project._set_parameter_record(symbol, deepcopy(record), parameters)
             project._parameters = parameters
-            overrides = state['overrides']
+            overrides = deepcopy(state['overrides'])
             if not isinstance(overrides, dict):
                 raise ValueError('Malformed saved numeric device overrides')
             for name, changes in overrides.items():
@@ -862,12 +862,12 @@ class FloorplanProject:
                     if role in device.symbols:
                         raise ValueError(f'{name}.{role}: numeric override conflicts with a shared parameter')
                     if role == 'NF':
-                        _fingers(value)
+                        changes[field_name] = _fingers(value)
                     elif role == 'M':
-                        _multiplicity(value, f'{name} M')
+                        changes[field_name] = _multiplicity(value, f'{name} M')
                     else:
-                        _positive(value, f'{name} {role}')
-            project._overrides = deepcopy(overrides)
+                        changes[field_name] = _positive(value, f'{name} {role}')
+            project._overrides = overrides
             project.devices = project._rebuild(parameters)
         sizes = state['devices']
         expected_names = {device.name for device in project.devices if device.kind == 'mos'}
@@ -876,6 +876,15 @@ class FloorplanProject:
         if len(sizes) != len(expected_names) or {row['name'] for row in sizes} != expected_names:
             raise ValueError('Saved sizes do not match the source circuit instances')
         for row in sizes:
+            # Normalize numeric strings consistently with overrides, and
+            # reject booleans before dict equality
+            # can mistake True for a dimension or finger count of one.
+            row = dict(row)
+            for field_name in ('width_um', 'length_um', 'nf'):
+                value = row[field_name]
+                if value is not None:
+                    row[field_name] = (_fingers(value) if field_name == 'nf' else
+                                       _positive(value, f'{row["name"]} {field_name}'))
             device = project._device(row['name'])
             if state['version'] in (2, 3, 4, 5, 6):
                 actual = {'name': device.name, 'width_um': device.width_um, 'length_um': device.length_um, 'nf': device.nf}

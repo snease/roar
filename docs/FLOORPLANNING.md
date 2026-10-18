@@ -27,7 +27,7 @@ not needed for this placement workflow; routing and signoff remain separate.
 ## Set up the ROAR desktop
 
 Setup installs the locked Pixi runtime under the checkout's `.pixi` directory:
-Python 3.11 for ROAR, native graphics libraries, and Python 3.10 for ALIGN.
+Python 3.11 for ROAR, native graphics libraries, and Python 3.11 for ALIGN.
 It verifies the pinned Pixi 0.75.0 download and configures the placement backend.
 No system Python, `sudo`, virtual environment activation or Conda shell commands
 are required. The launcher always selects this checkout's managed environment
@@ -218,7 +218,7 @@ not override managed mode.
 
 Open **ALIGN settings… → Setup help…** for
 [managed-runtime recovery and the manual installation recipe](../src/floorplan/ALIGN_SETUP.md).
-The profile uses the official ALIGN 0.9.8 Python 3.10 wheel, Dash 2.18.2 and the
+The profile uses the official ALIGN 0.9.8 Python 3.11 wheel, Dash 3.4.0 and the
 pinned vibeic SKY130 backend. The source reference used for compatibility checks is
 [revision `8d3cc2e9`](https://github.com/ALIGN-analoglayout/ALIGN-public/tree/8d3cc2e9aa5511315203eb5cbfd00d2c88fdbd18);
 the wheel is identified by its release and artifact, not assumed to equal that checkout.
@@ -642,7 +642,7 @@ packages:
 `test-floorplan` uses Python 3.11 and explicitly sets offscreen Qt.
 `check-gui` requires a visible desktop and verifies an OpenGL widget's rendered
 framebuffer; it rejects headless Qt overrides. Offscreen tests do not establish
-desktop or OpenGL support. `check-align` uses the managed Python 3.10 interpreter
+desktop or OpenGL support. `check-align` uses the managed Python 3.11 interpreter
 and pinned backend for native parsing, schema validation and constraint
 translation. `check-align-placement` adds real native placement and geometry
 checks without routing. Each check prints a retained temporary artifact

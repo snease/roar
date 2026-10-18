@@ -10,7 +10,7 @@ newer** is required. Its implementation is in [roar_api/design.py](../roar_api/d
 
 For the desktop and its managed Python 3.11 runtime, run `./bin/setup_roar.sh`
 then `./bin/roar` from the checkout. Setup uses Pixi to install locked Python
-and native dependencies, with a separate Python 3.10 environment for ALIGN.
+and native dependencies, with a separate Python 3.11 environment for ALIGN.
 Run your own API script in the managed ROAR environment with:
 
 ```sh

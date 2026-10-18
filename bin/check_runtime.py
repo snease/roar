@@ -132,7 +132,7 @@ def main():
                'checkout': str(ROOT), 'artifacts': str(work), 'status': 'FAIL'}
     started = time.monotonic()
     try:
-        expected = (3, 10) if options.check in ('align', 'align-placement') else (3, 11)
+        expected = (3, 11)
         if sys.version_info[:2] != expected:
             raise ValueError(f'{options.check} requires managed Python {expected[0]}.{expected[1]}')
         if options.check == 'package':

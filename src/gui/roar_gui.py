@@ -3,6 +3,7 @@ import os
 import json
 import re
 import signal
+from contextlib import contextmanager, nullcontext
 
 # Set up Ctrl-C signal handler early to allow graceful exit
 def _sigint_handler(signum, frame):
@@ -1729,8 +1730,19 @@ class ROARApp(QMainWindow):
                 capture_state=self.capture_app_state,
                 apply_design=self._apply_floorplan_design,
                 capture_editor=self._capture_design_editor_state,
-                apply_editor=self._apply_floorplan_editor_state)
+                apply_editor=self._apply_floorplan_editor_state,
+                save_context=self._saving_design_document)
         return self._floorplan_workspace
+
+    @contextmanager
+    def _saving_design_document(self, path, complete):
+        floorplan = self._floorplan_editor()
+        context = (floorplan.saving_design_document(path, save_companion=complete)
+                   if floorplan is not None else nullcontext(True))
+        with context as ready:
+            yield ready
+        if ready:
+            self.design_document_changed.emit()
 
     def _record_design_document(self, path):
         try:
@@ -1764,12 +1776,9 @@ class ROARApp(QMainWindow):
 
         try:
             floorplan = self._floorplan_editor()
-            if floorplan is not None and not floorplan.save_for_application():
-                return
             state = self.capture_app_state()
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(state, f, indent=2)
-            self._record_design_document(filename)
+            if not self.floorplan_workspace().save_document(filename, state):
+                return
             companion = f"\nFloorplan saved separately to:\n{floorplan.project_path}" if floorplan is not None and floorplan.project_path is not None else ""
             QMessageBox.information(self, "Success", f"App state saved to:\n{filename}{companion}")
         except Exception as e:

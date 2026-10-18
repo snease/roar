@@ -9,7 +9,7 @@ The normal checkout setup also prepares ALIGN for physical placement:
 ```
 
 Setup installs the locked Pixi environments, with Python 3.11 for ROAR and a
-separate Python 3.10 environment for ALIGN. It supplies the matching SKY130
+separate Python 3.11 environment for ALIGN. It supplies the matching SKY130
 backend and configures the paths automatically. Normal use needs no Python-path
 entry, shell activation, Conda knowledge or `sudo`.
 The managed launcher uses these paths with **Managed by ROAR** selected in
@@ -47,7 +47,7 @@ Only choose an external executable when you intend to use that installation.
 
 ## Toolchain versions
 
-The profile uses Python 3.10, the official ALIGN 0.9.8 wheel and Dash 3.4.0,
+The profile uses Python 3.11, the official ALIGN 0.9.8 wheel and Dash 3.4.0,
 with the vibeic SKY130 backend at
 `427b3b94242fdcf8009e418f6bbe14286fc71334`. The wheel supplies the native placer;
 its release and artifact identify the installed code. The ALIGN source revision
@@ -59,18 +59,12 @@ source of viewer assets, not a claim about the wheel's source commit.
 For a CAD-managed installation outside Pixi, prepare a separate ALIGN environment
 and select it explicitly in **ALIGN settings**. Keep it separate from ROAR's GUI
 environment. Installing dependencies such as gdspy through pip may require a C++
-compiler and Python development headers. On Ubuntu 22.04, an administrator can
-prepare those prerequisites with:
+compiler and Python development headers. Supply Python 3.11 with venv support,
+matching development headers, a C++ compiler and Git through your CAD environment,
+then create the separate manual ALIGN environment:
 
 ```sh
-sudo apt update
-sudo apt install python3.10 python3.10-venv python3.10-dev build-essential git
-```
-
-Then create the separate manual ALIGN environment:
-
-```sh
-python3.10 -m venv "$HOME/roar-align"
+python3.11 -m venv "$HOME/roar-align"
 "$HOME/roar-align/bin/python" -m pip install --upgrade pip
 "$HOME/roar-align/bin/python" -m pip install --only-binary=align-analoglayout \
   'align-analoglayout==0.9.8' 'dash==3.4.0'
@@ -115,7 +109,7 @@ setup supplies those runtime libraries for the GUI.
 | --- | --- |
 | Managed runtime is missing or incomplete | Rerun `./bin/setup_roar.sh` from this checkout, then launch `./bin/roar`. |
 | No module named `align` or `dash` | Repair the managed runtime with setup. For a manual installation, select its separate Python and install the packages there using the recipe above. |
-| Native import fails / no matching wheel | Check Linux x86-64 and the reported runtime requirements. A manual installation requires Python 3.10 and its native libraries. Other builds from the [ALIGN installation guide](https://align-analoglayout.github.io/ALIGN-public/notes/installation.html) have not been validated here. |
+| Native import fails / no matching wheel | Check Linux x86-64 and the reported runtime requirements. A manual installation requires Python 3.11 and its native libraries. Other builds from the [ALIGN installation guide](https://align-analoglayout.github.io/ALIGN-public/notes/installation.html) have not been validated here. |
 | Backend does not match | Rerun managed setup, or use the exact vibeic revision above for a custom installation and select its `SKY130_PDK` subfolder. The official ALIGN SKY130 backend and open_pdks `sky130A` are different installations. |
 | ALIGN viewer assets are missing | Native previews still work. Rerun setup for the managed viewer, or complete the manual static-assets step above for a custom installation. |
 | Cannot write to placement runs folder | Choose an existing writable location or a new folder beneath one. |

@@ -6,6 +6,7 @@ and MOS width is per finger, independently of the source's width convention.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -80,8 +81,7 @@ def _save_workspace(parent, workspace, protected_path=None):
         path += ".roar"
     if protected_path and Path(path).expanduser().resolve() == Path(protected_path).expanduser().resolve():
         raise ValueError("Save the current design to a different file; this path is the linked design you are switching to.")
-    workspace.save(path)
-    return True
+    return workspace.save(path) is not None
 
 
 def _choose_source(parent, project, mode, path, workspace=None, snapshot_provider=None):
@@ -1438,6 +1438,46 @@ class FloorplanDialog(QDialog):
             self.status.setText(str(exc))
             QMessageBox.warning(self, "Floorplan could not be saved", str(exc))
             return False
+
+    @contextmanager
+    def saving_design_document(self, path, *, save_companion=False):
+        """Follow Save As only when this floorplan uses the current live document.
+
+        Save the companion before committing the design. If that commit fails,
+        restore the active association; a companion already written stays dirty
+        so a subsequent save can repair its persisted association.
+        """
+        previous = self.workspace.path if self.workspace is not None else None
+        associated = self.project.roar_project_path if self.project is not None else None
+        follows_current = (self.project is not None and self._source_mode == "live" and
+                           (str(Path(associated).expanduser().resolve()) if associated else None) == previous)
+        changed = follows_current and associated != path
+        committed = False
+        source_update_pending = self._source_timer.isActive()
+        if changed:
+            # A save-path dialog may run Qt's loop while the new association is
+            # staged and the workspace still owns its previous identity.
+            self._source_timer.stop()
+            self.project.roar_project_path = path
+            self._record_edit(automatic=True)
+        try:
+            if (save_companion or changed) and not self.save_for_application():
+                yield False
+                return
+            yield True
+            committed = True
+        finally:
+            if changed and not committed:
+                self.project.roar_project_path = associated
+                self._record_edit(automatic=True)
+            if changed and source_update_pending:
+                self._source_timer.start()
+        if changed:
+            # Undoing a parameter edit must not undo the document's Save As.
+            for state in self._undo_states + self._redo_states:
+                project = state["project"]
+                if project.get("source_mode") == "live" and project.get("roar_project_path") == associated:
+                    project["roar_project_path"] = path
 
     def _discard_edits(self):
         return self.confirm_unsaved("replace this floorplan")

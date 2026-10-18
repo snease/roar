@@ -2527,18 +2527,24 @@ class ROAREditorWindow(QWidget):
     def save_all_data(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Save File", "", "JSON Files (*.json)")
         if file_path:
-            data = {
-                "expression_editor": self.expression_editor.get_table_data(),
-                "expression_tabs": self.expression_editor.get_tab_names(),
-                "constraint_editor": self.constraint_editor.get_table_data(),
-                "instance_table": self.instance_table.get_table_data(),
-                "iterative_solver": self.get_iterative_settings(),
-            }
-            with open(file_path, "w") as file:
-                json.dump(data, file, indent=4)
-            if self.top_level_app is not None and hasattr(self.top_level_app, '_record_design_document'):
-                self.top_level_app._record_design_document(file_path)
-            QMessageBox.information(self, "Success", "Data saved successfully!")
+            try:
+                data = {
+                    "expression_editor": self.expression_editor.get_table_data(),
+                    "expression_tabs": self.expression_editor.get_tab_names(),
+                    "constraint_editor": self.constraint_editor.get_table_data(),
+                    "instance_table": self.instance_table.get_table_data(),
+                    "iterative_solver": self.get_iterative_settings(),
+                }
+                app = self.top_level_app
+                if app is not None and hasattr(app, 'floorplan_workspace'):
+                    if not app.floorplan_workspace().save_document(file_path, data, indent=4):
+                        return
+                else:
+                    with open(file_path, "w") as file:
+                        json.dump(data, file, indent=4)
+                QMessageBox.information(self, "Success", "Data saved successfully!")
+            except Exception as exc:
+                QMessageBox.critical(self, "Error", f"Failed to save design:\n{exc}")
 
     def load_all_data(self, file_path=None, show_success_message=True):
         if not file_path:

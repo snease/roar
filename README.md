@@ -15,7 +15,7 @@ distributions meeting these requirements are targets, not yet validated platform
 
 **Compatibility requirement:** ROAR must remain compatible with Python 3.11.
 Preserve that support when changing code, dependencies or installation scripts.
-Setup supplies Python 3.11 for ROAR and a separate Python 3.10 environment for
+Setup supplies Python 3.11 for ROAR and a separate Python 3.11 environment for
 ALIGN. You do not need to install Python or choose interpreter paths yourself.
 
 ## Python API
