@@ -65,6 +65,9 @@ virtual environment is active. It runs offline without installing packages or
 changing the dependency lock. After updating or moving the checkout, rerun
 setup before launching. Do not copy a managed environment between locations.
 
+Ctrl+C in the launching terminal requests normal window closure, including any
+unsaved-floorplan prompt and placement-process cleanup. Cancel keeps ROAR open.
+
 The historical `./bin/setup_roar.csh` and `./bin/run_roar.csh` commands remain
 compatibility wrappers. The old setup options `--python` and
 `--skip-system-packages` no longer apply: Python versions are managed and setup

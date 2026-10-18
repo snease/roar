@@ -416,12 +416,50 @@ class Session:
         return self
 
     def run(self) -> int:
+        """Run the owned event loop; Ctrl+C requests normal window closure."""
         self._ensure()
-        from PyQt6.QtCore import QThread
+        import signal
+        from PyQt6.QtCore import QThread, QTimer
         if not self._owns_qapp or QThread.currentThread().loopLevel():
             raise RuntimeError("The host owns/runs Qt's event loop; use show() instead")
-        self.show()
-        return self._qapp.exec()
+        previous = signal.getsignal(signal.SIGINT)
+        handle_interrupt = previous == signal.default_int_handler
+        interrupted, closing = False, False
+
+        def request_close(signum, frame):
+            # Do not raise into an arbitrary Qt callback or open a modal dialog
+            # from a signal handler. Let the next event-loop tick close normally.
+            nonlocal interrupted
+            interrupted = True
+
+        def process_interrupt():
+            nonlocal interrupted, closing
+            if not interrupted or closing:
+                return
+            closing = True
+            try:
+                self.close()
+                if self._closed:
+                    self._qapp.exit(130)
+            finally:
+                # Repeated Ctrl+C while a save/discard prompt is open must not
+                # recurse into close or override the user's Cancel choice.
+                interrupted, closing = False, False
+
+        # Python handles SIGINT only when it regains control from Qt. Keep an
+        # idle native event loop responsive, while preserving custom API handlers.
+        timer = QTimer()
+        timer.timeout.connect(process_interrupt)
+        if handle_interrupt:
+            signal.signal(signal.SIGINT, request_close)
+        try:
+            timer.start(100)
+            self.show()
+            return self._qapp.exec()
+        finally:
+            timer.stop()
+            if handle_interrupt:
+                signal.signal(signal.SIGINT, previous)
 
     def close(self) -> None:
         _main_thread()
