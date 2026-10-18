@@ -14,8 +14,9 @@ from roar_api import Design
 from roar_api.floorplan import FloorplanProject
 
 try:
-    from PyQt6.QtCore import QSettings, Qt, QTimer
+    from PyQt6.QtCore import QSettings, Qt
     from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QMainWindow, QMessageBox, QPlainTextEdit, QWidget
+    from qt_test_helpers import modal_interaction
     from roar_api.floorplan.align_runner import AlignConfig
     from roar_api.floorplan.dialog import FloorplanDialog, OpenFloorplanDialog
 except ModuleNotFoundError as exc:
@@ -112,8 +113,8 @@ class EditorIntegrityTests(unittest.TestCase):
             text = modal.findChild(QPlainTextEdit).toPlainText()
             self.assertIn('"field": 12', text)
             modal.reject()
-        QTimer.singleShot(0, inspect)
-        self.dialog._inspect_constraint()
+        with modal_interaction(inspect):
+            self.dialog._inspect_constraint()
         self.dialog._toggle_constraint()
         self.dialog._collect_project().validate()
 
@@ -276,6 +277,7 @@ class EditorIntegrityTests(unittest.TestCase):
         # methods without constructing unrelated OpenGL graph panes.
         window = window_type.__new__(window_type)
         QMainWindow.__init__(window)
+        window._capture_default_layout = Mock()  # Graph panes are outside this fixture.
         window.header = SimpleNamespace(_floorplan_dialog=self.dialog)
         state = self.source.to_state()
         state["marker"] = "saved"
@@ -492,7 +494,7 @@ finally:
                     capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_cli_loaded_design_has_real_identity_and_clean_baseline_before_run(self):
+    def test_cli_and_python_open_saved_documents_with_the_same_identity(self):
         path = self.root / "cli.roar"
         self.source.save(path)
         script = r'''
@@ -501,9 +503,10 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0, sys.argv[1])
-from roar_api import Session
+from roar_api import Session, launch
 from roar_api.__main__ import main
 path = Path(sys.argv[2]).resolve()
+entry = sys.argv[3]
 previous_handler = signal.getsignal(signal.SIGINT)
 def inspect(session):
     workspace = session.app.floorplan_workspace()
@@ -513,15 +516,24 @@ def inspect(session):
     assert signal.getsignal(signal.SIGINT) == previous_handler
     session.close()
     return 0
-sys.argv = ['roar', str(path)]
-with patch('roar_api.floorplan.doctor.check_setup', return_value=0), patch.object(Session, 'run', inspect):
-    assert main() == 0
+if entry == 'cli':
+    sys.argv = ['roar', str(path)]
+    with patch('roar_api.floorplan.doctor.check_setup', return_value=0), patch.object(Session, 'run', inspect):
+        assert main() == 0
+elif entry == 'launch':
+    inspect(launch(path))
+else:
+    session = Session.from_file(path)
+    assert session._app is None
+    inspect(session)
 '''
-        result = subprocess.run(
-            [sys.executable, "-I", "-c", script, str(Path(__file__).resolve().parents[3]), str(path)],
-            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
-            capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for entry in ('cli', 'launch', 'session'):
+            with self.subTest(entry=entry):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", script, str(Path(__file__).resolve().parents[3]), str(path), entry],
+                    env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_main_window_cancel_does_not_shutdown_placement(self):
         window = self._main_window()

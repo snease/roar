@@ -35,8 +35,9 @@ def launch(design=None, *, home=None, run=False):
     returned Session. Standalone scripts can use Session(...).run() instead.
     """
     if design is not None and not isinstance(design, Design):
-        design = Design.load(design)
-    session = Session(design, home=home, show=True)
+        session = Session.from_file(design, home=home, show=True)
+    else:
+        session = Session(design, home=home, show=True)
     if run:
         session.run()
     return session

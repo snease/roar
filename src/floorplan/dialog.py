@@ -24,7 +24,7 @@ from .model import FloorplanProject, _scalar
 from .constraint_editor import ConstraintEditorDialog, constraint_summary, editable_constraint
 from .constraints import FIELDS
 
-from .workspace import editor_signature, load_roar_design
+from .workspace import load_roar_design
 from .documents import load_document
 
 
@@ -42,14 +42,8 @@ def _floorplan_example_directory():
 
 def _refresh_source_bindings(project, design, origin):
     """Migrate only explicit mappings, leaving manual values untouched."""
-    candidate = FloorplanProject.from_dict(project.to_dict())
-    for row in project.parameter_rows:
-        binding = row["binding"]
-        if binding:
-            candidate.bind_parameter(
-                design, row["symbol"], binding["instance"], binding["attribute"],
-                dimension_unit=row["dimension_unit"],
-                width_convention=row["width_convention"], source=origin)
+    candidate = project.snapshot()
+    candidate.migrate_bindings(design, origin)
     return candidate
 
 
@@ -87,7 +81,7 @@ def _save_workspace(parent, workspace, protected_path=None):
 def _choose_source(parent, project, mode, path, workspace=None, snapshot_provider=None):
     """Preflight mappings before changing the active design or floorplan."""
     if mode == "saved":
-        candidate = FloorplanProject.from_dict(project.to_dict())
+        candidate = project.snapshot()
         candidate.source_mode = "saved"
         return candidate, None, None
     def current_source():
@@ -116,9 +110,7 @@ def _choose_source(parent, project, mode, path, workspace=None, snapshot_provide
         candidate.source_mode = "linked"
         return candidate, design, "linked"
     if workspace is not None:
-        from roar_api import Design
-        has_current = (workspace.has_content() if hasattr(workspace, 'has_content') else
-                       editor_signature(workspace.snapshot()) != editor_signature(Design()))
+        has_current = workspace.has_content()
         choice = "switch"
         if has_current or workspace.path or workspace.is_modified():
             choice = _source_switch_choice(parent, workspace, path)
@@ -647,7 +639,7 @@ class FloorplanDialog(QDialog):
     def _editor_state(self):
         if self.project is None:
             return None
-        return {"project": self.project.to_dict(),
+        return {"project": self.project.snapshot(),
                 "cells": [[self.devices_table.item(row, column).text()
                            for column in range(self.devices_table.columnCount())]
                           for row in range(self.devices_table.rowCount())],
@@ -655,7 +647,7 @@ class FloorplanDialog(QDialog):
 
     @staticmethod
     def _document_state(state):
-        return (state["project"], state["cells"]) if state is not None else None
+        return (state["project"].to_dict(), state["cells"]) if state is not None else None
 
     def _record_edit(self, *, automatic=False):
         state = self._editor_state()
@@ -679,7 +671,7 @@ class FloorplanDialog(QDialog):
 
     def _restore_editor_state(self, state, *, refresh_source=True):
         from roar_api import Design
-        self.project = FloorplanProject.from_dict(state["project"])
+        self.project = state["project"].snapshot()
         design = Design.from_state(state["source"]) if state["source"] is not None else None
         self._set_source(design, self.project.source_mode if design is not None else None)
         self._render()
@@ -851,9 +843,7 @@ class FloorplanDialog(QDialog):
         interpretation.addWidget(self.binding_width)
         form.addRow("Source W/L units and W meaning:", interpretation)
         layout.addLayout(form)
-        # Retain the alias for callers; the header owns the single reload action.
-        self.refresh_bindings_button = self.source_reload_button
-        self.refresh_bindings_button.setEnabled(False)
+        self.source_reload_button.setEnabled(False)
         self.binding_instance.setToolTip("Bindings follow the selected sizing source; manual values are unchanged.")
         self.tabs.addTab(tab, "Parameters")
 
@@ -1138,11 +1128,7 @@ class FloorplanDialog(QDialog):
             return
         options = ConstraintEditorDialog(candidate, candidate.constraints[index], parent=self)
         if options.exec() == QDialog.DialogCode.Accepted:
-            # Keep row identity while replacing its native fields, including
-            # documents containing preserved, unsupported sibling constraints.
-            state = candidate.to_dict()
-            state['constraints'][index] = options.constraint
-            candidate = FloorplanProject.from_dict(state)
+            candidate.replace_constraint(index, options.constraint)
             self._arrange_sketch(candidate)
             self.project = candidate
             self._render_constraints()
@@ -1165,16 +1151,10 @@ class FloorplanDialog(QDialog):
         candidate = self._collect_project()
         index = self.constraints_table.currentRow()
         if 0 <= index < len(candidate.constraints):
-            from copy import deepcopy
-            from uuid import uuid4
-            state = candidate.to_dict()
-            state['constraints'].insert(index + 1, deepcopy(state['constraints'][index]))
-            state['constraint_enabled'].insert(index + 1, state['constraint_enabled'][index])
-            state['constraint_ids'].insert(index + 1, uuid4().hex)
-            candidate = FloorplanProject.from_dict(state)
+            inserted = candidate.duplicate_constraint(index)
             self.project = candidate
             self._render_constraints()
-            self.constraints_table.selectRow(index + 1)
+            self.constraints_table.selectRow(inserted)
             self._record_edit()
 
     def _toggle_constraint(self):
@@ -1285,7 +1265,7 @@ class FloorplanDialog(QDialog):
     def _collect_project(self):
         """Validate a copy so a bad cell/JSON edit never partially changes state."""
         self._require_project()
-        candidate = FloorplanProject.from_dict(self.project.to_dict())
+        candidate = self.project.snapshot()
         for row, device in enumerate(candidate.devices):
             if device.kind == "resistor":
                 candidate.set_resistance(device.name, self.devices_table.item(row, 7).text())
@@ -1476,8 +1456,8 @@ class FloorplanDialog(QDialog):
             # Undoing a parameter edit must not undo the document's Save As.
             for state in self._undo_states + self._redo_states:
                 project = state["project"]
-                if project.get("source_mode") == "live" and project.get("roar_project_path") == associated:
-                    project["roar_project_path"] = path
+                if project.source_mode == "live" and project.roar_project_path == associated:
+                    project.roar_project_path = path
 
     def _discard_edits(self):
         return self.confirm_unsaved("replace this floorplan")
@@ -1640,9 +1620,6 @@ class FloorplanDialog(QDialog):
                 self._source_error = str(exc)
                 self.snapshot_label.setText("Sizing source error: " + str(exc))
             raise
-
-    def _read_roar(self):
-        self._activate_source("live")
 
     def _set_source(self, design, origin=None):
         selected_instance = self.binding_instance.currentText()

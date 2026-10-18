@@ -90,23 +90,6 @@ class SketchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Constraint IDs'):
             FloorplanProject.from_dict(state)
 
-    def test_saved_link_resolves_relative_to_companion(self):
-        project = self.project()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            linked = root / 'source.roar'
-            linked.write_text('{}')
-            project.roar_project_path = linked
-            project.source_mode = 'linked'
-            saved = project.save(root / 'companions' / 'pair.floorplan')
-            state = json.loads(saved.read_text())
-            self.assertEqual(state['version'], 6)
-            self.assertEqual(state['roar_project_path'], '../source.roar')
-            restored = FloorplanProject.load(saved)
-            self.assertEqual(restored.roar_project_path, str(linked))
-            self.assertEqual(restored.source_mode, 'linked')
-            self.assertEqual(restored.to_dict(), project.to_dict())
-
     def test_order_row_and_screen_y_semantics(self):
         project = self.project()
         project.set_constraints([{'constraint': 'Order', 'instances': ['Mfirst', 'M2'], 'direction': 'top_to_bottom'},

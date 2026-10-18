@@ -4,7 +4,7 @@
 def main():
     import argparse
     import sys
-    from . import Design, Session
+    from . import Session
     parser = argparse.ArgumentParser(description="ROAR desktop / Python API")
     parser.add_argument("design", nargs="?", help="Saved .roar or design JSON file")
     parser.add_argument("--home", help="Checkout/assets root (defaults to ROAR_HOME)")
@@ -21,10 +21,8 @@ def main():
         return check_setup(gui_only=True)
     if check_setup(gui_only=True, quiet=True, prepare_launch=True, output=sys.stderr):
         return 1
-    design = Design.load(options.design) if options.design else None
-    session = Session(design, home=options.home)
-    if options.design:
-        session.app._record_design_document(options.design)
+    session = (Session.from_file(options.design, home=options.home)
+               if options.design else Session(None, home=options.home))
     return session.run()
 
 

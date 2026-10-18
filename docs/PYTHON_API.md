@@ -441,8 +441,11 @@ session = roar.launch(design, home=HOME)  # Keep this reference alive.
 ```
 
 `launch(design=None, *, home=None, run=False)` also accepts a saved-state path;
-it shows a session and returns it. `run=True` is for an appropriate standalone
-host, not a notebook. For an already running ROAR window:
+it shows a session and returns it with that file's document identity and a clean
+saved baseline. `Session.from_file(path, *, home=None, show=False)` opens the
+same saved document while leaving Qt initialization lazy until a live operation
+is requested. The file is read and validated immediately. `run=True` is for an
+appropriate standalone host, not a notebook. For an already running ROAR window:
 
 ```python
 # existing_roar_app must be the real ROARApp, not just QApplication.

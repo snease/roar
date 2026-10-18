@@ -229,10 +229,10 @@ class SetupCheckTests(unittest.TestCase):
         error = {'ok': False, 'error': 'ImportError: libEGL.so.1: cannot open shared object file'}
         child = subprocess.CompletedProcess([], 1, 'ROAR_GUI ' + json.dumps(error), '')
         output, errors = io.StringIO(), io.StringIO()
-        with patch.object(sys, 'argv', ['roar', 'example.roar']), patch.object(sys, 'stdout', output), patch.object(sys, 'stderr', errors), patch.object(doctor, '_run', return_value=child), patch('roar_api.Session') as session, patch('roar_api.Design.load') as load:
+        with patch.object(sys, 'argv', ['roar', 'example.roar']), patch.object(sys, 'stdout', output), patch.object(sys, 'stderr', errors), patch.object(doctor, '_run', return_value=child), patch('roar_api.Session') as session:
             self.assertEqual(main(), 1)
         session.assert_not_called()
-        load.assert_not_called()
+        session.from_file.assert_not_called()
         self.assertEqual(output.getvalue(), '')
         self.assertIn('libEGL.so.1', errors.getvalue())
         self.assertNotIn('PASS:', errors.getvalue())

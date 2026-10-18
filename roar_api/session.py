@@ -58,6 +58,7 @@ class Session:
             raise TypeError("design must be a Design")
         self.home = home
         self._initial_design = design
+        self._initial_path = None
         self._app = app
         self._qapp = None
         self._backend = None
@@ -76,6 +77,21 @@ class Session:
     def from_app(cls, app: Any) -> Session:
         """Attach to an existing ROARApp without restoring or constructing it."""
         return cls(app=app)
+
+    @classmethod
+    def from_file(cls, path: Path | str, *, home: Path | str | None = None,
+                  show: bool = False) -> Session:
+        """Open saved content with its document identity and a clean baseline.
+
+        Read and validate the file immediately; Qt initialization remains lazy
+        until the first live operation unless ``show=True``.
+        """
+        path = Path(path).expanduser().resolve()
+        session = cls(Design.load(path), home=home)
+        session._initial_path = path
+        if show:
+            session.show()
+        return session
 
     def _attach(self) -> None:
         _main_thread()
@@ -115,6 +131,9 @@ class Session:
         initial, self._initial_design = self._initial_design, None
         if initial is not None:
             self.apply(initial)
+            if self._initial_path is not None:
+                self._app._record_design_document(self._initial_path)
+                self._initial_path = None
 
     @property
     def app(self):

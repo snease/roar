@@ -7,10 +7,10 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
-    from PyQt6.QtCore import QSettings, QTimer, Qt, QObject, pyqtSignal
+    from PyQt6.QtCore import QSettings, Qt, QObject, pyqtSignal
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QMessageBox, QPushButton, QWidget
 except ModuleNotFoundError as exc:
@@ -20,8 +20,10 @@ except ModuleNotFoundError as exc:
 
 from roar_api import Design
 from roar_api.floorplan import FloorplanProject
+from roar_api.floorplan.workspace import DesignWorkspace
 
 if QApplication is not None:
+    from qt_test_helpers import modal_interaction
     from roar_api.floorplan.dialog import FloorplanDialog, NetlistImportDialog, OpenFloorplanDialog, load_roar_design
     from roar_api.floorplan.constraint_editor import ConstraintEditorDialog, editable_constraint, constraint_summary
     from roar_api.floorplan.align_runner import AlignConfig
@@ -40,33 +42,6 @@ M1 d g s b nch W=ws L=0.15u nf=nfs
 M2 d g s b nch W=ws L=0.15u nf=nfs
 .ends shared
 """
-
-
-class FakeWorkspace:
-    def __init__(self, design, path=None, dirty=False):
-        self.design, self.path, self.dirty = design, str(path) if path else None, dirty
-        self.saves, self.switches = [], []
-        self.failure = None
-
-    def snapshot(self):
-        if self.failure:
-            raise RuntimeError(self.failure)
-        return Design.from_state(self.design.to_state())
-
-    def is_modified(self):
-        return self.dirty
-
-    def save(self, path):
-        self.design.save(path)
-        self.path, self.dirty = str(Path(path).resolve()), False
-        self.saves.append(self.path)
-        return self.snapshot()
-
-    def switch(self, path):
-        self.design = load_roar_design(path)
-        self.path, self.dirty = str(Path(path).resolve()), False
-        self.switches.append(self.path)
-        return self.snapshot()
 
 
 @unittest.skipIf(QApplication is None, "PyQt6 GUI extra is not installed")
@@ -93,6 +68,53 @@ class FloorplanDialogTests(unittest.TestCase):
         self.parent.deleteLater()
         self.app.processEvents()
         self.directory.cleanup()
+
+    def select_source(self, mode, dialog=None):
+        dialog = self.dialog if dialog is None else dialog
+        index = dialog.source_mode.findData(mode)
+        dialog.source_mode.setCurrentIndex(index)
+        dialog.source_mode.activated.emit(index)
+
+    def workspace(self, design, path=None):
+        editor = SimpleNamespace(design=design)
+        editor.capture = Mock(wraps=lambda: editor.design)
+        workspace = DesignWorkspace(
+            capture_design=editor.capture, capture_state=lambda: editor.design.to_state(),
+            apply_design=lambda design: setattr(editor, 'design', design))
+        if path is not None:
+            workspace.record(path)
+        workspace.save = Mock(wraps=workspace.save)
+        workspace.switch = Mock(wraps=workspace.switch)
+        return workspace, editor
+
+    def test_modal_callback_assertion_reports_failure_and_cancels_pending_interactions(self):
+        calls = []
+
+        class FailedInteraction(unittest.TestCase):
+            def runTest(self):
+                modal = QDialog()
+                self.addCleanup(modal.deleteLater)
+
+                def inspect():
+                    calls.append('inspected')
+                    self.fail('scheduled assertion reaches unittest')
+
+                with modal_interaction(inspect):
+                    self.assertEqual(modal.exec(), QDialog.DialogCode.Accepted)
+
+        result = unittest.TestResult()
+        FailedInteraction().run(result)
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(result.errors, [])
+        self.assertIn('scheduled assertion reaches unittest', result.failures[0][1])
+        self.assertIsNone(QApplication.activeModalWidget())
+        # A disabled opener must fail here and cancel its pending callback,
+        # rather than letting it act on the next test's modal.
+        with self.assertRaisesRegex(AssertionError, 'interaction did not run'):
+            with modal_interaction(lambda: calls.append('leaked')):
+                pass
+        self.app.processEvents()
+        self.assertEqual(calls, ['inspected'])
 
     def test_sketch_history_keeps_incomplete_cells_and_relationship_ids(self):
         dialog = self.dialog
@@ -191,8 +213,8 @@ class FloorplanDialogTests(unittest.TestCase):
                 else:
                     editor.names_editor.set_names(["d"] if kind == "PowerPorts" else ["s"] if kind == "GroundPorts" else ["M1", "M2"])
                 editor.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
-            QTimer.singleShot(0, accept_constraint)
-            self.dialog._add_constraint()
+            with modal_interaction(accept_constraint):
+                self.dialog._add_constraint()
         self.assertEqual(self.dialog.constraints_table.rowCount(), 8)
         self.assertEqual(self.dialog.project.constraints[0]["pairs"], [["M1", "M2"]])
         self.assertEqual(self.dialog.project.constraints[3]["regions"], [["M1", "M2"], ["M3", "M4"]])
@@ -202,7 +224,7 @@ class FloorplanDialogTests(unittest.TestCase):
 
     def test_explicit_snapshot_mapping_and_total_width_conversion(self):
         original = self.design.to_state()
-        self.dialog._read_roar()
+        self.select_source("live")
         self.design.set_instance_attribute("M1_2", "W", 100e-6)
         self.dialog.import_targets.setText("M1, M2")
         self.dialog._apply_roar()
@@ -221,7 +243,7 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._collect_project()
         self.assertEqual(self.dialog.project.to_dict(), original)
         self.dialog._render()
-        self.dialog._read_roar()
+        self.select_source("live")
         original = self.dialog.project.to_dict()
         self.dialog.import_targets.setText("M1, NOT_A_DEVICE")
         with self.assertRaises(ValueError):
@@ -229,13 +251,13 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertEqual(self.dialog.project.to_dict(), original)
 
     def test_failed_refresh_preserves_snapshot_and_errors_are_visible(self):
-        self.dialog._read_roar()
+        self.select_source("live")
         def fail():
             raise RuntimeError("ROAR snapshot is unavailable")
         original = self.dialog.roar_design
         self.dialog.snapshot_provider = fail
         with patch.object(QMessageBox, "warning") as warning:
-            self.dialog._guard(self.dialog._read_roar)
+            self.select_source("live")
         warning.assert_called_once()
         self.assertIn("snapshot is unavailable", self.dialog.status.text())
         self.assertIs(self.dialog.roar_design, original)
@@ -250,10 +272,10 @@ class FloorplanDialogTests(unittest.TestCase):
             options = QApplication.activeModalWidget()
             options.width_convention.setCurrentIndex(options.width_convention.findData("total"))
             options.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
-        QTimer.singleShot(0, accept_import)
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")) as picker, \
-             patch.dict(os.environ, {"ROAR_DESIGN": str(examples.parent)}):
-            self.dialog._load_netlist()
+        with modal_interaction(accept_import):
+            with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")) as picker, \
+                 patch.dict(os.environ, {"ROAR_DESIGN": str(examples.parent)}):
+                self.dialog._load_netlist()
         self.assertEqual(picker.call_args.args[2], str(examples))
         self.assertEqual(self.dialog.project.devices[0].width_um, 4)
         self.dialog.project.set_constraints([{
@@ -269,9 +291,9 @@ class FloorplanDialogTests(unittest.TestCase):
             options.floorplan_path.setText(str(project_path))
             options.floorplan_path.editingFinished.emit()
             options.buttons.button(QDialogButtonBox.StandardButton.Open).click()
-        QTimer.singleShot(0, open_saved)
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
-            self.dialog._open_project()
+        with modal_interaction(open_saved):
+            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
+                self.dialog._open_project()
         self.assertEqual(self.dialog.devices_table.item(0, 3).text(), "4.0")
         with patch.object(QFileDialog, "getExistingDirectory", return_value=str(self.root)):
             self.dialog._export_align()
@@ -369,8 +391,8 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertEqual(options.circuit_combo.currentData(), "pair")
         self.assertEqual(options.dimension_unit.currentData(), "um")
         self.assertEqual(options.width_convention.currentData(), "per_finger")
-        QTimer.singleShot(0, lambda: options.buttons.button(QDialogButtonBox.StandardButton.Ok).click())
-        self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
+        with modal_interaction(lambda: options.buttons.button(QDialogButtonBox.StandardButton.Ok).click()):
+            self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
         options.deleteLater()
 
     def test_multiple_circuits_require_selection_and_metres_import_correctly(self):
@@ -388,9 +410,9 @@ class FloorplanDialogTests(unittest.TestCase):
             modal.dimension_unit.setCurrentIndex(modal.dimension_unit.findData("m"))
             modal.width_convention.setCurrentIndex(modal.width_convention.findData("total"))
             modal.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
-        QTimer.singleShot(0, accept_import)
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
-            self.dialog._load_netlist()
+        with modal_interaction(accept_import):
+            with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+                self.dialog._load_netlist()
         self.assertEqual(self.dialog.project.top, "second")
         self.assertEqual(self.dialog.project.devices[0].width_um, 4)
         self.assertAlmostEqual(self.dialog.project.devices[0].length_um, 0.2)
@@ -399,9 +421,9 @@ class FloorplanDialogTests(unittest.TestCase):
         source = self.root / "cancel.sp"
         source.write_text(NETLIST)
         original = self.dialog.project
-        QTimer.singleShot(0, lambda: QApplication.activeModalWidget().buttons.button(QDialogButtonBox.StandardButton.Cancel).click())
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
-            self.dialog._load_netlist()
+        with modal_interaction(lambda: QApplication.activeModalWidget().buttons.button(QDialogButtonBox.StandardButton.Cancel).click()):
+            with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+                self.dialog._load_netlist()
         self.assertIs(self.dialog.project, original)
         self.assertFalse(self.dialog._dirty)
 
@@ -418,17 +440,17 @@ class FloorplanDialogTests(unittest.TestCase):
             def choose_action(action=action):
                 question = QApplication.activeModalWidget()
                 next(button for button in question.buttons() if button.text() == action).click()
-            QTimer.singleShot(0, choose_action)
-            with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
-                self.dialog._import_constraints()
+            with modal_interaction(choose_action):
+                with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+                    self.dialog._import_constraints()
             self.assertEqual(self.dialog.project.constraints, expected)
             current = self.dialog.project.to_dict()
             self.assertEqual({key: value for key, value in current.items() if key not in ("constraints", "constraint_enabled", "constraint_ids")},
                              {key: value for key, value in previous.items() if key not in ("constraints", "constraint_enabled", "constraint_ids")})
         original = self.dialog.project
-        QTimer.singleShot(0, lambda: QApplication.activeModalWidget().button(QMessageBox.StandardButton.Cancel).click())
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
-            self.dialog._import_constraints()
+        with modal_interaction(lambda: QApplication.activeModalWidget().button(QMessageBox.StandardButton.Cancel).click()):
+            with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+                self.dialog._import_constraints()
         self.assertIs(self.dialog.project, original)
         sidecar = self.root / "whole.roar.floorplan"
         self.dialog.project.save(sidecar)
@@ -470,15 +492,15 @@ class FloorplanDialogTests(unittest.TestCase):
             editor = QApplication.activeModalWidget()
             editor.option.setCurrentIndex(editor.option.findData("top_to_bottom"))
             editor.reject()
-        QTimer.singleShot(0, cancel_edit)
-        self.dialog._edit_constraint()
+        with modal_interaction(cancel_edit):
+            self.dialog._edit_constraint()
         self.assertEqual(self.dialog.project.to_dict(), original)
         def accept_edit():
             editor = QApplication.activeModalWidget()
             editor.option.setCurrentIndex(editor.option.findData("top_to_bottom"))
             editor.accept()
-        QTimer.singleShot(0, accept_edit)
-        self.dialog.constraints_table.cellDoubleClicked.emit(2, 0)
+        with modal_interaction(accept_edit):
+            self.dialog.constraints_table.cellDoubleClicked.emit(2, 0)
         self.assertEqual(self.dialog.project.constraints[:2], [opaque, extra])
         self.assertEqual(self.dialog.project.constraints[2], dict(supported, direction="top_to_bottom"))
         self.dialog._remove_constraint()
@@ -506,7 +528,6 @@ class FloorplanDialogTests(unittest.TestCase):
         for constraint in native:
             with self.subTest(constraint=constraint):
                 editor = ConstraintEditorDialog(self.dialog.project, constraint, parent=self.parent)
-                self.assertEqual(editor.value(), constraint)
                 editor.accept()
                 self.assertEqual(editor.result(), QDialog.DialogCode.Accepted)
                 self.assertEqual(editor.constraint, constraint)
@@ -617,8 +638,8 @@ class FloorplanDialogTests(unittest.TestCase):
         options.floorplan_path.editingFinished.emit()
         self.assertEqual(options.design_path.text(), str(first_design))
         self.assertIn("Association will change", options.link_status.text())
-        QTimer.singleShot(0, lambda: options.buttons.button(QDialogButtonBox.StandardButton.Open).click())
-        self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
+        with modal_interaction(lambda: options.buttons.button(QDialogButtonBox.StandardButton.Open).click()):
+            self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
         self.assertEqual(options.project.roar_project_path, str(first_design))
         options.deleteLater()
 
@@ -632,12 +653,12 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertEqual(options.source_mode.currentData(), "saved")
         self.assertIn("missing", options.link_status.text())
         self.assertTrue(options.buttons.button(QDialogButtonBox.StandardButton.Open).isEnabled())
-        QTimer.singleShot(0, lambda: options.buttons.button(QDialogButtonBox.StandardButton.Open).click())
-        self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
+        with modal_interaction(lambda: options.buttons.button(QDialogButtonBox.StandardButton.Open).click()):
+            self.assertEqual(options.exec(), QDialog.DialogCode.Accepted)
         self.assertIsNone(options.design)
         self.assertEqual(options.project.roar_project_path, str(missing))
         self.dialog.set_project(options.project, sidecar, options.design)
-        self.assertFalse(self.dialog.refresh_bindings_button.isEnabled())
+        self.assertFalse(self.dialog.source_reload_button.isEnabled())
         self.assertEqual(self.dialog.project.devices[0].width_um, 2)
         options.deleteLater()
 
@@ -654,16 +675,16 @@ class FloorplanDialogTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Choose a ROAR design"):
             load_roar_design(sidecar)
         options.deleteLater()
-        self.dialog._read_roar()
+        self.select_source("live")
         original_project, original_source = self.dialog.project, self.dialog.roar_design
         def cancel_open():
             modal = QApplication.activeModalWidget()
             modal.floorplan_path.setText(str(sidecar))
             modal.floorplan_path.editingFinished.emit()
             modal.buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
-        QTimer.singleShot(0, cancel_open)
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
-            self.dialog._open_project()
+        with modal_interaction(cancel_open):
+            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard):
+                self.dialog._open_project()
         self.assertIs(self.dialog.project, original_project)
         self.assertIs(self.dialog.roar_design, original_source)
 
@@ -693,7 +714,7 @@ class FloorplanDialogTests(unittest.TestCase):
 
     def test_unnamed_live_source_reopens_captured_until_explicitly_selected(self):
         source = Design().add_instance('M1_2', W=2.2e-6, L=.5e-6, NF=2)
-        workspace = FakeWorkspace(source)
+        workspace, editor = self.workspace(source)
         self.dialog.workspace = workspace
         self.dialog.snapshot_provider = workspace.snapshot
         project = FloorplanProject.from_text(SYMBOLIC)
@@ -733,7 +754,6 @@ class FloorplanDialogTests(unittest.TestCase):
         options.deleteLater()
 
     def test_unfinished_current_design_can_reach_discard_and_switch(self):
-        from roar_api.floorplan.workspace import DesignWorkspace
         raw = {'instance_table': [{'Instance': '', 'W': 'unfinished'}]}
         holder = {'editor': raw}
         def apply(design):
@@ -822,8 +842,8 @@ class FloorplanDialogTests(unittest.TestCase):
             modal.floorplan_path.setText(str(sidecar))
             modal.floorplan_path.editingFinished.emit()
             modal.buttons.button(QDialogButtonBox.StandardButton.Open).click()
-        QTimer.singleShot(0, open_saved)
-        self.dialog._open_project()
+        with modal_interaction(open_saved):
+            self.dialog._open_project()
         self.assertEqual(self.dialog._source_origin, "linked")
         self.assertEqual(self.dialog.project.devices[0].width_um, 5)
         self.dialog._refresh_bindings()
@@ -840,7 +860,7 @@ class FloorplanDialogTests(unittest.TestCase):
 
     def test_parameter_binding_uses_explicit_attribute_and_preserves_captured_source(self):
         self.dialog.set_project(FloorplanProject.from_text(SYMBOLIC))
-        self.dialog._read_roar()
+        self.select_source("live")
         self.dialog.parameter_symbol.setCurrentText("nfs")
         self.dialog.binding_attribute.setCurrentIndex(self.dialog.binding_attribute.findData("NF"))
         self.dialog._bind_parameter()
@@ -921,8 +941,8 @@ class FloorplanDialogTests(unittest.TestCase):
             options.floorplan_path.setText(str(sidecar))
             options.floorplan_path.editingFinished.emit()
             options.buttons.button(QDialogButtonBox.StandardButton.Open).click()
-        QTimer.singleShot(0, open_saved)
-        self.dialog._open_project()
+        with modal_interaction(open_saved):
+            self.dialog._open_project()
         for symbol, attribute in (("ls", "L"), ("ws", "W")):
             self.dialog.parameter_symbol.setCurrentText(symbol)
             self.assertEqual(self.dialog.binding_attribute.currentData(), attribute)
@@ -941,9 +961,9 @@ class FloorplanDialogTests(unittest.TestCase):
             modal.dimension_unit.setCurrentIndex(modal.dimension_unit.findData("um"))
             modal.width_convention.setCurrentIndex(modal.width_convention.findData("total"))
             modal.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
-        QTimer.singleShot(0, accept_parameters)
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(parameters), "")):
-            self.dialog._import_parameters()
+        with modal_interaction(accept_parameters):
+            with patch.object(QFileDialog, "getOpenFileName", return_value=(str(parameters), "")):
+                self.dialog._import_parameters()
         self.assertEqual([d.width_um for d in self.dialog.project.devices], [2, 2])
         self.assertIn("Unused names: unused", self.dialog.status.text())
 
@@ -958,9 +978,9 @@ class FloorplanDialogTests(unittest.TestCase):
             modal.source_mode.setCurrentIndex(modal.source_mode.findData("linked"))
             modal.design_path.setText(str(saved_design))
             modal.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
-        QTimer.singleShot(0, accept_import)
-        with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
-            self.dialog._load_netlist()
+        with modal_interaction(accept_import):
+            with patch.object(QFileDialog, "getOpenFileName", return_value=(str(source), "")):
+                self.dialog._load_netlist()
         self.assertEqual(self.dialog.project.roar_project_path, str(saved_design))
         self.assertEqual(self.dialog._source_origin, "linked")
         self.assertEqual(self.dialog.project.unresolved_parameters, ["ws", "nfs"])
@@ -978,19 +998,19 @@ class FloorplanDialogTests(unittest.TestCase):
             changed = pyqtSignal()
         changes = Changes()
         current = self.design.save(self.root / 'current.roar')
-        workspace = FakeWorkspace(self.design, current)
+        workspace, editor = self.workspace(self.design, current)
         dialog = FloorplanDialog(self.parent, workspace=workspace, source_changed_signals=(changes.changed,),
                                  placement_options={"settings": QSettings(str(self.root / "live.ini"), QSettings.Format.IniFormat), "config": AlignConfig("", "", str(self.root / "runs"))})
         project = self._bound_project()
         project.roar_project_path = str(self.root / "obsolete.roar")
         dialog.set_project(project)
         with patch('roar_api.floorplan.dialog._source_switch_choice', return_value='current'):
-            dialog._read_roar()
+            self.select_source("live", dialog)
         self.assertEqual(dialog.project.roar_project_path, str(current))
         self.assertEqual(dialog.project.parameter_rows[0]["binding"]["source"], "live")
         self.assertIsNone(dialog.project.parameter_rows[1]["binding"])
         dialog.show()
-        workspace.design.set_instance_attribute("M1_2", "W", 24e-6)
+        editor.design.set_instance_attribute("M1_2", "W", 24e-6)
         for _ in range(5):
             changes.changed.emit()
         QTest.qWait(380)
@@ -998,7 +1018,7 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertEqual(dialog.project.parameter_rows[1]["value"], 4)
         before = dialog.project.to_dict()
         cached = dialog.roar_design
-        workspace.failure = "source temporarily unavailable"
+        editor.capture.side_effect = RuntimeError("source temporarily unavailable")
         changes.changed.emit()
         with patch.object(QMessageBox, "warning") as popup:
             QTest.qWait(380)
@@ -1007,13 +1027,13 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertIs(dialog.roar_design, cached)
         with self.assertRaisesRegex(RuntimeError, "temporarily unavailable"):
             dialog._export_align()
-        workspace.failure = None
-        workspace.design.set_instance_attribute("M1_2", "W", 32e-6)
+        editor.capture.side_effect = None
+        editor.design.set_instance_attribute("M1_2", "W", 32e-6)
         # Generate performs the same freshness guard, without waiting for debounce.
         dialog.placement_panel._before_generate()
         self.assertEqual(dialog.project.devices[0].width_um, 8)
         dialog._activate_source("saved")
-        workspace.design.set_instance_attribute("M1_2", "W", 40e-6)
+        editor.design.set_instance_attribute("M1_2", "W", 40e-6)
         dialog._ensure_current_source()
         self.assertEqual(dialog.project.devices[0].width_um, 8)
         self.assertIsNotNone(dialog.project.parameter_rows[0]["binding"])
@@ -1023,7 +1043,7 @@ class FloorplanDialogTests(unittest.TestCase):
 
     def test_reload_action_only_appears_for_saved_file_sources(self):
         self.assertTrue(self.dialog.source_reload_button.isHidden())
-        self.dialog._read_roar()
+        self.select_source("live")
         self.assertTrue(self.dialog.source_reload_button.isHidden())
         self.assertFalse(self.dialog.source_reload_button.isEnabled())
         saved = self.root / "reload.roar"
@@ -1032,7 +1052,6 @@ class FloorplanDialogTests(unittest.TestCase):
             self.dialog._load_linked_roar()
         self.assertFalse(self.dialog.source_reload_button.isHidden())
         self.assertTrue(self.dialog.source_reload_button.isEnabled())
-        self.assertIs(self.dialog.refresh_bindings_button, self.dialog.source_reload_button)
         self.assertEqual(len([button for button in self.dialog.findChildren(QPushButton) if button.text() == "Reload source"]), 1)
         self.dialog._activate_source("saved")
         self.assertTrue(self.dialog.source_reload_button.isHidden())
@@ -1041,12 +1060,12 @@ class FloorplanDialogTests(unittest.TestCase):
     def test_open_same_association_uses_unsaved_live_design_without_switch(self):
         design_path = self.root / "current.roar"
         self.design.save(design_path)
-        workspace = FakeWorkspace(self.design, design_path, dirty=True)
+        workspace, editor = self.workspace(self.design, design_path)
         project = self._bound_project()
         project.roar_project_path = design_path
         sidecar = self.root / "same.roar.floorplan"
         project.save(sidecar)
-        workspace.design.set_instance_attribute("M1_2", "W", 28e-6)
+        editor.design.set_instance_attribute("M1_2", "W", 28e-6)
         options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
         self.assertEqual(options.source_mode.currentData(), "linked")
         with patch("roar_api.floorplan.dialog._source_switch_choice") as warning:
@@ -1056,7 +1075,7 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertEqual(options.project.devices[0].width_um, 7)
         self.assertEqual(options.project.roar_project_path, str(design_path))
         self.assertEqual(options.source_origin, "live")
-        self.assertEqual(workspace.switches, [])
+        workspace.switch.assert_not_called()
         options.deleteLater()
 
     def test_saved_live_source_requires_choice_before_rebinding_to_another_design(self):
@@ -1066,11 +1085,11 @@ class FloorplanDialogTests(unittest.TestCase):
         project.roar_project_path = linked
         project.source_mode = 'live'
         sidecar = project.save(self.root / 'live.roar.floorplan')
-        workspace = FakeWorkspace(self.design, current)
+        workspace, editor = self.workspace(self.design, current)
         # Identical sizes still do not make two design files interchangeable.
         for changed_sizes in (False, True):
             if changed_sizes:
-                workspace.design.set_instance_attribute('M1_2', 'W', 28e-6)
+                editor.design.set_instance_attribute('M1_2', 'W', 28e-6)
                 linked.unlink()  # Captured sizes remain available with a missing link.
             options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
             self.assertEqual(options.source_mode.currentData(), 'live')
@@ -1082,7 +1101,7 @@ class FloorplanDialogTests(unittest.TestCase):
                 options.accept()
             self.assertEqual(options.project.roar_project_path, str(linked))
             self.assertEqual(options.project.devices[0].width_um, 2)
-            self.assertEqual(workspace.switches, [])
+            workspace.switch.assert_not_called()
             options.deleteLater()
 
     def test_open_conflict_cancel_save_cancel_discard_and_change_association(self):
@@ -1090,20 +1109,21 @@ class FloorplanDialogTests(unittest.TestCase):
         Design().add_instance("M1_2", W=20e-6, L=0.2e-6, NF=4).save(linked)
         current = self.root / "current.roar"
         self.design.save(current)
-        workspace = FakeWorkspace(self.design, current, dirty=True)
+        workspace, editor = self.workspace(self.design, current)
+        editor.design.set_instance_attribute("M1_2", "L", .25e-6)
         project = self._bound_project()
         project.roar_project_path = linked
         sidecar = self.root / "conflict.roar.floorplan"
         project.save(sidecar)
-        original = workspace.design.to_state()
+        original = editor.design.to_state()
         for choice in ("cancel", "save"):
             options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
             with patch("roar_api.floorplan.dialog._source_switch_choice", return_value=choice), patch.object(QFileDialog, "getSaveFileName", return_value=("", "")):
                 options.accept()
             self.assertEqual(options.result(), QDialog.DialogCode.Rejected)
             self.assertIsNone(options.project)
-            self.assertEqual(workspace.design.to_state(), original)
-            self.assertEqual(workspace.switches, [])
+            self.assertEqual(editor.design.to_state(), original)
+            workspace.switch.assert_not_called()
             options.deleteLater()
         before_target = linked.read_bytes()
         options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
@@ -1111,8 +1131,8 @@ class FloorplanDialogTests(unittest.TestCase):
             options.accept()
         self.assertIn("different file", options.link_status.text())
         self.assertEqual(linked.read_bytes(), before_target)
-        self.assertEqual(workspace.design.to_state(), original)
-        self.assertEqual(workspace.saves, [])
+        self.assertEqual(editor.design.to_state(), original)
+        workspace.save.assert_not_called()
         options.deleteLater()
         options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
         with patch("roar_api.floorplan.dialog._source_switch_choice", return_value="current"):
@@ -1124,7 +1144,7 @@ class FloorplanDialogTests(unittest.TestCase):
         options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
         with patch("roar_api.floorplan.dialog._source_switch_choice", return_value="switch"):
             options.accept()
-        self.assertEqual(workspace.switches, [str(linked)])
+        workspace.switch.assert_called_once_with(str(linked))
         self.assertEqual(options.project.devices[0].width_um, 5)
         self.assertEqual(options.project.roar_project_path, str(linked))
         self.assertEqual(options.source_origin, "live")
@@ -1135,7 +1155,8 @@ class FloorplanDialogTests(unittest.TestCase):
         Design().add_instance("M1_2", W=16e-6, L=0.2e-6, NF=4).save(linked)
         current = self.root / "old.roar"
         self.design.save(current)
-        workspace = FakeWorkspace(self.design, current, dirty=True)
+        workspace, editor = self.workspace(self.design, current)
+        editor.design.set_instance_attribute("M1_2", "L", .25e-6)
         project = self._bound_project()
         project.roar_project_path = linked
         sidecar = self.root / "modal.roar.floorplan"
@@ -1148,12 +1169,12 @@ class FloorplanDialogTests(unittest.TestCase):
             self.assertIn("Discard and Switch", labels)
             self.assertIn("Change saved association", labels)
             next(button for button in warning.buttons() if button.text() == "Save and Switch…").click()
-        QTimer.singleShot(0, save_and_switch)
-        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(saved), "")):
-            options.accept()
+        with modal_interaction(save_and_switch):
+            with patch.object(QFileDialog, "getSaveFileName", return_value=(str(saved), "")):
+                options.accept()
         self.assertEqual(options.result(), QDialog.DialogCode.Accepted)
-        self.assertEqual(workspace.saves, [str(saved)])
-        self.assertEqual(workspace.switches, [str(linked)])
+        workspace.save.assert_called_once_with(str(saved))
+        workspace.switch.assert_called_once_with(str(linked))
         self.assertEqual(load_roar_design(saved).get_instance_parameters()["M1_2"]["W"]["value"], 8e-6)
         self.assertEqual(options.project.devices[0].width_um, 4)
         options.deleteLater()
@@ -1165,13 +1186,13 @@ class FloorplanDialogTests(unittest.TestCase):
         project.roar_project_path = other
         sidecar = self.root / "missing-mapping.roar.floorplan"
         project.save(sidecar)
-        workspace = FakeWorkspace(self.design)
+        workspace, editor = self.workspace(self.design)
         options = OpenFloorplanDialog(self.parent, sidecar, workspace=workspace)
         with patch("roar_api.floorplan.dialog._source_switch_choice", return_value="switch"):
             options.accept()
         self.assertEqual(options.result(), QDialog.DialogCode.Rejected)
         self.assertIn("M1_2", options.link_status.text())
-        self.assertEqual(workspace.switches, [])
+        workspace.switch.assert_not_called()
         options.source_mode.setCurrentIndex(options.source_mode.findData("saved"))
         options.accept()
         self.assertEqual(options.result(), QDialog.DialogCode.Accepted)

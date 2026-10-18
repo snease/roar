@@ -357,6 +357,40 @@ class ModelRepairTests(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 FloorplanProject.from_dict(state)
 
+    def test_constraint_row_edits_preserve_identity_flags_and_unrelated_imported_rules(self):
+        project = self.project()
+        opaque = {'constraint': 'FutureRule', 'opaque': {'nested': [1, 2]}}
+        project.constraints = [opaque, {'constraint': 'PowerPorts', 'ports': ['VDD']}]
+        project.constraint_enabled = [True, False]
+        ids = project.constraint_ids
+        before = project.to_dict()
+        for invalid in ([], {'constraint': 'PowerPorts', 'ports': ['missing']}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                project.replace_constraint(1, invalid)
+            self.assertEqual(project.to_dict(), before)
+        replacement = {'constraint': 'GroundPorts', 'ports': ['VSS']}
+        project.replace_constraint(1, replacement)
+        replacement['ports'].append('OUT')
+        self.assertEqual(project.constraints, [opaque, {'constraint': 'GroundPorts', 'ports': ['VSS']}])
+        self.assertEqual(project.constraint_ids, ids)
+        self.assertEqual(project.constraint_enabled, [True, False])
+        inserted = project.duplicate_constraint(0)
+        self.assertEqual(inserted, 1)
+        self.assertEqual(project.constraint_ids[::2], ids)
+        self.assertNotIn(project.constraint_ids[1], ids)
+        self.assertEqual(project.constraint_enabled, [True, True, False])
+        project.constraints[inserted]['opaque']['nested'].append(3)
+        self.assertEqual(project.constraints[0], opaque)
+        # Duplicating a disabled row preserves its state as well as its fields.
+        project.duplicate_constraint(2)
+        self.assertEqual(project.constraint_enabled, [True, True, False, False])
+        with tempfile.TemporaryDirectory() as directory:
+            reopened = FloorplanProject.load(project.save(Path(directory) / 'draft.roar.floorplan'))
+            self.assertEqual(reopened.to_dict(), project.to_dict())
+            # Unrelated opaque enabled rows still block export until repaired.
+            with self.assertRaisesRegex(ValueError, 'unsupported native'):
+                reopened.export_align(Path(directory) / 'export')
+
     def test_disabled_imported_constraints_are_preserved_but_not_exported(self):
         project = self.project()
         unsupported = {'constraint': 'FutureNativeConstraint', 'opaque': 'preserved'}

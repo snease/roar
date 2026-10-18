@@ -121,6 +121,38 @@ class ProjectTests(unittest.TestCase):
                 project.save(path)
             self.assertEqual(path.read_text(), CIRCUIT)
 
+    def test_snapshot_preserves_repairable_draft_with_independent_nested_edits(self):
+        project = FloorplanProject.from_text(CIRCUIT.replace('W=2.2u', 'W=width').replace('nf=2', 'nf=fingers'))
+        project.bind_parameter(Design().add_instance('sizes', W=8e-6), 'width', 'sizes', 'W')
+        project.set_mos_parameters('M1', None, .7, None)
+        project.constraints = [{'constraint': 'FutureRule', 'opaque': {'nested': [1, 2]}}]
+        project.constraint_enabled = [False]
+        project.set_device_labels({'M1': 'Input pair'})
+        project.set_sketch({'positions': {'M1': [10, 20]}, 'groups': [
+            {'id': 'pair', 'label': 'Pair', 'instances': ['M1', 'X2']}]})
+        project.run_options = {'seed': 42}
+        # Copy directly assigned native rows before their lazy IDs are read.
+        clone = project.snapshot()
+        self.assertEqual(clone.constraint_ids, project.constraint_ids)
+        self.assertEqual(clone.to_dict(), project.to_dict())
+        self.assertEqual(clone.unresolved_parameters, ['fingers'])
+        before = project.to_dict()
+        clone.set_parameter('fingers', 4)
+        clone.bind_parameter(Design().add_instance('new', W=12e-6), 'width', 'new', 'W')
+        clone.constraints[0]['opaque']['nested'].append(3)
+        clone.set_constraint_enabled(0, True)
+        sketch = clone.sketch
+        sketch['positions']['M1'][0] = 99
+        sketch['groups'][0]['instances'].remove('X2')
+        clone.set_sketch(sketch)
+        clone.set_device_labels({'X2': 'Output pair'})
+        clone.run_options['seed'] = 9
+        self.assertEqual(clone.devices[0].width_um, 3)
+        self.assertEqual(clone.devices[0].length_um, .7)
+        self.assertEqual(project.to_dict(), before)
+        project.constraints[0]['opaque']['nested'][0] = 7
+        self.assertEqual(clone.constraints[0]['opaque']['nested'], [1, 2, 3])
+
     def test_constraints_validate_ids_shapes_native_mapping_and_symmetry(self):
         project = self.project()
         constraints = [
@@ -249,6 +281,35 @@ class ProjectTests(unittest.TestCase):
         project.set_parameter('width', 6, dimension_unit='um', width_convention='per_finger')
         self.assertEqual(project.devices[0].width_um, 6)
         self.assertIsNone(project.parameter_rows[0]['binding'])
+
+    def test_source_migration_updates_all_mappings_atomically_and_keeps_manual_values(self):
+        source = CIRCUIT.replace('W=2.2u L=0.5u nf=2', 'W=width L=length nf=fingers M=multiplicity')
+        project = FloorplanProject.from_text(source)
+        original = Design().add_instance('sizes', W=8, NF=4)
+        project.bind_parameter(original, 'width', 'sizes', 'W', dimension_unit='um', source='linked')
+        project.bind_parameter(original, 'fingers', 'sizes', 'NF', source='live')
+        project.set_parameter('length', .7, dimension_unit='um')
+        before = project.to_dict()
+        # Width resolves first; a later missing or invalid NF must roll it back
+        # together with source provenance and binding-origin changes.
+        for replacement in (Design().add_instance('sizes', W=12),
+                            Design().add_instance('sizes', W=12, NF=2.5)):
+            with self.subTest(replacement=replacement.to_state()), self.assertRaises(ValueError):
+                project.migrate_bindings(replacement, source='live')
+            self.assertEqual(project.to_dict(), before)
+        replacement = Design().add_instance('sizes', W=12, NF=6)
+        replacement_before = replacement.to_state()
+        project.migrate_bindings(replacement, source='live')
+        self.assertEqual(project.devices[0].width_um, 2)
+        self.assertEqual(project.devices[0].nf, 6)
+        self.assertEqual(project.devices[0].length_um, .7)
+        rows = {row['symbol']: row for row in project.parameter_rows}
+        self.assertEqual(rows['width']['binding']['source'], 'live')
+        self.assertEqual(rows['fingers']['binding']['source'], 'live')
+        self.assertIn('ROAR live: sizes.W', rows['width']['source'])
+        self.assertIsNone(rows['length']['binding'])
+        self.assertIsNone(rows['multiplicity']['value'])
+        self.assertEqual(replacement.to_state(), replacement_before)
 
     def test_numeric_parameter_import_is_atomic_reports_unused_and_clears_bindings(self):
         source = CIRCUIT.replace('W=2.2u L=0.5u nf=2', 'W=width L=0.5u nf=fingers')

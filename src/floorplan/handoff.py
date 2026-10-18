@@ -172,7 +172,7 @@ def export_handoff(project, destination, *, preview=None, state=None, candidate_
     target = Path(destination).expanduser().absolute()
     if target.suffix.lower() != '.zip':
         raise ValueError('A handoff bundle must use the .zip extension')
-    current = FloorplanProject.from_dict(project.to_dict())
+    current = project.snapshot()
     current.validate()
     fingerprint = project_fingerprint(current)
     files = {}

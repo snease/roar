@@ -185,7 +185,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(self.capture_state_calls, 0)
 
     def test_invalid_target_is_rejected_before_applying_or_changing_baseline(self):
-        for state in ({"version": 3, "source_netlist": "..."},
+        for state in ({}, [], {"unrelated": 1}, {"version": 3, "source_netlist": "..."},
                       {"instance_table": "invalid"},
                       {"instance_table": [{"Instance": "M1", "_attributes": None}]},
                       {"instance_table": [], "expression_tabs": "invalid"},

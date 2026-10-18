@@ -4,7 +4,6 @@ Run against an editable installation with python3 -m unittest discover
 -s src/floorplan/tests. Native ALIGN compatibility is checked separately.
 """
 from copy import deepcopy
-import importlib.util
 import json
 from pathlib import Path
 import shutil
@@ -154,17 +153,6 @@ class CompanionWorkflowTests(unittest.TestCase):
             del legacy[key]
         legacy["version"] = 1
         self.assertEqual(FloorplanProject.from_dict(legacy).devices, numeric.devices)
-
-    @unittest.skipUnless(importlib.util.find_spec("PyQt6"), "optional Qt source loader")
-    def test_saved_source_loader_rejects_unrelated_json(self):
-        from PyQt6 import QtWidgets  # An installed but broken Qt must fail the check.
-        from roar_api.floorplan.dialog import load_roar_design
-        for index, value in enumerate(({}, [], {"unrelated": 1}, self.project().to_dict())):
-            path = self.folder / f"wrong-{index}.json"
-            path.write_text(json.dumps(value))
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                load_roar_design(path)
-
 
 if __name__ == "__main__":
     unittest.main()

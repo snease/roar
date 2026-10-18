@@ -203,6 +203,20 @@ class FloorplanProject:
     imported constraint dictionaries so they can be inspected and corrected.
     """
 
+    def snapshot(self):
+        """Return independent editable state, including incomplete drafts.
+
+        This copies trusted state without persistence decoding or netlist
+        validation. Use load/from_dict for external data and validate before
+        export. Effective enabled flags are materialized on the copy. Like
+        to_dict, this materializes lazy row identities on the source so both
+        copies retain the same IDs after direct native list assignment.
+        """
+        self.constraint_ids
+        candidate = deepcopy(self)
+        candidate.constraint_enabled = self._constraint_flags()
+        return candidate
+
     @staticmethod
     def subcircuit_names(path):
         """List circuit wrappers without requiring resolved device sizing."""
@@ -512,17 +526,29 @@ class FloorplanProject:
         self._parameters, self.devices = parameters, devices
 
     def refresh_bindings(self, design, source='live'):
+        """Refresh only mappings already bound to the selected source."""
+        self._refresh_bound_parameters(design, source, migrate=False)
+
+    def migrate_bindings(self, design, source):
+        """Atomically move all explicit mappings to a newly selected source.
+
+        Preserve manual/unresolved values and each mapping's units and width
+        convention. Source association/mode belongs to the caller's transaction.
+        """
+        self._refresh_bound_parameters(design, source, migrate=True)
+
+    def _refresh_bound_parameters(self, design, source, *, migrate):
         if source not in ('live', 'linked'):
             raise ValueError('Binding source must be live or linked')
         parameters = deepcopy(self._parameters)
         for symbol, record in parameters.items():
             binding = record['binding']
-            if binding and binding['source'] == source:
+            if binding and (migrate or binding['source'] == source):
                 value, origin = self._roar_value(design, binding['instance'], binding['attribute'])
                 record['value'] = value
-                self._set_parameter_record(symbol, record, parameters)
                 record['source'] = f"ROAR {source}: {binding['instance']}.{binding['attribute']} ({origin})"
                 binding['source'] = source
+                self._set_parameter_record(symbol, record, parameters)
         devices = self._rebuild(parameters)
         self._parameters, self.devices = parameters, devices
 
@@ -714,6 +740,43 @@ class FloorplanProject:
 
     def add_constraint(self, constraint):
         self.set_constraints(self.constraints + [constraint], self._constraint_flags() + [True])
+
+    def replace_constraint(self, index, constraint):
+        """Replace one row, retaining its ID, enabled state and opaque siblings.
+
+        Validate the edited rule independently so imported drafts can be repaired
+        one row at a time. Whole-document conflicts remain export validation's
+        responsibility, as with enabling/disabling existing draft rows.
+        """
+        self.constraints[index]  # Check the index before changing any state.
+        index %= len(self.constraints)
+        candidate = deepcopy(constraint)
+        if not isinstance(candidate, dict):
+            raise ValueError('Constraint must be a native ALIGN dictionary')
+        self._validate_constraints([candidate], row_numbers=[index + 1])
+        flags, ids = self._constraint_flags(), self.constraint_ids
+        rows = list(self.constraints)
+        rows[index] = candidate
+        self.constraints, self.constraint_enabled = rows, flags
+        self._constraint_ids, self._constraint_id_rows = ids, deepcopy(rows)
+
+    def duplicate_constraint(self, index):
+        """Insert an independent copy after a row with a new ID and same state.
+
+        Preserve even unsupported imported rules; export validates active rows.
+        Return the inserted index for editor selection.
+        """
+        row = deepcopy(self.constraints[index])
+        # Normalize negative list indices before inserting after the source.
+        index %= len(self.constraints)
+        flags, ids = self._constraint_flags(), self.constraint_ids
+        rows = list(self.constraints)
+        rows.insert(index + 1, row)
+        flags.insert(index + 1, flags[index])
+        ids.insert(index + 1, uuid4().hex)
+        self.constraints, self.constraint_enabled = rows, flags
+        self._constraint_ids, self._constraint_id_rows = ids, deepcopy(rows)
+        return index + 1
 
     def remove_constraint(self, index):
         flags = self._constraint_flags()

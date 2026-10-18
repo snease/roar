@@ -11,7 +11,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget, QLineEdit, QScrollArea,
 )
 
-from .model import FloorplanProject
 from .constraints import KINDS, COMPILER_DEFAULTS, PORT_LOCATIONS, HELP, capability_note, net_pins
 
 
@@ -304,7 +303,7 @@ class ConstraintEditorDialog(QDialog):
             raise ValueError("These fields have no graphical form. Use Details to inspect them or disable the row.")
         self.setWindowTitle("Edit constraint" if constraint is not None else "Add constraint")
         self.setMinimumWidth(660)
-        self.project = FloorplanProject.from_dict(project.to_dict())
+        self.project = project.snapshot()
         self.original = deepcopy(constraint or {})
         self.selected_devices = list(selected_devices)
         self.constraint = None
