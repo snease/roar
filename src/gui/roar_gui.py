@@ -882,8 +882,8 @@ class ROARHeader(QWidget):
                 if exc.name not in {"roar_api.floorplan", "roar_api.floorplan.dialog", "parse_netlist"}:
                     raise
                 QMessageBox.warning(self, "Floorplan editor needs installation",
-                    "This checkout's floorplan package is missing from the active Python environment. "
-                    "This can happen after switching branches or updating ROAR.\n\n"
+                    "This Python environment cannot load the floorplan editor. "
+                    "Check that you have a complete ROAR checkout and its GUI dependencies.\n\n"
                     "Close ROAR, then run this from the checkout root using the same Python environment:\n\n"
                     "python -m pip install -e '.[gui]'\n\n"
                     "Restart ROAR after installation.")

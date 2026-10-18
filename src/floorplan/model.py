@@ -14,7 +14,13 @@ from pathlib import Path
 import re
 import tempfile
 
-from parse_netlist import MOSFETInstance, _parse_parameters, _split_tokens, parse_spice_netlist
+try:
+    from parse_netlist import MOSFETInstance, _parse_parameters, _split_tokens, parse_spice_netlist
+except ModuleNotFoundError as exc:
+    if exc.name != 'parse_netlist':
+        raise
+    # A checkout launched with python -m roar_api need not have src on sys.path.
+    from ..parse_netlist import MOSFETInstance, _parse_parameters, _split_tokens, parse_spice_netlist
 
 
 _SUFFIX = {'': 1, 't': 1e12, 'g': 1e9, 'meg': 1e6, 'k': 1e3,

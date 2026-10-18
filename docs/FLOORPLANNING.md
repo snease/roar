@@ -12,10 +12,9 @@ a PDK are not required to author or export a project. Generating placement needs
 a separate ALIGN installation and the tested SKY130 ALIGN backend on Linux or
 WSL. The Python API works with the headless installation, `pip install -e .`.
 
-If you already have ROAR installed, rerun `python -m pip install -e '.[gui]'`
-from this checkout's root in your ROAR environment after switching to this
-branch, then restart ROAR. Older installations may launch the main GUI but
-report `No module named 'roar_api.floorplan'` when opening the editor.
+If your environment already has ROAR's GUI dependencies, pull the branch and
+restart ROAR; no reinstall is needed to find the floorplan editor. Both
+`python src/roar.py` and `python -m roar_api` work from the checkout root.
 
 ## A companion to the ROAR design
 

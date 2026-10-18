@@ -240,36 +240,41 @@ class EditorIntegrityTests(unittest.TestCase):
         window._record_design_document = Mock()
         return window
 
-    def test_checkout_without_refreshed_install_explains_floorplan_setup(self):
+    def test_checkout_opens_floorplan_without_editable_install(self):
         # A fresh process with the existing GUI dependencies but no editable
         # import mappings reproduces launching src/roar.py after a branch switch.
         script = """
 import sys
 from pathlib import Path
-from unittest.mock import patch
 sys.meta_path[:] = [f for f in sys.meta_path if not f.__module__.startswith('__editable__')]
 sys.path_hooks[:] = [h for h in sys.path_hooks if not h.__module__.startswith('__editable__')]
 sys.path_importer_cache.clear()
 root = Path(sys.argv[1])
-sys.path[:0] = [str(root), str(root / 'src')]
-from roar_api._backend import load_backend
-gui = load_backend('roar_gui', root)
-app = gui.QApplication([])
-header = gui.ROARHeader()
-with patch.object(gui.QMessageBox, 'warning') as warning:
-    header.on_layout_button_clicked()
-warning.assert_called_once()
-message = warning.call_args.args[2]
-assert "python -m pip install -e '.[gui]'" in message, message
-assert 'checkout root' in message, message
-assert 'Restart ROAR' in message, message
-assert header._floorplan_dialog is None
+sys.path.insert(0, str(root))
+if sys.argv[2] == 'script':
+    sys.path.insert(0, str(root / 'src'))
+from roar_api.floorplan import FloorplanProject
+example = root / 'examples/floorplan/ota/cm_ota.roar.floorplan'
+project = FloorplanProject.load(example)
+assert len(project.devices) == 10
+from roar_api import Session
+session = Session(home=root)
+try:
+    session.app.header.on_layout_button_clicked()
+    editor = session.app.header._floorplan_dialog
+    assert editor is not None and editor.isVisible()
+    editor.set_project(project, example)
+    assert editor.devices_table.rowCount() == 10
+finally:
+    session.close()
 """
-        result = subprocess.run(
-            [sys.executable, "-I", "-c", script, str(Path(__file__).resolve().parents[3])],
-            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
-            capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for launch in ("script", "module"):
+            with self.subTest(launch=launch):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", script, str(Path(__file__).resolve().parents[3]), launch],
+                    env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_main_window_cancel_does_not_shutdown_placement(self):
         window = self._main_window()
