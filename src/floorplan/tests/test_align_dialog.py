@@ -1,6 +1,7 @@
 """Placement controls use mocked processes and browser opens, always offscreen."""
 
 from dataclasses import replace
+import json
 import os
 from pathlib import Path
 import sys
@@ -18,9 +19,10 @@ except ModuleNotFoundError as exc:
     QApplication = None
 
 from roar_api.floorplan import FloorplanProject
-from roar_api.floorplan.align_runner import AlignConfig, PROFILE_ID, RunState, project_fingerprint
+from roar_api.floorplan.align_runner import AlignConfig, AlignRunner, PROFILE_ID, RunSnapshot, RunState, project_fingerprint
 
 if QApplication is not None:
+    from qt_test_helpers import modal_interaction
     from roar_api.floorplan.align_dialog import AlignSettingsDialog, PlacementPanel, open_align_browser
 
 
@@ -28,14 +30,13 @@ class FakeRunner:
     def __init__(self, config, project_path=None):
         self.config, self.project_path = config, project_path
         self.state = self.placement = None
-        self.starts = self.opens = self.stops = self.shutdowns = self.rebinds = 0
+        self.starts = self.opens = self.stops = self.shutdowns = 0
 
     def _current(self, state, project):
         return replace(state, stale=bool(project and project_fingerprint(project) != state.fingerprint)) if state else None
 
-    def start(self, project, *, preview=False):
+    def start(self, project):
         self.starts += 1
-        self.preview_mode = preview
         self.state = RunState(str(Path(self.config.run_root) / f"run-{self.starts}"), "starting", None, None,
                               "align.log", project_fingerprint(project), can_stop=True)
         return self.state
@@ -44,14 +45,19 @@ class FakeRunner:
         self.state = replace(self.state, status="serving", url="http://127.0.0.1:9001/", has_placement=True)
         self.placement = replace(self.state, status="completed", url=None, can_stop=False)
 
+    def complete(self):
+        self.state = replace(self.state, status="completed", has_placement=True, can_stop=False)
+        self.placement = self.state
+
+    def snapshot(self, project=None, *, advance=True):
+        if advance and self.state and self.state.status == "stopping":
+            self.state = replace(self.state, status="stopped", can_stop=False)
+        current = self._current(self.state, project)
+        return RunSnapshot(current, self._current(self.placement, project),
+                           current if current and current.has_preview else None)
+
     def last_run(self, project=None):
-        return self._current(self.state, project)
-
-    def last_placement(self, project=None):
-        return self._current(self.placement, project)
-
-    def last_preview(self, project=None):
-        return None
+        return self.snapshot(project).current
 
     def open_last(self, project):
         if self.state and self.state.status == "serving":
@@ -60,11 +66,6 @@ class FakeRunner:
             raise ValueError("No saved placement")
         self.opens += 1
         self.state = replace(self.placement, status="starting", can_stop=True)
-        return self._current(self.state, project)
-
-    def poll(self, project=None):
-        if self.state and self.state.status == "stopping":
-            self.state = replace(self.state, status="stopped", can_stop=False)
         return self._current(self.state, project)
 
     def stop(self):
@@ -77,10 +78,6 @@ class FakeRunner:
         if self.state:
             self.state = replace(self.state, status="stopped", url=None, can_stop=False)
         return self.state
-
-    def rebind_project_path(self, path):
-        self.rebinds += 1
-        self.project_path = path
 
     def log_tail(self, max_chars=12000):
         return "isolated ALIGN log\n"
@@ -136,14 +133,29 @@ class PlacementPanelTests(unittest.TestCase):
             self.editor, settings=self.settings, runner_factory=factory)
         self.panel.refresh()
 
-    def test_generate_waits_for_verified_readiness_and_reuses_active_run(self):
+    def open_generated_placement(self):
+        self.panel.generate_button.click()
+        runner = self.runners[-1]
+        runner.complete()
+        self.panel._poll()
+        self.panel.open_last_button.click()
+        return runner
+
+    def test_preview_then_browser_waits_for_verified_readiness_and_reuses_active_run(self):
         self.assertTrue(self.panel.generate_button.isEnabled())
-        self.panel.generate()
+        self.panel.generate_button.click()
         runner = self.runners[-1]
         self.assertEqual(runner.starts, 1)
         self.assertEqual(self.opened, [])
-        self.panel.generate()
+        self.panel.generate_button.click()
         self.assertEqual(runner.starts, 1)
+        runner.complete()
+        self.panel._poll()
+        self.assertEqual(self.opened, [])
+        self.assertTrue(self.panel.open_last_button.isEnabled())
+        self.panel.open_last_button.click()
+        self.assertEqual((runner.starts, runner.opens), (1, 1))
+        self.assertEqual(self.opened, [])
         runner.serve()
         self.panel._poll()
         self.assertEqual(self.opened, ["http://127.0.0.1:9001/"])
@@ -157,7 +169,6 @@ class PlacementPanelTests(unittest.TestCase):
         from roar_api.floorplan.geometry import build_preview
         self.panel.generate_button.click()
         runner = self.runners[-1]
-        self.assertTrue(runner.preview_mode)
         fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
         data = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
         directory = Path(runner.state.run_dir)
@@ -166,58 +177,80 @@ class PlacementPanelTests(unittest.TestCase):
         runner.state = replace(runner.state, status='completed', has_preview=True, can_stop=False)
         emissions = []
         self.panel.previewReady.connect(lambda data, state: emissions.append((data, state)))
-        with patch.object(runner, 'last_preview', side_effect=lambda project=None: runner._current(runner.state, project)):
-            self.panel._poll()
-            self.assertEqual(self.opened, [])
-            self.assertFalse(emissions[-1][1].stale)
-            self.project.devices[0].width_um = 2.1
+        self.panel._poll()
+        self.assertEqual(self.opened, [])
+        self.assertFalse(emissions[-1][1].stale)
+        self.project.devices[0].width_um = 2.1
+        self.panel.refresh()
+        self.assertTrue(emissions[-1][1].stale)
+        with patch.object(self.panel, '_project_provider', side_effect=ValueError('Incomplete width')):
             self.panel.refresh()
             self.assertTrue(emissions[-1][1].stale)
-            with patch.object(self.panel, '_project_provider', side_effect=ValueError('Incomplete width')):
-                self.panel.refresh()
-                self.assertTrue(emissions[-1][1].stale)
-            self.project.devices[0].width_um = 2
-            self.panel.refresh()
-            self.assertFalse(emissions[-1][1].stale)
+        self.project.devices[0].width_um = 2
+        self.panel.refresh()
+        self.assertFalse(emissions[-1][1].stale)
         self.panel.project_changed()
         self.assertEqual(emissions[-1], (None, None))
 
-    def test_log_display_removes_terminal_codes_and_preserves_unicode_and_raw_log(self):
-        self.panel.generate()
+    def test_poll_captures_project_and_run_snapshot_once_even_with_invalid_edits(self):
+        self.panel.generate_button.click()
+        runner = self.runners[-1]
+        for invalid in (False, True):
+            with self.subTest(invalid=invalid):
+                provider = Mock(side_effect=ValueError('Incomplete width')) if invalid else Mock(return_value=self.project)
+                with patch.object(self.panel, '_project_provider', provider), \
+                        patch.object(runner, 'snapshot', wraps=runner.snapshot) as snapshot:
+                    self.panel._poll()
+                provider.assert_called_once_with()
+                snapshot.assert_called_once_with() if invalid else snapshot.assert_called_once_with(self.project)
+                self.assertEqual(self.panel._state.status, 'starting')
+
+    def test_valid_document_remains_editable_with_corrupt_optional_history(self):
+        self.project.save(self.path)
+        runner = AlignRunner(self.config, self.path)
+        index = runner._index(str(self.path))
+        index.parent.mkdir(parents=True)
+        index.write_text('[]')
+        self.panel._runner = runner
+        with patch.object(self.panel, '_project_provider', side_effect=lambda: FloorplanProject.load(self.path)):
+            self.panel.refresh()
+        self.assertTrue(self.panel.generate_button.isEnabled())
+        self.assertFalse(self.panel.open_last_button.isEnabled())
+        self.assertIsNone(self.panel._state)
+        self.assertEqual(index.read_text(), '[]')
+
+    def test_log_display_removes_terminal_codes_and_preserves_unicode(self):
+        self.panel.generate_button.click()
         runner = self.runners[-1]
         raw = ('\x1b[32mwerkzeug INFO\x1b[0m: W=1 µm\r\n'
                '\x1b]8;;http://127.0.0.1:9001/\x1b\\viewer\x1b]8;;\x1b\\\n'
                '\x9b31merror\x9b0m\tπ\x00\x07\n')
         with patch.object(runner, "log_tail", return_value=raw):
-            runner.serve()
             self.panel._poll()
             self.assertEqual(self.panel._view.log.toPlainText(),
                              'werkzeug INFO: W=1 µm\nviewer\nerror\tπ\n')
-            self.assertEqual(runner.log_tail(), raw)
 
     def test_stale_last_placement_is_explicit_and_reopening_does_not_generate(self):
-        self.panel.generate()
+        self.panel.generate_button.click()
         runner = self.runners[-1]
-        runner.serve()
-        self.panel._poll()
-        self.panel.stop()
+        runner.complete()
         self.panel._poll()
         self.project.set_mos_parameters("M1", width_um=3, length_um=0.15, nf=2)
         self.panel.refresh()
         self.assertIn("out of date", self.panel.last_label.text())
-        self.panel.open_last()
+        self.panel.open_last_button.click()
         self.assertEqual(runner.starts, 1)
         self.assertEqual(runner.opens, 1)
-        self.assertEqual(len(self.opened), 1)
+        self.assertEqual(self.opened, [])
         runner.serve()
         self.panel._poll()
-        self.assertEqual(len(self.opened), 2)
+        self.assertEqual(len(self.opened), 1)
         self.assertIn("out of date", self.panel._view.status.text())
 
     def test_failed_latest_attempt_keeps_previous_saved_placement_available(self):
-        self.panel.generate()
+        self.panel.generate_button.click()
         runner = self.runners[-1]
-        runner.serve()
+        runner.complete()
         self.panel._poll()
         previous = runner.placement
         runner.state = replace(runner.state, status="failed", run_dir="failed-new-run", url=None,
@@ -229,7 +262,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertNotIn("failed-new-run", self.panel.open_last_button.toolTip())
 
     def test_failed_run_log_can_be_reopened_and_copied_without_rerunning(self):
-        self.panel.generate()
+        self.panel.generate_button.click()
         runner = self.runners[-1]
         runner.state = replace(runner.state, status='failed', error='Cannot place M1', can_stop=False)
         self.panel.refresh()
@@ -251,8 +284,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertEqual((runner.starts, runner.opens, self.opened), (1, 0, []))
 
     def test_native_check_survives_run_polling_and_is_invalidated_by_edits(self):
-        self.panel.generate()
-        runner = self.runners[-1]
+        runner = self.open_generated_placement()
         runner.serve()
         self.panel._poll()
         callbacks = []
@@ -273,11 +305,9 @@ class PlacementPanelTests(unittest.TestCase):
             self.assertNotIn('passed', self.panel.constraint_status.text())
 
     def test_invalid_draft_can_reopen_captured_placement(self):
-        self.panel.generate()
+        self.panel.generate_button.click()
         runner = self.runners[-1]
-        runner.serve()
-        self.panel._poll()
-        self.panel.stop()
+        runner.complete()
         self.panel._poll()
         def invalid():
             raise ValueError('M1: enter a numeric width')
@@ -286,7 +316,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertFalse(self.panel.generate_button.isEnabled())
         self.assertTrue(self.panel.open_last_button.isEnabled())
         self.assertIn('captured input', self.panel.last_label.text())
-        self.panel.open_last()
+        self.panel.open_last_button.click()
         self.assertEqual(runner.opens, 1)
         self.assertEqual(runner.starts, 1)
 
@@ -300,9 +330,31 @@ class PlacementPanelTests(unittest.TestCase):
             dialog.option_fields['seed'].setValue(19)
             dialog.option_fields['lambda_coeff'].setValue(2.5)
             dialog.accept()
-        QTimer.singleShot(0, choose)
-        self.panel.edit_settings()
+        with modal_interaction(choose):
+            self.panel.edit_settings()
         self.assertEqual(changed, [{'nvariants': 8, 'placer_sa_iterations': 10000, 'seed': 19, 'lambda_coeff': 2.5}])
+
+    def test_option_defaults_and_widget_boundaries_match_valid_document_values(self):
+        from roar_api.floorplan.align_runner import run_options
+        from roar_api.floorplan.run_options import validate_run_options
+        expected = {'nvariants': (4, 1, 100), 'placer_sa_iterations': (100, 1, 1000000),
+                    'seed': (0, 0, 2147483647), 'lambda_coeff': (1.0, 0.01, 1000)}
+        dialog = AlignSettingsDialog(self.config, PROFILE_ID)
+        self.assertEqual(run_options(self.project), {key: values[0] for key, values in expected.items()})
+        for key, (default, low, high) in expected.items():
+            with self.subTest(option=key):
+                field = dialog.option_fields[key]
+                self.assertEqual((field.value(), field.minimum(), field.maximum()), (default, low, high))
+                for value in (low, high):
+                    field.setValue(value)
+                    self.assertEqual(validate_run_options({key: value}), {key: field.value()})
+                for value in (low - 1, high + 1, True, '1'):
+                    with self.assertRaises(ValueError):
+                        validate_run_options({key: value})
+        for value in (float('nan'), float('inf'), -float('inf')):
+            with self.assertRaises(ValueError):
+                validate_run_options({'lambda_coeff': value})
+        dialog.deleteLater()
 
     def test_installation_test_starts_asynchronously_and_displays_versions(self):
         dialog = AlignSettingsDialog(self.config, PROFILE_ID)
@@ -364,6 +416,54 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertTrue(results[0]['ok'], results[0])
         self.assertEqual(results[0]['prefix'], sys.prefix)
         self.assertNotEqual(results[0]['cwd'], os.getcwd())
+        self.assertFalse(Path(results[0]['cwd']).exists(), 'Probe scratch directory was not cleaned up')
+
+    def test_real_probe_failures_are_safe_to_display_and_clean_up(self):
+        from roar_api.floorplan.align_dialog import _probe, _probe_text
+        from PyQt6.QtCore import QEventLoop
+        cases = (([], 0, 'Invalid installation-check response'),
+                 ({'ok': True, 'message': []}, 0, 'message must be text'),
+                 ({'ok': True, 'message': 'Ready'}, 7, 'exit code 7'),
+                 ({'ok': False, 'message': 'Native backend unavailable'}, 1, 'Native backend unavailable'),
+                 (None, 0, 'exceeded 30 seconds'),
+                 (None, 0, 'could not start'))
+        for record, exitcode, diagnostic in cases:
+            with self.subTest(record=record, exitcode=exitcode):
+                script = self.root / '_align_probe.py'
+                timed_out = diagnostic == 'exceeded 30 seconds'
+                script.write_text('import sys, time\n' + ('time.sleep(10)\n' if timed_out else '') +
+                                  f'print({("ROAR_PROBE " + json.dumps(record))!r}, flush=True)\n'
+                                  f'sys.exit({exitcode})\n')
+                config = replace(self.config, python=str(self.root / 'absent-python') if diagnostic == 'could not start' else sys.executable)
+                class ProbeTimer(QTimer):
+                    def setInterval(self, interval):
+                        super().setInterval(20 if timed_out else interval)
+                real_path = Path
+                def script_path(value):
+                    return script.with_name('align_dialog.py') if str(value).endswith('align_dialog.py') else real_path(value)
+                results = []
+                loop = QEventLoop()
+                def completed(result):
+                    results.append(result)
+                    loop.quit()
+                with patch('roar_api.floorplan.align_dialog.Path', side_effect=script_path), \
+                     patch('roar_api.floorplan.align_dialog.QTimer', ProbeTimer):
+                    process = _probe(self.owner, config, completed)
+                scratch = Path(process.workingDirectory())
+                timeout = QTimer()
+                timeout.setSingleShot(True)
+                timeout.timeout.connect(loop.quit)
+                timeout.start(5000)
+                loop.exec()
+                timeout.stop()
+                if not results:
+                    process.kill()
+                    process.waitForFinished(1000)
+                self.assertTrue(results, 'Probe did not finish')
+                self.assertIs(results[0]['ok'], False)
+                self.assertIn(diagnostic, _probe_text(results[0]))
+                self.assertNotIn('Ready', _probe_text(results[0]))
+                self.assertFalse(scratch.exists())
 
     def test_profile_and_complete_input_gate_generation_and_missing_tools_are_actionable(self):
         self.project.align_profile = None
@@ -376,9 +476,10 @@ class PlacementPanelTests(unittest.TestCase):
         self.panel.refresh()
         self.assertFalse(self.panel.generate_button.isEnabled())
         self.project.devices[0].model = original
+        self.panel.refresh()
         self.validate.side_effect = ValueError("Select isolated ALIGN Python")
-        QTimer.singleShot(0, lambda: QApplication.activeModalWidget().reject())
-        self.panel._guard(self.panel.generate)
+        with modal_interaction(lambda: QApplication.activeModalWidget().reject()):
+            self.panel.generate_button.click()
         self.assertIn("isolated ALIGN Python", self.panel.status.text())
         self.assertEqual(self.opened, [])
         self.assertEqual(self.runners[-1].starts, 0)
@@ -399,9 +500,9 @@ class PlacementPanelTests(unittest.TestCase):
             dialog.option_fields['nvariants'].setValue(8)
             dialog.profile.setCurrentIndex(dialog.profile.findData(None))
             dialog.reject()
-        QTimer.singleShot(0, cancel)
-        with patch('roar_api.floorplan.align_dialog._probe') as probe:
-            self.panel.generate_button.click()
+        with modal_interaction(cancel):
+            with patch('roar_api.floorplan.align_dialog._probe') as probe:
+                self.panel.generate_button.click()
         self.assertEqual(inspected, [True])
         probe.assert_not_called()
         self.panel._before_generate.assert_not_called()
@@ -428,12 +529,11 @@ class PlacementPanelTests(unittest.TestCase):
             dialog.backend.setText('/confirmed/backend')
             dialog.option_fields['nvariants'].setValue(8)
             dialog.accept()
-        QTimer.singleShot(0, configure)
-        self.panel.generate_button.click()
+        with modal_interaction(configure):
+            self.panel.generate_button.click()
         runner = self.runners[-1]
         self.assertEqual(captured, [True])
         self.assertEqual(runner.starts, 1)
-        self.assertTrue(runner.preview_mode)
         self.assertEqual(runner.config.python, '/confirmed/python')
         self.assertEqual(runner.config.backend_path, '/confirmed/backend')
         self.assertEqual(self.settings.value('python'), '/confirmed/python')
@@ -460,8 +560,8 @@ class PlacementPanelTests(unittest.TestCase):
             self.assertNotIn("OTA", labels)
             self.assertNotIn("tested", labels.lower())
             dialog.reject()
-        QTimer.singleShot(0, inspect)
-        self.panel.edit_settings()
+        with modal_interaction(inspect):
+            self.panel.edit_settings()
         self.assertEqual(self.settings.allKeys(), [])
 
     def test_supported_technology_remains_available_without_a_library_provider(self):
@@ -476,8 +576,8 @@ class PlacementPanelTests(unittest.TestCase):
             dialog = QApplication.activeModalWidget()
             dialog.technology.setCurrentIndex(dialog.technology.findText("SKY130A"))
             dialog.accept()
-        QTimer.singleShot(0, choose)
-        self.panel.edit_settings()
+        with modal_interaction(choose):
+            self.panel.edit_settings()
         self.assertEqual(self.profiles, [PROFILE_ID])
         self.assertEqual(self.project.align_profile, PROFILE_ID)
         self.assertEqual(set(self.settings.allKeys()), {"python", "backend_path", "run_root"})
@@ -501,11 +601,11 @@ class PlacementPanelTests(unittest.TestCase):
             calls.append(True)
             self.project.set_mos_parameters("M1", 2.4, 0.15, 2)
         self.panel._before_generate = update
-        self.panel.generate()
+        self.panel.generate_button.click()
         runner = self.runners[-1]
         self.assertEqual(runner.state.fingerprint, project_fingerprint(self.project))
         self.assertEqual(self.project.devices[0].width_um, 2.4)
-        self.panel.generate()  # Showing the active run must not change its input.
+        self.panel.generate_button.click()  # Showing the active run must not change its input.
         self.assertEqual(len(calls), 1)
         self.assertEqual(runner.starts, 1)
         self.panel.stop()
@@ -513,39 +613,31 @@ class PlacementPanelTests(unittest.TestCase):
         def fail():
             raise ValueError("ROAR M1.W has no current assigned value")
         self.panel._before_generate = fail
-        self.panel._guard(self.panel.generate)
+        self.panel.generate_button.click()
         self.assertEqual(runner.starts, 1)
         self.assertIn("no current assigned value", self.panel.status.text())
         self.assertEqual(self.opened, [])
 
     def test_cancel_run_window_close_owner_close_and_shutdown_cleanup(self):
-        self.panel.generate()
+        self.panel.generate_button.click()
         runner = self.runners[-1]
         self.panel._view.close()
         self.assertEqual(runner.stops, 1)
         self.assertEqual(self.panel._state.status, "stopping")
         self.panel._poll()
         self.assertFalse(self.panel._poll_timer.isActive())
-        self.panel.generate()
+        self.panel.generate_button.click()
         self.owner.close()
         self.assertGreaterEqual(runner.shutdowns, 1)
         self.assertFalse(self.panel._poll_timer.isActive())
-        self.panel.generate()
+        self.panel.generate_button.click()
         self.panel.shutdown()  # Same slot is connected to QApplication.aboutToQuit.
         self.assertEqual(self.panel._state.status, "stopped")
 
-    def test_project_change_stops_managed_run_and_save_as_rebinds_without_restart(self):
-        self.panel.generate()
-        runner = self.runners[-1]
+    def test_project_change_stops_managed_run_and_clears_view(self):
+        runner = self.open_generated_placement()
         runner.serve()
         self.panel._poll()
-        self.path = self.root / "copy.roar.floorplan"
-        self.panel.saved_as(self.path)
-        self.panel.refresh()
-        self.assertIs(self.panel._runner, runner)
-        self.assertEqual(runner.rebinds, 1)
-        self.assertEqual(runner.starts, 1)
-        self.assertEqual(runner.project_path, self.path)
         self.panel.project_changed()
         self.assertGreaterEqual(runner.shutdowns, 1)
         self.assertIsNone(self.panel._runner)
@@ -554,7 +646,7 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertFalse(self.panel._view.stop_button.isEnabled())
 
     def test_escape_stops_the_managed_run_like_closing_its_window(self):
-        self.panel.generate()
+        self.panel.generate_button.click()
         runner = self.runners[-1]
         QTest.keyClick(self.panel._view, Qt.Key.Key_Escape)
         self.assertEqual(runner.stops, 1)
@@ -563,8 +655,8 @@ class PlacementPanelTests(unittest.TestCase):
         self.assertEqual(self.panel._state.status, "stopped")
 
     def test_source_link_change_keeps_geometry_current_but_size_change_is_stale(self):
-        self.panel.generate()
-        self.runners[-1].serve()
+        self.panel.generate_button.click()
+        self.runners[-1].complete()
         self.panel._poll()
         self.project.roar_project_path = str(self.root / "other-source.roar")
         self.panel.refresh()
@@ -590,8 +682,8 @@ class PlacementPanelTests(unittest.TestCase):
             dialog.profile.setCurrentIndex(dialog.profile.findData(None))
             dialog.python.setText("/different/python")
             dialog.reject()
-        QTimer.singleShot(0, cancel)
-        self.panel.edit_settings()
+        with modal_interaction(cancel):
+            self.panel.edit_settings()
         self.assertEqual(self.panel.config, original)
         self.assertEqual(self.settings.allKeys(), [])
         self.assertEqual(self.profiles, [])
@@ -600,8 +692,8 @@ class PlacementPanelTests(unittest.TestCase):
             dialog = QApplication.activeModalWidget()
             dialog.profile.setCurrentIndex(dialog.profile.findData(None))
             dialog.accept()
-        QTimer.singleShot(0, remove_profile)
-        self.panel.edit_settings()
+        with modal_interaction(remove_profile):
+            self.panel.edit_settings()
         self.assertEqual(self.profiles, [None])
         self.assertFalse(self.panel.generate_button.isEnabled())
         self.assertEqual(self.settings.value("python"), original.python)
@@ -638,9 +730,9 @@ class PlacementPanelTests(unittest.TestCase):
                 dialog.installation.setCurrentIndex(1)
                 self.assertEqual(dialog.python.text(), '/edited/custom/python')
                 dialog.reject()
-            QTimer.singleShot(0, inspect_and_cancel)
-            with patch('roar_api.floorplan.align_dialog._probe') as probe:
-                self.assertFalse(self.panel.edit_settings())
+            with modal_interaction(inspect_and_cancel):
+                with patch('roar_api.floorplan.align_dialog._probe') as probe:
+                    self.assertFalse(self.panel.edit_settings())
             probe.assert_not_called()
         self.assertEqual({key: self.settings.value(key) for key in self.settings.allKeys()}, saved)
         self.assertEqual(self.panel.config.python, '/managed/python')
@@ -662,8 +754,8 @@ class PlacementPanelTests(unittest.TestCase):
                 dialog.installation.setCurrentIndex(0)
                 dialog.run_root.setText(str(self.root / 'moved-runs'))
                 dialog.accept()
-            QTimer.singleShot(0, choose_managed)
-            self.assertTrue(self.panel.edit_settings())
+            with modal_interaction(choose_managed):
+                self.assertTrue(self.panel.edit_settings())
             self.assertEqual(self.panel.config.python, '/managed/python')
             self.assertEqual(self.panel.config.run_root, str(self.root / 'moved-runs'))
             self.assertFalse(self.settings.value('custom_installation'))
@@ -679,34 +771,27 @@ class PlacementPanelTests(unittest.TestCase):
                 dialog.python.setText('/confirmed/custom/python')
                 dialog.backend.setText('/confirmed/custom/backend')
                 dialog.accept()
-            QTimer.singleShot(0, choose_custom)
-            self.assertTrue(self.panel.edit_settings())
+            with modal_interaction(choose_custom):
+                self.assertTrue(self.panel.edit_settings())
             self.assertEqual(self.panel.config.python, '/confirmed/custom/python')
             self.assertTrue(self.settings.value('custom_installation'))
             self.assertEqual(self.settings.value('python'), '/confirmed/custom/python')
             self.assertEqual(self.settings.value('backend_path'), '/confirmed/custom/backend')
 
-    def test_browser_failure_keeps_ready_url_and_error_visible(self):
-        self.panel._browser_opener = lambda _url: False
-        self.panel.generate()
-        self.runners[-1].serve()
-        self.panel._poll()
-        self.assertIn("Could not open the browser", self.panel.status.text())
-        self.assertEqual(self.panel._view.url.text(), "http://127.0.0.1:9001/")
-        self.panel._poll()
-        self.assertIn("Could not open the browser", self.panel.status.text())
-
-    def test_browser_exception_keeps_copy_url_error_visible_after_polling(self):
-        def fail(_url):
-            raise OSError("Browser helper is unavailable")
-        self.panel._browser_opener = fail
-        self.panel.generate()
-        self.runners[-1].serve()
-        self.panel._poll()
-        self.panel._poll()
-        self.assertIn("Could not open the browser", self.panel.status.text())
-        self.assertIn("Copy the viewer URL", self.panel._view.status.text())
-        self.assertEqual(self.panel._view.url.text(), "http://127.0.0.1:9001/")
+    def test_browser_open_failures_keep_ready_url_and_error_visible(self):
+        for outcome in (False, OSError("Browser helper is unavailable")):
+            with self.subTest(outcome=outcome):
+                self.panel.project_changed()
+                opener = Mock(side_effect=[outcome])
+                self.panel._browser_opener = opener
+                runner = self.open_generated_placement()
+                runner.serve()
+                self.panel._poll()
+                self.panel._poll()
+                self.assertIn("Could not open the browser", self.panel.status.text())
+                self.assertIn("Copy the viewer URL", self.panel._view.status.text())
+                self.assertEqual(self.panel._view.url.text(), "http://127.0.0.1:9001/")
+                opener.assert_called_once()
 
     def test_browser_helper_exit_failure_keeps_ready_url_and_does_not_retry(self):
         process = Mock(spec=QProcess)
@@ -716,7 +801,7 @@ class PlacementPanelTests(unittest.TestCase):
         process.exitCode.return_value = 1
         opener = Mock(return_value=process)
         self.panel._browser_opener = opener
-        self.panel.generate()
+        self.open_generated_placement()
         self.runners[-1].serve()
         self.panel._poll()
         self.assertNotIn("Could not open the browser", self.panel.status.text())
@@ -730,7 +815,7 @@ class PlacementPanelTests(unittest.TestCase):
 
     def test_start_failure_is_visible_in_the_open_run_window(self):
         with patch.object(self.runners[-1], "start", side_effect=ValueError("Worker could not start")):
-            self.panel._guard(self.panel.generate)
+            self.panel.generate_button.click()
         self.assertIn("Worker could not start", self.panel._view.status.text())
         self.assertFalse(self.panel._view.stop_button.isEnabled())
         self.assertFalse(self.panel._open_when_ready)

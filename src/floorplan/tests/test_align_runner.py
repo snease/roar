@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
@@ -64,18 +65,15 @@ def stop(*args):
 signal.signal(signal.SIGTERM, signal.SIG_IGN if mode=='ignore' else stop)
 print('captured child log: '+mode,flush=True)
 write('generating')
-if mode=='fail' and m['active']['mode']=='generate':
-    write('failed','intentional backend failure'); sys.exit(2)
 if m['active']['mode']=='preview':
     if mode=='fail':
         write('failed','intentional backend failure'); sys.exit(2)
     if mode=='good':
+        dump=p.parent/'3_pnr'/'__placer_dump__.json'
+        dump.parent.mkdir(); dump.write_text(json.dumps([m['top'].upper(),{},[['PLACEMENT_0',{}]],{}]))
         (p.parent/'preview.json').write_bytes((pathlib.Path(__file__).parent/'preview-fixture.json').read_bytes())
         write('completed'); sys.exit(0)
 if mode not in ('pending','ignore'):
-    dump=p.parent/'3_pnr'/'__placer_dump__.json'
-    if m['active']['mode']=='generate':
-        dump.parent.mkdir(); dump.write_text(json.dumps([m['top'].upper(),{},[['PLACEMENT_0',{}]],{}]))
     write('serving')
 while True: time.sleep(.02)
 '''
@@ -95,6 +93,10 @@ class RunnerTests(unittest.TestCase):
         fixture = Path(__file__).resolve().parents[3] / 'examples/floorplan/ota/cm_ota.roar.floorplan'
         self.project = FloorplanProject.load(fixture)
         self.project.align_profile = PROFILE_ID
+        from roar_api.floorplan.geometry import build_preview
+        capture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        preview = build_preview(capture, json.loads((capture / 'manifest.json').read_text()))
+        (self.base / 'preview-fixture.json').write_text(json.dumps(preview))
         self.runner = AlignRunner(self.config, self.base / 'project.floorplan')
         self.addCleanup(self.runner.shutdown)
         self.validation = patch.object(AlignConfig, 'validate')
@@ -112,6 +114,120 @@ class RunnerTests(unittest.TestCase):
                 return state
             time.sleep(.02)
         self.fail(f'Expected {status}: {state}; {runner.log_tail()}')
+
+    def start_viewer(self, runner):
+        runner.start(self.project)
+        self.until(runner, 'completed')
+        return runner.open_last(self.project)
+
+    def test_corrupt_history_is_optional_but_cannot_authorize_new_run(self):
+        index = self.runner._index(self.runner.project_path)
+        index.parent.mkdir(parents=True)
+        for content in ('[]', '{}', '{"version": 1}', '{"garbage": "x"}', '{',
+                        '{"version": 99}', '{"run_dir": 7}', 'x' * 16385):
+            with self.subTest(content=content[:40]):
+                index.write_text(content)
+                for getter in (self.runner.last_run, self.runner.last_placement, self.runner.last_preview):
+                    self.assertIsNone(getter(self.project))
+                with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN index record'):
+                    self.runner.start(self.project)
+                self.assertEqual(index.read_text(), content)
+        self.assertFalse(list(Path(self.config.run_root).glob('*/run.json')))
+
+    def test_corrupt_index_does_not_allow_duplicate_worker_or_save_as_target(self):
+        state = self.start_viewer(self.runner)
+        self.until(self.runner, 'serving')
+        index = self.runner._index(self.runner.project_path)
+        original = index.read_bytes()
+        destination = Path(self.runner.project_path)
+        destination.write_text('existing document')
+        index.write_text('[]')
+        try:
+            observer = AlignRunner(self.config, destination)
+            self.assertIsNone(observer.last_run(self.project))
+            # A cached controller also cannot republish over unresolved ownership.
+            self.assertIsNone(self.runner.poll(self.project))
+            self.assertEqual(index.read_text(), '[]')
+            with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN index record'):
+                observer.start(self.project)
+            draft = AlignRunner(self.config)
+            with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN index record'):
+                with draft.save_as_transaction(destination):
+                    destination.write_text('overwritten')
+            self.assertEqual(destination.read_text(), 'existing document')
+            self.assertEqual(index.read_text(), '[]')
+            self.assertIsNone(self.runner._process.poll())
+            self.assertEqual(len(list(Path(self.config.run_root).glob('*/run.json'))), 1)
+            self.assertTrue(Path(state.run_dir).is_dir())
+        finally:
+            index.write_bytes(original)
+
+    def test_failed_setup_without_worker_has_stable_failed_state(self):
+        with patch.object(self.runner, '_launch', side_effect=OSError('launch setup failed')):
+            with self.assertRaisesRegex(OSError, 'launch setup failed'):
+                self.runner.start(self.project)
+        state = self.runner.last_run(self.project)
+        self.assertEqual(state.status, 'failed')
+        self.assertIn('setup did not start a worker', state.error)
+        self.assertFalse(state.can_stop)
+        self.assertIsNone(self.runner._process)
+        self.assertEqual(self.runner.poll(self.project), state)
+
+    def test_invalid_ownership_cannot_signal_launch_or_transfer(self):
+        state = self.start_viewer(self.runner)
+        self.until(self.runner, 'serving')
+        path = Path(state.run_dir) / 'run.json'
+        original = path.read_bytes()
+        manifest = json.loads(original)
+        target = self.base / 'target.floorplan'
+        for mutate in (lambda m: m.update(version=99),
+                       lambda m: m.update(created_at=float('nan')),
+                       lambda m: m.update(created_at=10**400),
+                       lambda m: m['generation_config'].update(unused=float('inf')),
+                       lambda m: m.update(active=[]),
+                       lambda m: m['active'].update(pid=True),
+                       lambda m: m['active'].update(token=['bad']),
+                       lambda m: m['active'].update(stop_requested=10**400),
+                       lambda m: m['input_hashes'].update({'../escape': 'a' * 64})):
+            record = json.loads(original)
+            mutate(record)
+            path.write_text(json.dumps(record))
+            corrupted = path.read_bytes()
+            try:
+                self.assertIsNone(self.runner.last_run(self.project))
+                other = AlignRunner(self.config, self.runner.project_path)
+                self.assertIsNone(other.last_run(self.project))
+                with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN run record'):
+                    other.start(self.project)
+                with patch('roar_api.floorplan.align_runner.os.killpg') as signal:
+                    for operation in (self.runner.stop, self.runner.shutdown,
+                                      lambda: self.runner.start(self.project),
+                                      lambda: self.runner.open_last(self.project),
+                                      lambda: self.runner.rebind_project_path(target)):
+                        with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN run record'):
+                            operation()
+                    signal.assert_not_called()
+                self.assertIsNone(self.runner._process.poll())
+                self.assertEqual(path.read_bytes(), corrupted)
+                self.assertFalse(target.exists())
+            finally:
+                path.write_bytes(original)
+        self.assertEqual(json.loads(path.read_bytes())['active']['pid'], manifest['active']['pid'])
+
+    def test_corrupt_status_is_recoverable_without_authorizing_ownership(self):
+        state = self.start_viewer(self.runner)
+        self.until(self.runner, 'serving')
+        path = Path(state.run_dir) / 'status.json'
+        for content in ('[]', '{"token": 3, "status": "serving"}', '{"version": 99}'):
+            path.write_text(content)
+            current = self.runner.poll(self.project)
+            self.assertEqual(current.status, 'starting')
+            self.assertTrue(current.can_stop)
+            self.assertIsNone(current.url)
+            self.assertEqual(path.read_text(), content)
+        # The real child remains stoppable using the separately validated manifest.
+        self.runner.stop()
+        self.until(self.runner, 'stopped')
 
     def test_technology_gate_accepts_different_circuit_sizes_and_reports_unsupported_devices(self):
         self.project.align_profile = None
@@ -140,6 +256,16 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, message):
                 validate_ota_project(project)
             self.assertEqual(getattr(project.devices[0], key), value)
+        # Public device edits can pass geometry rules yet conflict with the
+        # saved parameter/override representation. Never publish that capture.
+        for device in self.project.devices:
+            device.width_um = 1.2
+        validate_ota_project(self.project)
+        self.project.validate()
+        with self.assertRaisesRegex(ValueError, 'saved sizes conflict with source parameters or overrides'):
+            self.runner.start(self.project)
+        self.assertFalse(list(Path(self.config.run_root).glob('*/run.json')))
+        self.assertIsNone(self.runner._process)
 
     def test_boundary_halos_follow_backend_grid_and_disabled_constraints_are_ignored(self):
         for horizontal, vertical in [(0, 0), (0.43, 0.42), (0.86, 0.84), (1.72, 2.52)]:
@@ -152,6 +278,7 @@ class RunnerTests(unittest.TestCase):
         validate_ota_project(self.project)
 
     def test_concurrent_processes_publish_only_one_worker(self):
+        (self.base / 'mode').write_text('pending')
         context = multiprocessing.get_context('fork')
         barrier, results = context.Barrier(2), context.Queue()
         workers = [context.Process(target=_race_start, args=(self.config, self.project.to_dict(),
@@ -175,12 +302,12 @@ class RunnerTests(unittest.TestCase):
             self.runner.last_run(self.project)
 
     def test_save_as_preflight_conflict_cannot_write_destination(self):
-        self.runner.start(self.project)
+        self.start_viewer(self.runner)
         target = self.base / 'occupied.floorplan'
         target.write_text('original destination')
         other = AlignRunner(self.config, target)
         self.addCleanup(other.shutdown)
-        other.start(self.project)
+        self.start_viewer(other)
         with self.assertRaisesRegex(ValueError, 'already has an active ALIGN run'):
             with self.runner.save_as_transaction(target):
                 target.write_text('must not be written')
@@ -220,7 +347,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertFalse((root / '.ownership.lock').is_file())
 
     def test_draft_without_loaded_history_still_checks_active_save_target(self):
-        self.runner.start(self.project)
+        self.start_viewer(self.runner)
         draft = AlignRunner(self.config)
         target = Path(self.runner.project_path)
         target.write_text('original destination')
@@ -274,7 +401,7 @@ class RunnerTests(unittest.TestCase):
             self.until(self.runner, 'stopped')
 
     def test_worker_terminal_error_published_during_exit_is_preserved(self):
-        self.runner.start(self.project)
+        self.start_viewer(self.runner)
         state = self.until(self.runner, 'serving')
         self.runner.shutdown()
         path = Path(state.run_dir) / 'status.json'
@@ -295,7 +422,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_snapshot_isolated_command_readiness_cache_and_restart(self):
         before = self.project.to_dict()
-        state = self.runner.start(self.project)
+        state = self.start_viewer(self.runner)
         state = self.until(self.runner, 'serving')
         self.assertEqual(state.url, 'http://127.0.0.1:12345/')
         self.assertTrue(state.has_placement)
@@ -321,15 +448,44 @@ class RunnerTests(unittest.TestCase):
         self.runner.stop()
         self.until(self.runner, 'stopped')
 
+    def test_legacy_generating_worker_can_be_reconnected_and_stopped(self):
+        state = self.runner.start(self.project)
+        self.until(self.runner, 'completed')
+        path = Path(state.run_dir) / 'run.json'
+        manifest = json.loads(path.read_text())
+        manifest['version'] = 1
+        manifest.pop('fingerprint_version')
+        manifest['active'].update(mode='generate', pid=None, stop_requested=None)
+        path.write_text(json.dumps(manifest))
+        (self.base / 'mode').write_text('pending')
+        process = subprocess.Popen([str(self.python), '--manifest', str(path),
+                                   '--token', manifest['active']['token']],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(lambda: process.terminate() if process.poll() is None else None)
+        manifest['active']['pid'] = process.pid
+        path.write_text(json.dumps(manifest))
+        observer = AlignRunner(self.config, self.runner.project_path)
+        self.addCleanup(observer.shutdown)
+        restored = observer.last_run(self.project)
+        restored = self.until(observer, 'generating')
+        self.assertEqual(restored.run_dir, state.run_dir)
+        self.assertTrue(restored.can_stop)
+        self.assertEqual(json.loads(path.read_text())['active']['mode'], 'generate')
+        observer.stop()
+        self.until(observer, 'stopped')
+        self.assertEqual(process.wait(timeout=2), 0)
+
     def test_older_window_cannot_replace_new_history_or_launch_duplicate_worker(self):
-        self.runner.start(self.project)
+        self.start_viewer(self.runner)
         old = self.until(self.runner, 'serving')
         self.runner.shutdown()
         older_observer = AlignRunner(self.config, self.base / 'project.floorplan')
         older_observer.last_run(self.project)
         newer = AlignRunner(self.config, self.base / 'project.floorplan')
         self.addCleanup(newer.shutdown)
-        newer.start(self.project)
+        self.start_viewer(newer)
         current = self.until(newer, 'serving')
         manifest_path = Path(current.run_dir) / 'run.json'
         pid = json.loads(manifest_path.read_text())['active']['pid']
@@ -349,7 +505,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(json.loads(manifest_path.read_text())['active']['mode'], 'reopen')
 
     def test_save_as_rebinds_live_run_without_restarting_worker(self):
-        self.runner.start(self.project)
+        self.start_viewer(self.runner)
         original = self.until(self.runner, 'serving')
         path = Path(original.run_dir) / 'run.json'
         pid = json.loads(path.read_text())['active']['pid']
@@ -366,7 +522,7 @@ class RunnerTests(unittest.TestCase):
         source = Path(tempfile.mkdtemp(dir=self.base)) / 'source.floorplan'
         initiator = AlignRunner(self.config, source)
         self.addCleanup(initiator.shutdown)
-        initiator.start(self.project)
+        self.start_viewer(initiator)
         state = self.until(initiator, 'serving')
         observer = AlignRunner(self.config, source)
         self.addCleanup(observer.shutdown)
@@ -415,7 +571,7 @@ class RunnerTests(unittest.TestCase):
         for direct_child in (False, True):
             with self.subTest(direct_child=direct_child):
                 stale, owner, transferred = self.transferred_run(direct_child)
-                stale.start(self.project)
+                self.start_viewer(stale)
                 new = self.until(stale, 'serving')
                 self.assertNotEqual(new.run_dir, transferred.run_dir)
                 self.assertEqual(owner.last_run(self.project).run_dir, transferred.run_dir)
@@ -475,7 +631,7 @@ class RunnerTests(unittest.TestCase):
                         owner = AlignRunner(self.config, source)
                         self.addCleanup(owner.shutdown)
                         (self.base / 'mode').write_text('good')
-                        owner.start(self.project)
+                        self.start_viewer(owner)
                         original = self.until(owner, 'serving')
                         directory = Path(original.run_dir)
                         (directory / 'preview.json').write_text(json.dumps(preview))
@@ -510,7 +666,7 @@ class RunnerTests(unittest.TestCase):
                         self.assertEqual(owner.last_preview(self.project).run_dir, original.run_dir)
 
     def test_stale_reopen_keeps_artifacts_and_last_placement_after_failure(self):
-        self.runner.start(self.project)
+        self.start_viewer(self.runner)
         good = self.until(self.runner, 'serving')
         dump = Path(good.run_dir) / '3_pnr/__placer_dump__.json'
         original = (dump.read_bytes(), dump.stat().st_mtime_ns)
@@ -551,7 +707,7 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(stopped.can_stop)
 
     def test_named_floorplans_are_scoped_and_tampered_inputs_refuse_reopen(self):
-        self.runner.start(self.project)
+        self.start_viewer(self.runner)
         state = self.until(self.runner, 'serving')
         other = AlignRunner(self.config, self.base / 'different.floorplan')
         self.assertIsNone(other.last_run(self.project))
@@ -564,7 +720,7 @@ class RunnerTests(unittest.TestCase):
     def test_unsaved_run_adoption_and_fingerprint_incomplete_project(self):
         unsaved = AlignRunner(self.config)
         self.addCleanup(unsaved.shutdown)
-        unsaved.start(self.project)
+        self.start_viewer(unsaved)
         state = self.until(unsaved, 'serving')
         adopted = AlignRunner(self.config, self.base / 'newly_saved.floorplan')
         self.addCleanup(adopted.shutdown)
@@ -581,20 +737,44 @@ class RunnerTests(unittest.TestCase):
         (self.base / 'preview-fixture.json').write_text(json.dumps(data))
         runner = AlignRunner(self.config)
         self.addCleanup(runner.shutdown)
-        runner.start(self.project, preview=True)
+        runner.start(self.project)
         first = self.until(runner, 'completed')
         self.assertTrue(first.has_preview)
         self.assertIsNone(first.url)
         self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        # A legacy capture's freshness belongs to its own captured circuit.
+        legacy_path = Path(first.run_dir) / 'run.json'
+        legacy = json.loads(legacy_path.read_text())
+        legacy['version'] = 1
+        legacy.pop('fingerprint_version')
+        legacy_path.write_text(json.dumps(legacy))
         self.project.run_options['seed'] = 42
         (self.base / 'mode').write_text('fail')
-        runner.start(self.project, preview=True)
+        runner.start(self.project)
         self.until(runner, 'failed')
         self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
         self.assertTrue(runner.last_preview(self.project).stale)
+        from roar_api.floorplan import align_runner
+        evidence = {path: path.read_bytes() for path in (
+            legacy_path, Path(first.run_dir) / 'status.json',
+            runner._run_dir / 'status.json', runner._index('snapshot:' + project_fingerprint(self.project)))}
+        with patch.object(runner, '_advance_run', wraps=runner._advance_run) as advance, \
+                patch.object(align_runner, '_tool_identity', wraps=align_runner._tool_identity) as identity, \
+                patch.object(align_runner, 'project_fingerprint', wraps=project_fingerprint) as fingerprint:
+            snapshot = runner.snapshot(self.project)
+        self.assertEqual(advance.call_count, 1)
+        self.assertEqual(identity.call_count, 1)
+        self.assertEqual(sum(call.args[0] is self.project for call in fingerprint.call_args_list), 1)
+        self.assertEqual(snapshot.current.status, 'failed')
+        self.assertEqual(snapshot.preview.run_dir, first.run_dir)
+        self.assertTrue(snapshot.preview.stale)
+        with patch.object(runner, '_advance_run', side_effect=AssertionError('advanced read-only snapshot')), \
+                patch.object(align_runner, '_write_json', side_effect=AssertionError('wrote history')):
+            self.assertEqual(runner.snapshot(self.project, advance=False), snapshot)
+        self.assertTrue(all(path.read_bytes() == contents for path, contents in evidence.items()))
         self.project.run_options['seed'] = 43
         (self.base / 'mode').write_text('pending')
-        runner.start(self.project, preview=True)
+        runner.start(self.project)
         self.until(runner, 'generating')
         runner.stop()
         self.until(runner, 'stopped')
@@ -609,7 +789,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(reopened.last_preview(self.project).run_dir, first.run_dir)
         self.assertTrue(reopened.last_preview(self.project).stale)
         (self.base / 'mode').write_text('good')
-        reopened.start(self.project, preview=True)
+        reopened.start(self.project)
         second = self.until(reopened, 'completed')
         self.assertNotEqual(second.run_dir, first.run_dir)
         self.assertEqual(reopened.last_preview(self.project).run_dir, second.run_dir)
@@ -651,7 +831,7 @@ class RunnerTests(unittest.TestCase):
         backend = Path(self.config.backend_path)
         backend.mkdir()
         (backend / 'models.sp').write_text('original models')
-        self.runner.start(self.project)
+        self.start_viewer(self.runner)
         self.until(self.runner, 'serving')
         self.assertFalse(self.runner.poll(self.project).stale)
         self.runner.config = dataclasses.replace(self.config, port=9010)
@@ -688,6 +868,7 @@ class WorkerErrorTests(unittest.TestCase):
                             generation_config={'profile': PROFILE, 'run_options': {'seed': 17}})
             path = root / 'run.json'
             path.write_text(json.dumps(manifest))
+            (root / 'status.json').write_text('[]')
             calls = []
             modules = {
                 'align': SimpleNamespace(__version__=PROFILE['align_version'],
@@ -711,6 +892,9 @@ class WorkerErrorTests(unittest.TestCase):
                 status = json.loads((root / 'status.json').read_text())
                 self.assertEqual(status['status'], 'completed')
                 self.assertIsNone(status['url'])
+                evidence = list(root.glob('status.json.invalid-*'))
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(evidence[0].read_text(), '[]')
                 # A bad native capture must not publish a partial replacement.
                 (root / 'preview.json').unlink()
                 shutil.rmtree(root / '3_pnr' / 'Results')
@@ -724,7 +908,7 @@ class WorkerErrorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'run.json'
             activation = 'public-process-activation'
-            path.write_text(json.dumps({'active': {'token': activation, 'mode': 'generate', 'backend_path': directory, 'port': 0},
+            path.write_text(json.dumps({'active': {'token': activation, 'mode': 'reopen', 'backend_path': directory, 'port': 0},
                 'generation_config': {'profile': dict(PROFILE, dash_major=2), 'run_options': {'nvariants': 7, 'seed': 19}},
                 'input_dir': directory, 'top': 'test'}))
             placer, captured = SimpleNamespace(), {}
@@ -762,6 +946,7 @@ class WorkerErrorTests(unittest.TestCase):
             self.assertEqual(captured['status']['url'], 'http://127.0.0.1:9012' + prefix)
             self.assertEqual(captured['options']['nvariants'], 7)
             self.assertEqual(captured['options']['seed'], 19)
+            self.assertEqual(captured['options']['flow_start'], '3_pnr:gui')
 
     def test_viewer_protects_layout_assets_and_callbacks_with_host_origin_and_authentication(self):
         from roar_api.floorplan._align_worker import ProtectedViewer
@@ -804,12 +989,12 @@ class WorkerErrorTests(unittest.TestCase):
             self.assertNotIn('Set-Cookie', response['headers'])
         self.assertEqual(calls, [prefix + path for path in ('', '_dash-layout', 'assets/test.js', '_dash-update-component')])
 
-    def test_loopback_permission_error_preserves_placement_and_explains_reopen(self):
+    def test_loopback_permission_error_explains_how_to_reopen(self):
         from roar_api.floorplan import _align_worker
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'run.json'
             token = 'test-activation'
-            path.write_text(json.dumps({'active': {'token': token, 'mode': 'generate', 'backend_path': directory, 'port': 0},
+            path.write_text(json.dumps({'active': {'token': token, 'mode': 'reopen', 'backend_path': directory, 'port': 0},
                 'generation_config': {'profile': PROFILE}, 'input_dir': directory, 'top': 'test'}))
             placer = SimpleNamespace()
             def schematic2layout(**kwargs):
@@ -869,14 +1054,21 @@ class ConfigTests(unittest.TestCase):
             with patch.dict(PROFILE, {'backend_hashes': hashes}):
                 config = AlignConfig(sys.executable, directory, str(base / 'runs'))
                 config.validate()
+                self.assertFalse((base / 'runs').exists())
+                runner = AlignRunner(config)
+                self.assertIsNone(runner.last_run())
+                config.prepare_storage()
+                self.assertTrue((base / 'runs').is_dir())
+                self.assertIsNone(runner.last_run())
+                self.assertFalse((base / 'runs' / '.ownership.lock').exists())
                 blocked = base / 'file-not-folder'
                 blocked.write_text('keep')
                 for root in (blocked, blocked / 'child'):
                     with self.assertRaisesRegex(ValueError, 'Cannot write.*Choose a writable folder'):
-                        dataclasses.replace(config, run_root=str(root)).validate()
+                        dataclasses.replace(config, run_root=str(root)).prepare_storage()
                 with patch('roar_api.floorplan.align_runner.tempfile.TemporaryFile', side_effect=PermissionError('denied')):
                     with self.assertRaisesRegex(ValueError, 'Cannot write.*denied'):
-                        config.validate()
+                        config.prepare_storage()
                 self.assertEqual(blocked.read_text(), 'keep')
                 (base / 'gen_param.py').write_text('changed')
                 with self.assertRaisesRegex(ValueError, 'Backend does not match'):

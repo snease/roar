@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the OTA using native ALIGN, then exercise its real Dash viewer.
+"""Generate an OTA physical preview, then explicitly open its real Dash viewer.
 
 No browser, Qt, mocks or user settings are used. The worker is always stopped;
 retained diagnostics redact the expired viewer capability.
@@ -16,6 +16,18 @@ import urllib.request
 
 from roar_api.floorplan import FloorplanProject
 from roar_api.floorplan.align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID
+from roar_api.floorplan.geometry import load_preview
+
+
+def wait_for(runner, project, expected):
+    deadline = time.monotonic() + 180
+    while True:
+        state = runner.poll(project)
+        if state.status == expected:
+            return state
+        if state.status in ('failed', 'stopped', 'interrupted') or time.monotonic() > deadline:
+            raise RuntimeError(f'Native ALIGN did not reach {expected}: {state.status}: {state.error}\n{runner.log_tail()}')
+        time.sleep(0.1)
 
 
 def main():
@@ -37,14 +49,15 @@ def main():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         runner.start(project)
-        deadline = time.monotonic() + 180
-        while True:
-            state = runner.poll(project)
-            if state.status == 'serving' and state.url:
-                break
-            if state.status in ('failed', 'stopped', 'interrupted') or time.monotonic() > deadline:
-                raise RuntimeError(f'Native viewer failed to start: {state.status}: {state.error}\n{runner.log_tail()}')
-            time.sleep(0.1)
+        preview = wait_for(runner, project, 'completed')
+        assert preview.url is None and preview.has_preview and preview.has_placement, preview
+        data = load_preview(Path(preview.run_dir) / 'preview.json')
+        assert data['candidates'], 'Native preview has no placement candidates'
+        report['checks'].append('Native physical preview without a browser or viewer server')
+        runner.open_last(project)
+        state = wait_for(runner, project, 'serving')
+        assert state.url and state.run_dir == preview.run_dir, state
+        report['checks'].append('Explicit viewer open reuses the captured placement')
         base = state.url
         parsed = urllib.parse.urlsplit(base)
         origin = f'{parsed.scheme}://{parsed.netloc}'

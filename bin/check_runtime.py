@@ -66,7 +66,8 @@ result = subprocess.run([sys.executable, '-I', '-B', '-m', 'roar_api'],
                         capture_output=True, text=True, timeout=40)
 assert result.returncode == 1, result.stdout + result.stderr
 assert "No module named 'PyQt6'" in result.stderr, result.stderr
-assert "pip install -e '.[gui]'" in result.stderr, result.stderr
+assert "pip install --upgrade 'roar-cad[gui]'" in result.stderr, result.stderr
+assert 'checkout root' not in result.stderr, result.stderr
 assert 'Traceback' not in result.stderr, result.stderr
 assert 'sudo apt install' not in result.stderr, result.stderr
 assert not result.stdout, result.stdout

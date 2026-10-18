@@ -32,16 +32,6 @@ QOpenGLContext.create = lambda self: False
         self.assertFalse(report['ok'])
         self.assertIn('cannot create an OpenGL context', report['error'])
 
-    @unittest.skipIf(importlib.util.find_spec('PyQt6'), 'Requires an environment without the GUI extra')
-    def test_real_missing_gui_package_exits_with_install_guidance(self):
-        result = self.launch(dict(os.environ))
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("No module named 'PyQt6'", result.stderr)
-        self.assertIn("pip install -e '.[gui]'", result.stderr)
-        self.assertNotIn('Traceback', result.stderr)
-        self.assertNotIn('sudo apt install', result.stderr)
-        self.assertEqual(result.stdout, '')
-
     @unittest.skipUnless(sys.platform == 'linux' and importlib.util.find_spec('PyQt6'),
                          'Requires a Linux GUI environment to check native prerequisites')
     def test_real_missing_native_library_exits_cleanly_without_library_override(self):
@@ -56,7 +46,8 @@ QOpenGLContext.create = lambda self: False
         result = self.launch(environment)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn('GUI startup:', result.stderr)
-        self.assertIn('sudo apt install', result.stderr)
+        self.assertIn('distribution', result.stderr)
+        self.assertNotIn('sudo apt install', result.stderr)
         self.assertNotIn('Traceback', result.stderr)
         self.assertEqual(result.stdout, '')
 

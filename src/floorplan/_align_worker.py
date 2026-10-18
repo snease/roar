@@ -97,14 +97,22 @@ def main():
     path = Path(arguments.manifest).resolve()
     manifest = json.loads(path.read_text())
     active = manifest['active']
+    if active['mode'] not in ('preview', 'reopen'):
+        raise ValueError('Worker operation must generate a preview or reopen a captured placement')
     if active['token'] != arguments.token:
         raise ValueError('Worker activation no longer owns this run')
+
+    preserve_invalid = runpy.run_path(str(Path(__file__).with_name('run_records.py')))['preserve_invalid_record']
 
     def status(value, url=None, error=None):
         target = path.with_name('status.json')
         temporary = target.with_name('status.' + uuid.uuid4().hex + '.tmp')
-        temporary.write_text(json.dumps({'token': arguments.token, 'status': value, 'url': url, 'error': error}))
-        os.replace(temporary, target)
+        try:
+            temporary.write_text(json.dumps({'token': arguments.token, 'status': value, 'url': url, 'error': error}))
+            preserve_invalid(target)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
         print(f'ROAR ALIGN {value}' + (f': {url}' if url else '') + (f': {error}' if error else ''), flush=True)
 
     def stopped(signum, frame):
@@ -114,7 +122,7 @@ def main():
     signal.signal(signal.SIGTERM, stopped)
     signal.signal(signal.SIGINT, stopped)
     try:
-        status('generating' if active['mode'] in ('generate', 'preview') else 'starting')
+        status('generating' if active['mode'] == 'preview' else 'starting')
         import align
         import dash
         profile = manifest['generation_config']['profile']
@@ -183,11 +191,7 @@ def main():
             return application.sel
 
         placer.run_gui = native_gui
-        options.update(gui=True, flow_stop='3_pnr:gui', port=active['port'])
-        if active['mode'] == 'reopen':
-            options['flow_start'] = '3_pnr:gui'
-        elif 'netlist' in manifest:
-            native_preflight(manifest)
+        options.update(gui=True, flow_start='3_pnr:gui', flow_stop='3_pnr:gui', port=active['port'])
         align.schematic2layout(**options)
         status('completed')
     except Exception as error:

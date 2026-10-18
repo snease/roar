@@ -102,6 +102,12 @@ paths. It reports errors without opening ROAR or changing installations.
 For manual installations, missing EGL/OpenGL or xcb libraries belong to the ROAR
 desktop setup; installing ALIGN alone does not provide them. The normal managed
 setup supplies those runtime libraries for the GUI.
+Use your distribution's Qt/OpenGL desktop packages for any shared libraries
+named by the check, or ask your CAD administrator. A display connection failure
+requires a working desktop session; WSL2 users should check WSLg. For an installed
+ROAR package missing its GUI dependencies, install `roar-cad[gui]` in its Python
+environment. The editable `.[gui]` installation command applies to a source
+checkout, while managed installations are repaired with the setup script.
 
 ## If setup fails
 

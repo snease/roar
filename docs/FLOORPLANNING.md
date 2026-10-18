@@ -299,6 +299,11 @@ saved floorplan path. Saving an unsaved floorplan before running gives it a
 stable identity for reopening results. **Save as…** moves the current run's
 association to the new floorplan path without restarting ALIGN.
 
+Unreadable run history does not prevent editing or exporting a floorplan.
+If a damaged record leaves process ownership uncertain, generation, reopening
+and ownership transfer stop with a diagnostic identifying the original record;
+they do not start another worker or silently replace that evidence.
+
 Technology choices come from ROAR's sizing library. A characterization library
 alone does not provide an ALIGN layout generator: technologies without a
 configured backend remain visible but unavailable for generation. The included
@@ -576,6 +581,10 @@ flowchart LR
 The two views share one document and undo history. The document stays independent
 of Qt and ALIGN; ALIGN imports run in separate tool processes. Derived geometry stays
 in its captured run, accompanied by generation inputs, provenance and logs.
+Internal edits use detached model snapshots; persistence decoding remains at
+file boundaries. Each run-control refresh reads one current project and one
+runner snapshot, advancing the current worker once and reading older results
+without changing their history.
 
 ```mermaid
 flowchart TB

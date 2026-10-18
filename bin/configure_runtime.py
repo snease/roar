@@ -76,7 +76,8 @@ def configure(root):
     os.environ.update(runtime_environment(root))
     sys.path.insert(0, str(root))
     from roar_api.floorplan.align_runner import align_process_environment
-    from roar_api.floorplan.doctor import check_setup, _record
+    from roar_api.floorplan.doctor import check_setup
+    from roar_api.floorplan.probe_result import parse_probe_result
 
     environment = align_process_environment(str(align_python))
     with tempfile.TemporaryDirectory(prefix='roar-managed-setup-') as directory:
@@ -91,8 +92,8 @@ def configure(root):
             [str(align_python), '-I', '-B', str(root / 'src/floorplan/_align_probe.py'),
              '--backend', str(backend)], cwd=directory, env=environment,
             capture_output=True, text=True, errors='replace', timeout=60)
-        result = _record(probe.stdout, 'ROAR_PROBE ') or {}
-        if probe.returncode or not result.get('ok') or not result.get('browser_viewer'):
+        result = parse_probe_result(probe.stdout, stderr=probe.stderr, returncode=probe.returncode)
+        if not result['ok'] or not result.get('browser_viewer') or not result.get('align'):
             raise ValueError('Managed ALIGN check failed:\n' +
                              str(result.get('message') or probe.stderr or probe.stdout)[-2500:])
         if str(result.get('python', '')).split('.')[:2] != ['3', '11']:

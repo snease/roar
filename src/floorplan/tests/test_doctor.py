@@ -10,6 +10,34 @@ import unittest
 from unittest.mock import patch
 
 from roar_api.floorplan import doctor
+from roar_api.floorplan.probe_result import parse_probe_result
+
+
+class ProbeResultTests(unittest.TestCase):
+    def test_malformed_records_and_fields_become_bounded_diagnostics(self):
+        records = ([], None, {}, {'ok': 1}, {'ok': 'true'}, {'ok': True, 'message': []},
+                   {'ok': True, 'align': {}}, {'ok': True, 'browser_viewer': 'yes'})
+        for record in records:
+            with self.subTest(record=record):
+                result = parse_probe_result('ROAR_PROBE ' + json.dumps(record), stderr='native detail\n' * 1000)
+                self.assertIs(result['ok'], False)
+                self.assertIn('Invalid installation-check response', result['message'])
+                self.assertIn('native detail', result['message'])
+                self.assertLess(len(result['message']), 2800)
+        for output in ('', 'ROAR_PROBE {invalid', 'ROAR_PROBE ' + '[' * 1100 + '0' + ']' * 1100):
+            with self.subTest(output=output):
+                self.assertFalse(parse_probe_result(output)['ok'])
+
+    def test_exit_failure_crash_and_timeout_override_success_record(self):
+        output = 'ROAR_PROBE {"ok": true, "message": "Ready"}'
+        for options, diagnostic in (({'returncode': 7}, 'exit code 7'),
+                                    ({'normal_exit': False, 'returncode': 0}, 'crashed'),
+                                    ({'timed_out': True}, 'exceeded 30 seconds')):
+            with self.subTest(options=options):
+                result = parse_probe_result(output, **options)
+                self.assertFalse(result['ok'])
+                self.assertIn(diagnostic, result['message'])
+                self.assertNotIn('Ready', result['message'])
 
 
 class SetupCheckTests(unittest.TestCase):
@@ -97,17 +125,23 @@ class SetupCheckTests(unittest.TestCase):
         self.assertIn('libEGL.so.1', text)
         self.assertNotIn('pip install', text)
         if sys.platform == 'linux':
-            self.assertIn('sudo apt install libegl1', text)
+            self.assertIn('distribution', text)
+        self.assertNotIn('sudo apt', text)
         self.assertIn('ALIGN is not configured', text)
         self.assertIn('ALIGN settings -> Setup help', text)
         self.assertNotIn('\u2192', text)
 
     def test_absent_gui_package_points_to_the_gui_extra(self):
         error = {'ok': False, 'error': "ModuleNotFoundError: No module named 'PyQt6'", 'missing_module': 'PyQt6'}
-        code, text, _ = self.run_check([subprocess.CompletedProcess([], 1, 'ROAR_GUI ' + json.dumps(error), '')])
-        self.assertEqual(code, 1)
-        self.assertIn("pip install -e '.[gui]'", text)
-        self.assertNotIn('sudo apt install', text)
+        child = subprocess.CompletedProcess([], 1, 'ROAR_GUI ' + json.dumps(error), '')
+        for checkout in (Path('/source/roar'), None):
+            with self.subTest(checkout=checkout), patch.object(doctor, '_source_checkout', return_value=checkout):
+                code, text, _ = self.run_check([child])
+                self.assertEqual(code, 1)
+                self.assertIn("pip install -e '.[gui]'" if checkout else "pip install --upgrade 'roar-cad[gui]'", text)
+                self.assertNotIn('sudo apt install', text)
+                if checkout is None:
+                    self.assertNotIn('checkout', text)
 
     def test_managed_native_failure_points_to_setup_instead_of_apt(self):
         error = {'ok': False, 'error': 'ImportError: libEGL.so.1: cannot open shared object file'}
@@ -135,12 +169,38 @@ class SetupCheckTests(unittest.TestCase):
         child = subprocess.CompletedProcess([], -6, 'ROAR_IMPORTS ready\n',
             'qt.qpa.xcb: could not connect to display\n'
             'qt.qpa.plugin: From 6.5.0, xcb-cursor0 or libxcb-cursor0 is needed to load the Qt xcb platform plugin.')
-        code, text, _ = self.run_check([child])
-        self.assertEqual(code, 1)
-        self.assertIn('could not connect to display', text)
-        self.assertIn('WSLg', text)
-        self.assertNotIn('sudo apt install', text)
-        self.assertNotIn('libxcb-cursor0', text)
+        for wsl in (False, True):
+            with self.subTest(wsl=wsl), patch.object(doctor.platform, 'release', return_value='generic-linux'):
+                code, text, _ = self.run_check([child], {'WSL_INTEROP': '/run/WSL/1_interop'} if wsl else {})
+                self.assertEqual(code, 1)
+                self.assertIn('could not connect to display', text)
+                self.assertEqual('WSLg' in text, wsl)
+                self.assertNotIn('sudo apt install', text)
+                self.assertNotIn('libxcb-cursor0', text)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'ALIGN checks require Linux')
+    def test_align_child_response_is_validated_before_success_or_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gui = self.gui(settings={'python': sys.executable, 'backend_path': str(root)})
+            # Substitute only the worker programs; exercise real subprocess
+            # status/output collection, isolation and the CLI consumer.
+            for record, exitcode, detail in (([], 0, 'Invalid installation-check response'),
+                                           ({'ok': True, 'message': []}, 0, 'message must be text'),
+                                           ({'ok': True, 'message': 'Ready'}, 7, 'exit code 7')):
+                with self.subTest(record=record, exitcode=exitcode):
+                    (root / '_align_probe.py').write_text('import sys\n'
+                        f'print({("ROAR_PROBE " + json.dumps(record))!r})\nsys.exit({exitcode})\n')
+                    output = io.StringIO()
+                    with patch.dict(os.environ, {}, clear=True), \
+                         patch.object(doctor, '_QT_CHECK', f'print({gui.stdout!r})'), \
+                         patch.object(doctor, '__file__', str(root / 'doctor.py')):
+                        code = doctor.check_setup(output=output)
+                    text = output.getvalue()
+                    self.assertEqual(code, 1)
+                    self.assertIn(detail, text)
+                    self.assertNotIn('PASS: ALIGN', text)
+                    self.assertNotIn('Ready', text)
 
     def test_gui_timeout_does_not_print_the_child_program(self):
         code, text, _ = self.run_check([subprocess.TimeoutExpired(['python', '-c', doctor._QT_CHECK], 30)], gui_only=True)

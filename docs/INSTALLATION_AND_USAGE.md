@@ -165,6 +165,13 @@ needs a separately installed ALIGN toolchain and explicit settings; see
 [Set up ALIGN](../src/floorplan/ALIGN_SETUP.md#expert-manual-installation).
 Do not install ALIGN into the ROAR GUI environment.
 
+The editable command above runs from a source checkout. For an installed package,
+add the desktop extra in that package's Python environment with
+`python3 -m pip install --upgrade 'roar-cad[gui]'`. If diagnostics name a missing
+shared library (such as `libEGL.so.1`), install the corresponding Qt/OpenGL
+desktop package for your distribution or ask your CAD administrator. Display
+connection failures require a working desktop session; under WSL2, check WSLg.
+
 ## Runtime Maintenance
 
 The existing `pyproject.toml` is the source of Python package requirements.

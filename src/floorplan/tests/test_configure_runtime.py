@@ -61,7 +61,12 @@ class ConfigureRuntimeTests(unittest.TestCase):
 
     def test_success_receipt_matches_inputs_and_subprocess_paths_remain_literal(self):
         run = self.configure(self.children())
-        self.assertEqual(json.loads(self.receipt.read_text()), runtime.fingerprint(self.root))
+        receipt = json.loads(self.receipt.read_text())
+        self.assertEqual(receipt['schema'], 1)
+        self.assertEqual(receipt['checkout'], str(self.root))
+        self.assertEqual(receipt['inputs'], {name: hashlib.sha256((self.root / name).read_bytes()).hexdigest()
+            for name in ('pyproject.toml', 'pixi.lock', 'bin/configure_runtime.py',
+                         'bin/provision_align.py', 'src/floorplan/align_profile.json')})
         runtime.check_ready(self.root)
         command = run.call_args_list[0].args[0]
         self.assertEqual(command, [str(self.align), '-I', str(self.root / 'bin/provision_align.py'),
@@ -74,8 +79,12 @@ class ConfigureRuntimeTests(unittest.TestCase):
             'provision': ([subprocess.CompletedProcess([], 1, '', 'download failed')], 0),
             'probe': ([self.children()[0], subprocess.CompletedProcess([], 1, '', 'native import failed')], 0),
             'viewer': ([self.children()[0], subprocess.CompletedProcess([], 0, 'ROAR_PROBE {"ok": true, "browser_viewer": false}', '')], 0),
+            'invalid-probe': ([self.children()[0], subprocess.CompletedProcess([], 0,
+                'ROAR_PROBE {"ok": "false", "browser_viewer": "false", "python": "3.11.17", "align": "bogus"}', '')], 0),
+            'missing-version': ([self.children()[0], subprocess.CompletedProcess([], 0,
+                'ROAR_PROBE {"ok": true, "browser_viewer": true, "python": "3.11.17"}', '')], 0),
             'align-python': ([self.children()[0], subprocess.CompletedProcess([], 0,
-                'ROAR_PROBE {"ok": true, "browser_viewer": true, "python": "3.10.22"}', '')], 0),
+                'ROAR_PROBE {"ok": true, "browser_viewer": true, "align": "0.9.8", "python": "3.10.22"}', '')], 0),
             'display': (self.children(), 1),
             'timeout': ([subprocess.TimeoutExpired(['align-python'], 300)], 0),
         }
@@ -93,8 +102,9 @@ class ConfigureRuntimeTests(unittest.TestCase):
                 runtime.configure(self.root)
         self.assertEqual(self.receipt.read_bytes(), before)
 
-    def test_changed_manifest_or_lock_rejects_readiness_without_writes(self):
-        for name in ('pyproject.toml', 'pixi.lock'):
+    def test_changed_setup_inputs_reject_readiness_without_writes(self):
+        for name in ('pyproject.toml', 'pixi.lock', 'bin/configure_runtime.py',
+                     'bin/provision_align.py', 'src/floorplan/align_profile.json'):
             with self.subTest(input=name):
                 self.write_receipt()
                 path = self.root / name
@@ -124,7 +134,7 @@ class ConfigureRuntimeTests(unittest.TestCase):
                          (str(self.gui), [str(self.gui), '-I', str(self.root / 'src/roar.py'), *arguments]))
         self.assertEqual(execute.call_args.args[2]['ROAR_ALIGN_PYTHON'], str(self.align))
 
-    def test_receipt_cannot_supply_executable_paths(self):
+    def test_modified_receipt_blocks_launch(self):
         value = runtime.fingerprint(self.root)
         value['align_python'] = '/untrusted/python'
         self.receipt.write_text(json.dumps(value))

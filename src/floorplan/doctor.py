@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 
+from .probe_result import parse_probe_result
 
 _QT_CHECK = r'''
 import importlib, json, sys
@@ -73,11 +74,16 @@ except Exception as error:
     sys.exit(1)
 '''
 
-_UBUNTU_LIBRARIES = (
-    "libegl1 libgl1 libfontconfig1 libdbus-1-3 libglib2.0-0 libx11-xcb1 "
-    "libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 "
-    "libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 "
-    "libxcb-sync1 libxcb-xfixes0 libxcb-xkb1")
+def _source_checkout():
+    root = Path(__file__).resolve().parents[2]
+    return root if (root / 'pyproject.toml').is_file() and (root / 'bin/setup_roar.sh').is_file() else None
+
+
+def _gui_install_advice():
+    root = _source_checkout()
+    if root is not None:
+        return f"Activate the ROAR environment and run python3 -m pip install -e '.[gui]' from the checkout root ({root})."
+    return "In the ROAR Python environment, install the desktop extra: python3 -m pip install --upgrade 'roar-cad[gui]'."
 
 
 def _record(output, prefix):
@@ -178,16 +184,19 @@ def check_setup(*, output=None, gui_only=False, quiet=False, prepare_launch=Fals
             if managed and not display_lines and not graphics_failure:
                 report('FIX', 'Rerun ./bin/setup_roar.sh from the checkout to repair the managed runtime.')
             if not managed and gui and gui.get('missing_module'):
-                report('FIX', "Activate the ROAR environment and run python3 -m pip install -e '.[gui]' from the checkout root.")
+                report('FIX', _gui_install_advice())
             display_unavailable = 'could not connect to display' in str(detail).lower()
             unknown_platform = 'could not find the qt platform plugin' in str(detail).lower()
-            if not managed and (not gui or '.so' in str(detail)) and not display_unavailable and not unknown_platform and not graphics_failure and sys.platform == 'linux':
-                report('FIX', 'For Ubuntu 22.04, install the desktop runtime libraries: sudo apt install ' + _UBUNTU_LIBRARIES)
+            native_failure = '.so' in str(detail) or 'could not load the qt platform plugin' in str(detail).lower()
+            if not managed and native_failure and not display_unavailable and not unknown_platform and not graphics_failure and sys.platform == 'linux':
+                report('FIX', 'Check the reported native libraries against your Linux distribution\'s Qt/OpenGL desktop packages; '
+                       'install any missing shared libraries or ask your CAD administrator.')
             if 'ROAR_IMPORTS ready' in child.stdout:
                 if unknown_platform:
                     report('FIX', 'Remove the QT_QPA_PLATFORM override or select an installed Qt platform plugin.')
                 report('FIX', 'Launch from a desktop terminal with a working DISPLAY or WAYLAND_DISPLAY. '
-                       'On WSL use WSL2 with WSLg; if Wayland/OpenGL fails, try QT_QPA_PLATFORM=xcb ' +
+                       + ('On WSL use WSL2 with WSLg. ' if os.environ.get('WSL_INTEROP') or 'microsoft' in platform.release().lower() else '') +
+                       'If Wayland/OpenGL fails, try QT_QPA_PLATFORM=xcb ' +
                        ('./bin/roar. ' if managed else 'python3 -m roar_api. ') +
                        'QT_QPA_PLATFORM=offscreen is only a headless check.')
     except subprocess.TimeoutExpired as error:
@@ -220,8 +229,8 @@ def check_setup(*, output=None, gui_only=False, quiet=False, prepare_launch=Fals
                    '--backend', str(Path(backend).expanduser().resolve())]
         try:
             child = _run(command, environment=align_process_environment(python))
-            result = _record(child.stdout, 'ROAR_PROBE ')
-            if result and result.get('ok') and child.returncode == 0:
+            result = parse_probe_result(child.stdout, stderr=child.stderr, returncode=child.returncode)
+            if result['ok']:
                 report('PASS', f'ALIGN {result.get("align", "unknown")}, Dash {result.get("dash", "unknown")}; backend checked.')
                 if result.get('browser_viewer') is False:
                     report('WARN', result.get('message', 'Optional ALIGN browser viewer unavailable.'))
@@ -233,8 +242,7 @@ def check_setup(*, output=None, gui_only=False, quiet=False, prepare_launch=Fals
                     report('FAIL', str(error))
             else:
                 failed = True
-                detail = result.get('message') if result else (child.stderr.strip() or child.stdout.strip() or f'Worker exited with code {child.returncode}')
-                report('FAIL', 'ALIGN: ' + str(detail)[-2500:])
+                report('FAIL', 'ALIGN: ' + result['message'])
                 report('FIX', 'Rerun ./bin/setup_roar.sh to repair the managed ALIGN installation.' if managed_align else
                        'Check the separate Python and pinned SKY130_PDK folder in ALIGN settings -> Setup help.')
         except (OSError, subprocess.TimeoutExpired) as error:

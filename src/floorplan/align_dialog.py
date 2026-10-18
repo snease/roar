@@ -22,6 +22,8 @@ from .align_runner import (
     AlignConfig, AlignRunner, PROFILE, PROFILE_ID, align_process_environment,
     managed_installation, project_fingerprint, run_options, validate_ota_project,
 )
+from .probe_result import parse_probe_result
+from .run_options import OPTION_LIMITS, default_run_options
 
 
 ACTIVE = {"starting", "generating", "serving", "stopping"}
@@ -81,7 +83,6 @@ def _label(text=""):
 def _probe(parent, config, completed, *, manifest=None):
     """Run the isolated interpreter without blocking the Qt event loop."""
     process = QProcess(parent)
-    process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
     environment = QProcessEnvironment()
     for name, value in align_process_environment(config.python).items():
         environment.insert(name, value)
@@ -103,17 +104,17 @@ def _probe(parent, config, completed, *, manifest=None):
             return
         finished = True
         timer.stop()
-        output = bytes(process.readAllStandardOutput()).decode('utf-8', errors='replace')
-        lines = [line[11:] for line in output.splitlines() if line.startswith('ROAR_PROBE ')]
         try:
-            result = json.loads(lines[-1]) if lines else {'ok': False, 'message': process.errorString() + '\n' + output[-2500:]}
-        except ValueError:
-            result = {'ok': False, 'message': 'Invalid installation-check response.\n' + output[-2500:]}
-        if timed_out:
-            result = {'ok': False, 'message': 'ALIGN check exceeded 30 seconds and was stopped. Check the selected installation and retry.'}
-        completed(result)
-        directory.cleanup()
-        process.deleteLater()
+            output = bytes(process.readAllStandardOutput()).decode('utf-8', errors='replace')
+            errors = bytes(process.readAllStandardError()).decode('utf-8', errors='replace')
+            result = parse_probe_result(output, stderr=errors, returncode=process.exitCode(),
+                                        normal_exit=process.exitStatus() == QProcess.ExitStatus.NormalExit,
+                                        timed_out=timed_out,
+                                        start_error=process.errorString() if process.error() == QProcess.ProcessError.FailedToStart else '')
+            completed(result)
+        finally:
+            directory.cleanup()
+            process.deleteLater()
     def timeout():
         nonlocal timed_out
         timed_out = True
@@ -124,8 +125,8 @@ def _probe(parent, config, completed, *, manifest=None):
     process.destroyed.connect(directory.cleanup)
     # Keep the venv executable path rather than resolving its symlink to the
     # system Python; resolve relative paths before changing the child's cwd.
-    process.start(str(Path(config.python).expanduser().absolute()), arguments)
     timer.start()
+    process.start(str(Path(config.python).expanduser().absolute()), arguments)
     return process
 
 
@@ -150,7 +151,7 @@ class AlignSettingsDialog(QDialog):
         custom_config = custom_config or config
         self._custom_paths = (custom_config.python, custom_config.backend_path)
         self.custom_installation = managed_config is None or custom_installation
-        self.run_options = dict(PROFILE['run_defaults'], lambda_coeff=1.0)
+        self.run_options = default_run_options()
         self.run_options.update(placement_options or {})
         layout = QVBoxLayout(self)
         introduction = (
@@ -203,18 +204,18 @@ class AlignSettingsDialog(QDialog):
                 self._installation_controls.extend((field, browse))
         layout.addLayout(form)
         self.option_fields = {}
-        for key, title, low, high, tip in (
-                ('nvariants', 'Placement candidates:', 1, 100, 'Maximum number of candidates requested; ALIGN may find fewer.'),
-                ('placer_sa_iterations', 'Placement effort (iterations):', 1, 1000000, 'More simulated-annealing iterations can improve placement and take longer. The initial quick-preview setting is 100; ALIGN normally uses 10000.'),
-                ('seed', 'Random seed:', 0, 2147483647, 'Use the same seed, inputs, and tool versions to reproduce a run.')):
+        for key, title, tip in (
+                ('nvariants', 'Placement candidates:', 'Maximum number of candidates requested; ALIGN may find fewer.'),
+                ('placer_sa_iterations', 'Placement effort (iterations):', 'More simulated-annealing iterations can improve placement and take longer. The initial quick-preview setting is 100; ALIGN normally uses 10000.'),
+                ('seed', 'Random seed:', 'Use the same seed, inputs, and tool versions to reproduce a run.')):
             field = QSpinBox()
-            field.setRange(low, high)
+            field.setRange(*OPTION_LIMITS[key])
             field.setValue(self.run_options[key])
             field.setToolTip(tip)
             self.option_fields[key] = field
             form.addRow(title, field)
         weight = QDoubleSpinBox()
-        weight.setRange(0.01, 1000)
+        weight.setRange(*OPTION_LIMITS['lambda_coeff'])
         weight.setDecimals(2)
         weight.setValue(self.run_options['lambda_coeff'])
         weight.setToolTip('ALIGN minimizes log(area) + λ × log(estimated wirelength). Larger values favor shorter wires. Default: 1.')
@@ -504,9 +505,10 @@ class PlacementPanel(QWidget):
             self._invalidate_check(None)
             self._input_error = str(exc)
             runner = self._ensure_runner()
-            self._apply_state(runner.last_run())
-            self._refresh_preview(None)
-            historical = runner.last_placement()
+            snapshot = runner.snapshot()
+            self._apply_state(snapshot.current)
+            self._refresh_preview(snapshot.preview, None)
+            historical = snapshot.placement
             self.generate_button.setEnabled(self._active())
             self.open_last_button.setEnabled(historical is not None and not (self._active() and self._state.status != 'serving'))
             self.open_last_button.setToolTip(str(historical.run_dir) if historical else '')
@@ -529,14 +531,15 @@ class PlacementPanel(QWidget):
         except (ValueError, TypeError, KeyError) as exc:
             error = str(exc)
         runner = self._ensure_runner()
-        self._apply_state(runner.last_run(project))
+        snapshot = runner.snapshot(project)
+        self._apply_state(snapshot.current)
         if self._active():
             self._poll_timer.start()
         self.generate_button.setEnabled(self._active() or not error)
         self.generate_button.setText("Show active ALIGN run…" if self._active() else "Generate physical preview")
         self.generate_button.setToolTip(error)
         self.settings_button.setEnabled(not self._active())
-        state = runner.last_placement(project)
+        state = snapshot.placement
         self.open_last_button.setEnabled(state is not None and not (self._active() and self._state.status != "serving"))
         self.open_last_button.setToolTip(str(state.run_dir) if state else "")
         self.last_label.setText("Placement out of date. Regenerate to apply changes." if state and state.stale else "")
@@ -544,10 +547,9 @@ class PlacementPanel(QWidget):
             self.status.setText(error)
         elif self._state is None:
             self.status.clear()
-        self._refresh_preview(project)
+        self._refresh_preview(snapshot.preview, project)
 
-    def _refresh_preview(self, project):
-        state = self._ensure_runner().last_preview(project)
+    def _refresh_preview(self, state, project):
         if state is None:
             if self._preview_data is not None:
                 self._preview_identity = self._preview_data = self._preview_state = None
@@ -582,9 +584,6 @@ class PlacementPanel(QWidget):
             self._apply_state(state)
 
     def generate_preview(self):
-        self.generate(preview=True)
-
-    def generate(self, *, preview=False):
         if self._active():
             self._managed = True
             self._show_view()
@@ -609,11 +608,11 @@ class PlacementPanel(QWidget):
         self._validator(project)
         project.validate()
         self._closing = False
-        self._open_when_ready = not preview
+        self._open_when_ready = False
         self._browser_error = ""
         self._show_view()
         runner = self._ensure_runner()
-        state = runner.start(project, preview=True) if preview else runner.start(project)
+        state = runner.start(project)
         self._managed = True
         self._apply_state(state)
         self._poll_timer.start()
@@ -684,16 +683,8 @@ class PlacementPanel(QWidget):
             self._poll_timer.stop()
 
     def _poll(self):
-        if self._runner is None:
-            return
-        try:
-            project = self._project_provider()
-            self._input_error = ""
-        except (ValueError, TypeError, KeyError) as exc:
-            project = None
-            self._input_error = str(exc)
-        self._apply_state(self._runner.poll(project))
-        self.refresh()
+        if self._runner is not None:
+            self.refresh()
 
     def stop(self):
         self._open_when_ready = False
@@ -805,7 +796,7 @@ class PlacementPanel(QWidget):
                 process.kill()
 
     def project_changed(self):
-        """Changing documents ends the old managed run; Save As uses saved_as."""
+        """Changing documents ends the old managed run; Save As is transactional."""
         self.shutdown()
         self._checked_fingerprint = None
         self.constraint_status.clear()
@@ -823,15 +814,6 @@ class PlacementPanel(QWidget):
             self._view.url.clear()
             self._view.log.clear()
             self._view.stop_button.setEnabled(False)
-
-    def saved_as(self, path):
-        if self._runner is not None and self._managed:
-            self._runner.rebind_project_path(path)
-            self._runner_path = str(path) if path else None
-        elif not self._active():
-            self._runner = None
-            self._state = None
-        self.schedule_refresh()
 
     @contextmanager
     def save_as_transaction(self, path):

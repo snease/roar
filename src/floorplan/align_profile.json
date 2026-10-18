@@ -15,6 +15,6 @@
     "models.sp": "4660e6645e442fdc0326741d3ca8ca89893014675da64340cb9ef422f61e90f0"
   },
   "models": ["sky130_fd_pr__nfet_01v8", "sky130_fd_pr__pfet_01v8"],
-  "run_defaults": {"nvariants": 4, "placer_sa_iterations": 100, "seed": 0},
+  "run_defaults": {"nvariants": 4, "placer_sa_iterations": 100, "seed": 0, "lambda_coeff": 1.0},
   "instructions": "Select the separate ALIGN Python environment and the configured SKY130A backend's SKY130_PDK directory. ROAR_ALIGN_PDK_FIXED identifies this backend; ROAR_ALIGN_PDK may point to the incompatible official backend. Machine paths belong in user settings."
 }

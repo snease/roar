@@ -147,7 +147,7 @@ class FloorplanDialogTests(unittest.TestCase):
         self.assertIn('W 4 /', dialog.sketch_panel.items_by_name['M1'].detail)
 
     def test_failed_live_sizing_marks_physical_preview_stale_until_repaired(self):
-        from roar_api.floorplan.align_runner import RunState, project_fingerprint
+        from roar_api.floorplan.align_runner import RunSnapshot, RunState, project_fingerprint
         from roar_api.floorplan.geometry import build_preview
         project = FloorplanProject.from_text(SYMBOLIC)
         project.set_parameter('nfs', 4)
@@ -160,7 +160,7 @@ class FloorplanDialogTests(unittest.TestCase):
                          project_fingerprint(project), has_preview=True)
         panel = self.dialog.placement_panel
         runner = panel._ensure_runner()
-        with patch.object(runner, 'last_preview', return_value=state):
+        with patch.object(runner, 'snapshot', return_value=RunSnapshot(preview=state)):
             panel.refresh()
             self.assertFalse(self.dialog.preview_panel.state.stale)
             self.design.set_instance_attribute('M1_2', 'W', -1)
