@@ -49,13 +49,6 @@ class ProvisionAlignTests(unittest.TestCase):
         with patch.object(provision, 'BACKEND_FILES', self.hashes), patch.object(provision, '_download', return_value=payload or self.archive()):
             return provision.provision_backend(self.target)
 
-    def test_backend_pins_match_the_runtime_profile(self):
-        profile = json.loads((ROOT / 'src/floorplan/align_profile.json').read_text())
-        self.assertEqual(provision.BACKEND_REVISION, profile['backend_revision'])
-        for name, digest in profile['backend_hashes'].items():
-            self.assertEqual(provision.BACKEND_FILES[name], digest)
-        self.assertIn('LICENSE', provision.BACKEND_FILES)
-
     def test_check_missing_files_does_not_create_directories_or_download(self):
         with patch.object(provision, '_download') as download:
             with self.assertRaisesRegex(ValueError, 'rerun ROAR setup'):

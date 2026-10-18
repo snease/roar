@@ -47,7 +47,7 @@ Only choose an external executable when you intend to use that installation.
 
 ## Toolchain versions
 
-The profile uses Python 3.10, the official ALIGN 0.9.8 wheel and Dash 2.18.2,
+The profile uses Python 3.10, the official ALIGN 0.9.8 wheel and Dash 3.4.0,
 with the vibeic SKY130 backend at
 `427b3b94242fdcf8009e418f6bbe14286fc71334`. The wheel supplies the native placer;
 its release and artifact identify the installed code. The ALIGN source revision
@@ -73,7 +73,7 @@ Then create the separate manual ALIGN environment:
 python3.10 -m venv "$HOME/roar-align"
 "$HOME/roar-align/bin/python" -m pip install --upgrade pip
 "$HOME/roar-align/bin/python" -m pip install --only-binary=align-analoglayout \
-  'align-analoglayout==0.9.8' 'dash==2.18.2'
+  'align-analoglayout==0.9.8' 'dash==3.4.0'
 git clone https://github.com/vibeic/ALIGN-pdk-sky130.git "$HOME/roar-align-sky130"
 git -C "$HOME/roar-align-sky130" checkout 427b3b94242fdcf8009e418f6bbe14286fc71334
 ```

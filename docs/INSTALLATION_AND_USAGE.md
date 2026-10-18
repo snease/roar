@@ -141,7 +141,7 @@ for the managed runtime.
 A CAD-managed Python environment remains supported. This bypasses the managed
 launcher and requires your administrator to supply Qt/OpenGL/X11 libraries and
 a compatible desktop connection. See the
-[Qt 6.8 platform dependencies](https://doc.qt.io/qt-6.8/linux-requirements.html).
+[Qt 6.9 platform dependencies](https://doc.qt.io/qt-6.9/linux-requirements.html).
 With an installed Python 3.11 and its `venv` support:
 
 ```sh
@@ -171,6 +171,25 @@ ALIGN preview after runtime changes. Bundled native libraries need dependency
 updates even when the workstation's OS packages are current. Package locks and
 checksums make changes reviewable; they do not establish that third-party code
 is safe. Local editable ROAR code and backend code remain trusted inputs.
+
+The October 2026 dependency review updated PyQt6 to 6.9.1 (Qt 6.9.2),
+Dash to 3.4.0, Flask to 3.1.3 and Werkzeug to 3.1.9. Python advisory scans of
+the locked GUI, ALIGN and headless environments found no matches after these
+updates. That scan does not cover native libraries bundled inside wheels.
+Dash 4.4.1 requires Pydantic 2, which conflicts with ALIGN 0.9.8's Pydantic 1
+requirement; upgrade those together only after native viewer validation.
+
+**Known native dependency limitation:** Qt 6.9.2 remains affected by
+[SVG recursion and use-after-free vulnerabilities](https://www.qt.io/blog/security-advisory-uncontrolled-recursion-and-use-after-free-vulnerabilities-in-qt-svg-module-impact-qt)
+and an [SVG marker vulnerability](https://www.qt.io/blog/security-advisory-type-confusion-and-heap-buffer-overflow-vulnerability-in-qt-svg-marker-handling).
+ROAR has no direct user-SVG loading feature, but that does not establish that
+all Qt image-loading paths are unreachable. Only trusted SVG content should
+reach Qt. The published PyPI Qt wheels containing these fixes require glibc
+2.34; no Qt 6.9.3 wheel is available. Resolving this requires a patched runtime
+package or an explicitly reviewed increase to the Linux baseline. The current
+update preserves the documented glibc 2.28 baseline and does not close this
+native security item. Recheck upstream advisories and wheel availability when
+updating the runtime.
 
 Pixi was chosen because this desktop needs Python packages and native graphics
 and placement libraries together. `venv` or `uv` would still leave the native

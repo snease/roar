@@ -3,7 +3,7 @@
   "label": "SKY130A",
   "technology": "SKY130A",
   "align_version": "0.9.8",
-  "dash_major": 2,
+  "dash_major": 3,
   "backend_repository": "https://github.com/vibeic/ALIGN-pdk-sky130",
   "backend_revision": "427b3b94242fdcf8009e418f6bbe14286fc71334",
   "backend_environment": "ROAR_ALIGN_PDK_FIXED",

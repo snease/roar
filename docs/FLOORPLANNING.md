@@ -278,7 +278,7 @@ inspection.
 ![ALIGN's optional browser viewer showing a generated OTA placement and candidate tradeoffs.](../images/png/floorplan/placement.png)
 
 The repository profile is
-[`align_profile.json`](../src/floorplan/align_profile.json): ALIGN 0.9.8, Dash 2,
+[`align_profile.json`](../src/floorplan/align_profile.json): ALIGN 0.9.8, Dash 3.4.0,
 the tested `vibeic/ALIGN-pdk-sky130` backend revision, four requested candidates,
 100 placement iterations and seed zero. **ALIGN settings…** exposes candidate
 count, placement effort, random seed, and wirelength weight. These choices are
@@ -627,12 +627,53 @@ dependencies apart from ROAR, but is not an operating-system security sandbox.
 
 ## Checks
 
-After setup, run the floorplan tests in the managed GUI environment:
+After setup, run the named checks with the checkout's pinned Pixi. These
+commands use the installed lock without resolving dependencies or installing
+packages:
 
 ```sh
-QT_QPA_PLATFORM=offscreen ./.pixi/bin/pixi run --offline --locked --no-install \
-  -e default --executable python -m unittest discover -s src/floorplan/tests -v
+./.pixi/bin/pixi run --no-config --offline --locked --no-install -e default test-floorplan
+./.pixi/bin/pixi run --no-config --offline --locked --no-install -e default check-gui
+./.pixi/bin/pixi run --no-config --offline --locked --no-install -e align check-align
+./.pixi/bin/pixi run --no-config --offline --locked --no-install -e align check-align-placement
+./.pixi/bin/pixi run --no-config --offline --locked --no-install -e default check-align-viewer
 ```
+
+`test-floorplan` uses Python 3.11 and explicitly sets offscreen Qt.
+`check-gui` requires a visible desktop and verifies an OpenGL widget's rendered
+framebuffer; it rejects headless Qt overrides. Offscreen tests do not establish
+desktop or OpenGL support. `check-align` uses the managed Python 3.10 interpreter
+and pinned backend for native parsing, schema validation and constraint
+translation. `check-align-placement` adds real native placement and geometry
+checks without routing. Each check prints a retained temporary artifact
+directory containing logs and a JSON receipt. Settings are isolated from desktop
+preferences. Set `ROAR_CHECK_OUTPUT_DIR` to choose the artifacts' parent directory.
+`check-align-viewer` generates the OTA in native ALIGN and checks the real Dash
+layout, assets, placement/tradeoff callbacks and local access controls over HTTP.
+It stops its worker and redacts the viewer capability in retained logs; it does
+not open a browser or establish visible browser rendering.
+
+The installed-wheel check has a separate, GUI-free test environment. Install it
+once during setup, then run its offline task:
+
+```sh
+./.pixi/bin/pixi install --no-config --locked -e headless
+./.pixi/bin/pixi run --no-config --offline --locked --no-install -e headless check-package
+```
+
+`check-package` builds a wheel from a temporary source copy without build
+isolation or downloads, installs it without dependencies in a temporary venv,
+and checks the core API and packaged ALIGN profile/help files outside the
+checkout. Its dependencies come from the locked headless environment, where Qt
+and ALIGN are absent. It also launches the installed module and verifies the
+missing-GUI diagnostic, covering the case skipped by GUI-environment tests.
+It does not modify a managed environment.
+
+Pull requests run floorplan tests, the installed-wheel check and the small real
+native placement cases (including schema validation) and viewer HTTP check on
+Ubuntu 22.04. CI setup uses explicit offscreen Qt and retains validation
+artifacts. Visible desktop
+and OpenGL acceptance still require `check-gui` on the target machine.
 
 The tests cover topology, unit conversion, explicit ROAR mappings, persistence,
 export collisions, invalid input and Qt editing flows. Placement tests cover

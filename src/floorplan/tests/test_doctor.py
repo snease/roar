@@ -99,6 +99,8 @@ class SetupCheckTests(unittest.TestCase):
         if sys.platform == 'linux':
             self.assertIn('sudo apt install libegl1', text)
         self.assertIn('ALIGN is not configured', text)
+        self.assertIn('ALIGN settings -> Setup help', text)
+        self.assertNotIn('\u2192', text)
 
     def test_absent_gui_package_points_to_the_gui_extra(self):
         error = {'ok': False, 'error': "ModuleNotFoundError: No module named 'PyQt6'", 'missing_module': 'PyQt6'}
@@ -168,12 +170,6 @@ class SetupCheckTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(text, '')
 
-    def test_terminal_diagnostics_use_ascii_arrows(self):
-        code, text, _ = self.run_check([self.gui()])
-        self.assertEqual(code, 0)
-        self.assertIn('ALIGN settings -> Setup help', text)
-        self.assertNotIn('\u2192', text)
-
     @unittest.skipUnless(sys.platform == 'linux', 'ALIGN launcher requires Linux or WSL')
     def test_saved_align_settings_are_checked_without_creating_run_storage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -217,19 +213,16 @@ class SetupCheckTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Cannot write'):
                 doctor._check_runs(root)
 
-    def test_cli_check_does_not_construct_a_session(self):
+    def test_cli_checks_do_not_construct_a_session(self):
         from roar_api.__main__ import main
-        with patch.object(sys, 'argv', ['roar', '--check-setup']), patch.object(doctor, 'check_setup', return_value=1) as check, patch('roar_api.Session') as session:
-            self.assertEqual(main(), 1)
-        check.assert_called_once_with()
-        session.assert_not_called()
-
-    def test_cli_gui_check_does_not_construct_a_session(self):
-        from roar_api.__main__ import main
-        with patch.object(sys, 'argv', ['roar', '--check-gui']), patch.object(doctor, 'check_setup', return_value=0) as check, patch('roar_api.Session') as session:
-            self.assertEqual(main(), 0)
-        check.assert_called_once_with(gui_only=True)
-        session.assert_not_called()
+        for flag, code, options in (('--check-setup', 1, {}),
+                                    ('--check-gui', 0, {'gui_only': True})):
+            with self.subTest(flag=flag), patch.object(sys, 'argv', ['roar', flag]), \
+                 patch.object(doctor, 'check_setup', return_value=code) as check, \
+                 patch('roar_api.Session') as session:
+                self.assertEqual(main(), code)
+            check.assert_called_once_with(**options)
+            session.assert_not_called()
 
     def test_launch_native_failure_is_actionable_without_loading_a_design(self):
         from roar_api.__main__ import main

@@ -18,10 +18,16 @@ import urllib.error
 import urllib.request
 
 
-BACKEND_REVISION = '427b3b94242fdcf8009e418f6bbe14286fc71334'
-BACKEND_URL = 'https://codeload.github.com/vibeic/ALIGN-pdk-sky130/tar.gz/' + BACKEND_REVISION
+# The runtime profile owns the revision and generator hashes used by both
+# interpreters. Additional provisioning-only files below are checked at setup.
+PROFILE = json.loads((Path(__file__).resolve().parents[1] /
+                      'src/floorplan/align_profile.json').read_text(encoding='utf-8'))
+BACKEND_REVISION = PROFILE['backend_revision']
+BACKEND_URL = PROFILE['backend_repository'].replace('https://github.com/',
+    'https://codeload.github.com/') + '/tar.gz/' + BACKEND_REVISION
 BACKEND_SHA256 = '1c7311c4016d8afcb73a9b966917cf4570b7bc1fe76e07bcf04d6cb1a2a5d705'
 BACKEND_FILES = {
+    **PROFILE['backend_hashes'],
     'Align_primitives.py': '886938e72b7cfc47390a8ac5f3f04c4f9b4e19487f13baf340d889ab6b41107d',
     'LICENSE': '9da4c466377398db5b1453c54f64e6b175243a3869fa5bf65c26217b7c2ea4fc',
     '__init__.py': 'd6207ba4e9a22e787c20a6e4df71fde2ca3ed05884c1a8251bf934d7c50e96e7',
@@ -29,11 +35,7 @@ BACKEND_FILES = {
     'fabric_Cap.py': '6b8aa54cdc30ce8a04469fde58fc531e725a86bd2727f8b464e0ee4bb5fcbd64',
     'fabric_Res.py': '7dfa23938ffa051c97b944624805a2cbd08e7ba1fbd3f66af09d0e44186d5284',
     'fabric_ring.py': 'eedce84e6c7ff7554b0a8e76492366d24cc67620fe6b9a7cd4956e39f2d54294',
-    'gen_param.py': '3a2fcc03163ae7ee1f89ce6d1c7a74be3cb5f3f558ed9b7230364f2d7bd72a3a',
     'guard_ring.py': 'd91b19528bc90350557e661eb7b64ef005320aa59f2ba0fef73c1aaaf1659114',
-    'layers.json': 'baf138788e3a48e7d2e8d7035f54abf9518cad3b1ce1a7f55ac3160b5f35743f',
-    'models.sp': '4660e6645e442fdc0326741d3ca8ca89893014675da64340cb9ef422f61e90f0',
-    'mos.py': '3ea8bcb3d56ce1193b9325045504f0582715ae3eadcde99d5723f4f9e96cf01a',
     'res.py': '7e50d16b7098bdd5cd14aa82f699d9e93764abeab8bbc3b5dd65c5fb0a188e9c',
 }
 ASSETS_REVISION = '8d3cc2e9aa5511315203eb5cbfd00d2c88fdbd18'

@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 dependencies = ["numpy", "pandas", "sympy", "matplotlib"]
 
 [project.optional-dependencies]
-gui = ["PyQt6==6.8", "PyQt6-QScintilla", "jedi", "pyqtgraph>=0.13", "PyOpenGL", "colorama", "pyqtdarktheme", "kiwisolver>=1.4"]
+gui = ["PyQt6==6.9.1", "PyQt6-QScintilla", "jedi", "pyqtgraph>=0.13", "PyOpenGL", "colorama", "pyqtdarktheme", "kiwisolver>=1.4"]
 
 [project.scripts]
 roar = "roar_api.__main__:main"
@@ -80,11 +80,37 @@ xorg-libx11 = "*"
 
 [tool.pixi.feature.align.pypi-dependencies]
 align-analoglayout = { url = "https://files.pythonhosted.org/packages/36/0d/98ec1058dbaf3e3e3d2635cf9c309261cbbbf7e2e3489e76b09fe8ff9634/align_analoglayout-0.9.8-cp310-cp310-manylinux_2_28_x86_64.whl" }
-dash = "==2.18.2"
+dash = "==3.4.0"
 
 [tool.pixi.feature.align.activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/lib"
 
+# Test-only environment: exercise an installed wheel with no Qt or ALIGN.
+[tool.pixi.feature.headless.dependencies]
+python = "3.11.*"
+pip = "*"
+setuptools = ">=64"
+wheel = "*"
+
+[tool.pixi.feature.headless.pypi-dependencies]
+numpy = "*"
+pandas = "*"
+sympy = "*"
+matplotlib = "*"
+
+[tool.pixi.feature.gui.tasks]
+test-floorplan = { cmd = "python bin/check_runtime.py floorplan", description = "Python 3.11 floorplan tests with offscreen Qt", env = { QT_QPA_PLATFORM = "offscreen" } }
+check-gui = { cmd = "python bin/check_runtime.py gui", description = "Visible desktop and OpenGL acceptance check (requires a display)" }
+check-align-viewer = { cmd = "python bin/check_runtime.py align-viewer", description = "Generate a native placement and exercise real Dash viewer HTTP callbacks" }
+
+[tool.pixi.feature.align.tasks]
+check-align = { cmd = "python bin/check_runtime.py align", description = "Native ALIGN parser, schema and constraint translation check" }
+check-align-placement = { cmd = "python bin/check_runtime.py align-placement", description = "Real native ALIGN placement and geometry check (no routing)" }
+
+[tool.pixi.feature.headless.tasks]
+check-package = { cmd = "python bin/check_runtime.py package", description = "Build and install the wheel offline; check core API and missing-GUI diagnostics" }
+
 [tool.pixi.environments]
 default = { features = ["gui"] }
 align = { features = ["align"], no-default-feature = true }
+headless = { features = ["headless"], no-default-feature = true }

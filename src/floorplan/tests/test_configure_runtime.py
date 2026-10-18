@@ -164,15 +164,3 @@ class ManagedAlignEnvironmentTests(unittest.TestCase):
             result = align_process_environment('/custom/align/bin/python')
         self.assertEqual(result['LD_LIBRARY_PATH'], '/custom/align/lib')
         self.assertNotIn('PYTHONPATH', result)
-
-    def test_doctor_uses_the_managed_align_environment_in_its_probe(self):
-        with tempfile.TemporaryDirectory() as directory:
-            environment = dict(self.environment, ROAR_ALIGN_PDK_FIXED='/managed/backend', XDG_STATE_HOME=directory)
-            children = [subprocess.CompletedProcess([], 0,
-                'ROAR_SETTINGS {"python": "/old/align", "backend_path": "/old/backend"}\n'
-                'ROAR_GUI {"ok": true, "platform": "xcb"}', ''),
-                subprocess.CompletedProcess([], 0, 'ROAR_PROBE {"ok": true, "browser_viewer": true}', '')]
-            with patch.dict(os.environ, environment, clear=True), patch.object(doctor, '_run', side_effect=children) as run:
-                self.assertEqual(doctor.check_setup(output=io.StringIO()), 0)
-            self.assertEqual(run.call_args_list[1].args[0][0], self.python)
-            self.assertEqual(run.call_args_list[1].kwargs['environment']['LD_LIBRARY_PATH'], self.prefix + '/lib')

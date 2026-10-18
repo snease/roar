@@ -118,8 +118,12 @@ def main():
         import align
         import dash
         profile = manifest['generation_config']['profile']
-        if align.__version__ != profile['align_version'] or int(dash.__version__.split('.')[0]) != profile['dash_major']:
-            raise ValueError(f"This profile requires ALIGN {profile['align_version']} and Dash {profile['dash_major']}.x")
+        # Captured geometry keeps its ALIGN version. The HTTP viewer uses the
+        # currently supported Dash runtime, including when reopening a capture
+        # made before the viewer dependency was upgraded.
+        runtime_profile = json.loads(Path(__file__).with_name('align_profile.json').read_text())
+        if align.__version__ != profile['align_version'] or int(dash.__version__.split('.')[0]) != runtime_profile['dash_major']:
+            raise ValueError(f"This profile requires ALIGN {profile['align_version']} and Dash {runtime_profile['dash_major']}.x")
         options = dict(profile['run_defaults'])
         options.update(manifest['generation_config'].get('run_options', {}))
         options.update(netlist_dir=manifest['input_dir'], pdk_dir=active['backend_path'],
