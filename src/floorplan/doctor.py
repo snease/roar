@@ -102,13 +102,13 @@ def check_setup(*, output=None):
             detail = gui.get('error') if gui else (child.stderr.strip() or f'Qt child exited with code {child.returncode}')
             report('FAIL', 'GUI startup: ' + str(detail)[-2500:])
             if gui and gui.get('missing_module'):
-                report('FIX', "Activate the ROAR environment and run python -m pip install -e '.[gui]' from the checkout root.")
+                report('FIX', "Activate the ROAR environment and run python3 -m pip install -e '.[gui]' from the checkout root.")
             display_unavailable = 'could not connect to display' in str(detail).lower()
             if (not gui or '.so' in str(detail)) and not display_unavailable and sys.platform == 'linux':
                 report('FIX', 'For Ubuntu 22.04, install the desktop runtime libraries: sudo apt install ' + _UBUNTU_LIBRARIES)
             if 'ROAR_IMPORTS ready' in child.stdout:
                 report('FIX', 'Launch from a desktop terminal with a working DISPLAY or WAYLAND_DISPLAY. '
-                       'On WSL use WSL2 with WSLg; if Wayland/OpenGL fails, try QT_QPA_PLATFORM=xcb python -m roar_api. '
+                       'On WSL use WSL2 with WSLg; if Wayland/OpenGL fails, try QT_QPA_PLATFORM=xcb python3 -m roar_api. '
                        'QT_QPA_PLATFORM=offscreen is only a headless check.')
     except (OSError, subprocess.TimeoutExpired) as error:
         failed = True

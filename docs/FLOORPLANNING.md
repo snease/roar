@@ -20,7 +20,7 @@ WSL. The Python API works with the headless installation, `pip install -e .`.
 
 If your environment already has ROAR's GUI dependencies, pull the branch and
 restart ROAR; no reinstall is needed to find the floorplan editor. Both
-`python src/roar.py` and `python -m roar_api` work from the checkout root.
+`python3 src/roar.py` and `python3 -m roar_api` work from the checkout root.
 Activate that environment before launching; `python3 --version` must report
 Python 3.10 or newer. If an older system Python is selected, reactivate the
 existing ROAR environment rather than reinstalling ROAR.
@@ -53,13 +53,13 @@ For a new GUI environment, run this from the checkout root in a bash terminal:
 ```sh
 python3.10 -m venv "$HOME/roar-gui"
 . "$HOME/roar-gui/bin/activate"
-python -m pip install --upgrade pip
-python -m pip install -e '.[gui]'
-python -m roar_api --check-setup
-python -m roar_api
+python3 -m pip install --upgrade pip
+python3 -m pip install -e '.[gui]'
+python3 -m roar_api --check-setup
+python3 -m roar_api
 ```
 
-Use `python -m roar_api --check-setup` in an existing environment too. It checks
+Use `python3 -m roar_api --check-setup` in an existing environment too. It checks
 GUI imports and display initialization in a child process, so a Qt startup
 failure is reported without opening ROAR. It also checks ALIGN when paths are
 saved in **ALIGN settings** or supplied through `ROAR_ALIGN_PYTHON` and
@@ -70,18 +70,18 @@ It does not install packages, change settings or create placement runs.
 Under WSL, use WSL2 with a working WSLg desktop connection; follow Microsoft's
 [Linux GUI application setup](https://learn.microsoft.com/en-us/windows/wsl/tutorials/gui-apps).
 Launch from that Ubuntu terminal so its `DISPLAY`/`WAYLAND_DISPLAY` are available.
-If the Wayland/OpenGL path fails, try `QT_QPA_PLATFORM=xcb python -m roar_api`.
+If the Wayland/OpenGL path fails, try `QT_QPA_PLATFORM=xcb python3 -m roar_api`.
 An SSH or container session also needs display access to show the editor.
 
 | Startup problem | What to do |
 | --- | --- |
-| `No module named 'PyQt6'` or another GUI package | Activate the GUI environment and install `.[gui]` with that environment's `python -m pip`. |
+| `No module named 'PyQt6'` or another GUI package | Activate the GUI environment and install `.[gui]` with that environment's `python3 -m pip`. |
 | `ImportError: libEGL.so.1` or another missing `.so` | Install the native runtime packages above. Reinstalling PyQt6 into the venv does not supply these system libraries. |
 | Qt cannot load `xcb` or connect to the display | Run the setup checker; check both the native packages and desktop/WSLg connection. |
 | The checker reports `offscreen` or `minimal` | Only a headless Qt check ran. Remove that `QT_QPA_PLATFORM` override and rerun from the desktop terminal to check visible windows. |
 
 For a direct import diagnostic, run
-`python -c 'from PyQt6.QtWidgets import QApplication; print("Qt widgets import OK")'`.
+`python3 -c 'from PyQt6.QtWidgets import QApplication; print("Qt widgets import OK")'`.
 `QT_QPA_PLATFORM=offscreen` is useful for automated tests but does not repair
 missing EGL/xcb libraries or provide an interactive desktop.
 
@@ -635,7 +635,7 @@ dependencies apart from ROAR, but is not an operating-system security sandbox.
 After installing the GUI extra, run:
 
 ```sh
-QT_QPA_PLATFORM=offscreen python -m unittest discover -s src/floorplan/tests -v
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s src/floorplan/tests -v
 ```
 
 The tests cover topology, unit conversion, explicit ROAR mappings, persistence,
@@ -643,7 +643,7 @@ export collisions, invalid input and Qt editing flows. Placement tests cover
 process ownership, cancellation, saved-result reopening, stale inputs, settings
 and browser handoff using isolated subprocesses and mocked browser opening.
 GUI tests skip only when the PyQt6 package is absent. An installed Qt with missing
-native libraries or broken imports fails the check; run `python -m roar_api --check-setup`
+native libraries or broken imports fails the check; run `python3 -m roar_api --check-setup`
 for repair guidance. The core package does not import Qt or ALIGN.
 
 For an independent compatibility check, use a separately installed ALIGN and a

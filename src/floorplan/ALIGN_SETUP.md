@@ -52,7 +52,7 @@ it creates that folder if needed. Optional browser-viewer failures are reported
 as warnings and do not block native previews. The check does not install tools
 or prove that a particular circuit can be placed.
 
-From an activated ROAR environment, `python -m roar_api --check-setup` also
+From an activated ROAR environment, `python3 -m roar_api --check-setup` also
 checks the desktop's native libraries and display, then the configured ALIGN
 paths. It reports errors without opening ROAR or changing installations.
 Missing EGL/OpenGL or xcb libraries belong to the ROAR desktop setup; installing

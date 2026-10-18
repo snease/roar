@@ -4,8 +4,8 @@ This bundle demonstrates a ten-transistor current-mirror OTA using the
 graphical floorplanner and the supported SKY130A ALIGN backend. The sizes are
 synthetic layout examples, not an optimized or simulation-qualified design.
 
-1. Launch ROAR in your existing GUI environment (`python src/roar.py` or
-   `python -m roar_api` from the checkout root; Python 3.10 or newer). Open the
+1. Launch ROAR in your existing GUI environment (`python3 src/roar.py` or
+   `python3 -m roar_api` from the checkout root; Python 3.10 or newer). Open the
    floorplan editor with the layout button in the main header.
 2. Choose **Open floorplan…** and select `cm_ota.roar.floorplan` here.
 3. Use **Captured sizes (no updates)** to keep the companion's saved values.
