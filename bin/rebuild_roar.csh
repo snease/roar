@@ -47,6 +47,8 @@ if ( -d "$roar_home/.appimage-build" ) then
 endif
 
 echo "Rebuilding ROAR environment in $roar_home"
+# This helper deliberately recreates the checkout environment.
+unsetenv VIRTUAL_ENV
 "$roar_home/bin/setup_roar.csh"
 if ( $status != 0 ) then
     echo "ROAR environment rebuild failed." >&2
@@ -69,8 +71,6 @@ if ( $build_appimage ) then
 else
     echo "To launch ROAR:"
     echo "  cd $roar_home"
-    echo "  source .venv/bin/activate.csh"
-    echo "  source roar_env.csh"
     echo "  ./bin/roar"
 endif
 

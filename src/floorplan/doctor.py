@@ -18,10 +18,11 @@ try:
 except ImportError:
     pass
 try:
-    from PyQt6.QtCore import QSettings
-    settings = QSettings("ROAR", "FloorplanALIGN")
-    print("ROAR_SETTINGS " + json.dumps({key: settings.value(key) for key in
-          ("python", "backend_path", "run_root") if settings.contains(key)}), flush=True)
+    if '--gui-only' not in sys.argv:
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("ROAR", "FloorplanALIGN")
+        print("ROAR_SETTINGS " + json.dumps({key: settings.value(key) for key in
+              ("python", "backend_path", "run_root") if settings.contains(key)}), flush=True)
     for module in ("PyQt6.QtWidgets", "PyQt6.Qsci", "pyqtgraph.opengl", "jedi",
                    "colorama", "qdarktheme", "kiwisolver"):
         importlib.import_module(module)
@@ -77,16 +78,24 @@ def _check_runs(path):
     return root
 
 
-def check_setup(*, output=None):
-    """Print actionable checks and return 0 when all configured checks pass."""
+def check_setup(*, output=None, gui_only=False, quiet=False):
+    """Return 0 on success; optionally check only GUI and print only failures.
+
+    Qt initializes in a child so a missing platform plugin or display cannot
+    abort the launcher. Ordinary startup ignores optional ALIGN configuration.
+    """
     output = output or sys.stdout
     def report(level, message):
-        print(f'{level}: {message}', file=output)
+        if not quiet or level in ('FAIL', 'FIX'):
+            print(f'{level}: {message}'.replace('\u2192', '->'), file=output)
     report('PASS', f'Python {platform.python_version()} ({sys.executable})')
     settings = {}
     failed = False
     try:
-        child = _run([sys.executable, '-I', '-B', '-c', _QT_CHECK])
+        command = [sys.executable, '-I', '-B', '-c', _QT_CHECK]
+        if gui_only:
+            command.append('--gui-only')
+        child = _run(command)
         settings = _record(child.stdout, 'ROAR_SETTINGS ') or {}
         gui = _record(child.stdout, 'ROAR_GUI ')
         if gui and gui.get('ok') and child.returncode == 0:
@@ -100,25 +109,44 @@ def check_setup(*, output=None):
         else:
             failed = True
             detail = gui.get('error') if gui else (child.stderr.strip() or f'Qt child exited with code {child.returncode}')
-            report('FAIL', 'GUI startup: ' + str(detail)[-2500:])
+            # Qt emits several paragraphs before aborting. Keep the useful
+            # cause visible without repeating its generic crash instructions.
+            lines = [line.strip() for line in str(detail).splitlines() if line.strip()
+                     and not line.startswith(('Available platform plugins are:',
+                                              'This application failed to start'))]
+            display_lines = [line for line in lines if 'could not connect to display' in line.lower()]
+            if display_lines:
+                # Qt also suggests xcb-cursor0 when the plugin merely cannot
+                # reach the display; avoid recommending the wrong repair.
+                lines = display_lines
+            report('FAIL', 'GUI startup: ' + ' '.join(lines[:3])[:1200])
             if gui and gui.get('missing_module'):
                 report('FIX', "Activate the ROAR environment and run python3 -m pip install -e '.[gui]' from the checkout root.")
             display_unavailable = 'could not connect to display' in str(detail).lower()
-            if (not gui or '.so' in str(detail)) and not display_unavailable and sys.platform == 'linux':
+            unknown_platform = 'could not find the qt platform plugin' in str(detail).lower()
+            if (not gui or '.so' in str(detail)) and not display_unavailable and not unknown_platform and sys.platform == 'linux':
                 report('FIX', 'For Ubuntu 22.04, install the desktop runtime libraries: sudo apt install ' + _UBUNTU_LIBRARIES)
             if 'ROAR_IMPORTS ready' in child.stdout:
+                if unknown_platform:
+                    report('FIX', 'Remove the QT_QPA_PLATFORM override or select an installed Qt platform plugin.')
                 report('FIX', 'Launch from a desktop terminal with a working DISPLAY or WAYLAND_DISPLAY. '
                        'On WSL use WSL2 with WSLg; if Wayland/OpenGL fails, try QT_QPA_PLATFORM=xcb python3 -m roar_api. '
                        'QT_QPA_PLATFORM=offscreen is only a headless check.')
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
+        failed = True
+        report('FAIL', f'GUI check timed out after {error.timeout} seconds. Check your desktop session and retry --check-gui.')
+    except OSError as error:
         failed = True
         report('FAIL', f'GUI check could not complete: {error}. Check the selected Python and desktop session.')
+
+    if gui_only:
+        return int(failed)
 
     python = settings.get('python', os.environ.get('ROAR_ALIGN_PYTHON', ''))
     backend = settings.get('backend_path', os.environ.get('ROAR_ALIGN_PDK_FIXED', ''))
     if not python and not backend:
         report('INFO', 'ALIGN is not configured; it is optional for authoring and export. '
-               'For placement, follow ALIGN settings → Setup help.')
+               'For placement, follow ALIGN settings -> Setup help.')
     elif not python or not backend:
         failed = True
         report('FAIL', 'ALIGN configuration is incomplete. Set both ALIGN Python and ALIGN backend folder in ALIGN settings, '
@@ -148,7 +176,7 @@ def check_setup(*, output=None):
                 failed = True
                 detail = result.get('message') if result else (child.stderr.strip() or child.stdout.strip() or f'Worker exited with code {child.returncode}')
                 report('FAIL', 'ALIGN: ' + str(detail)[-2500:])
-                report('FIX', 'Check the separate Python and pinned SKY130_PDK folder in ALIGN settings → Setup help.')
+                report('FIX', 'Check the separate Python and pinned SKY130_PDK folder in ALIGN settings -> Setup help.')
         except (OSError, subprocess.TimeoutExpired) as error:
             failed = True
             report('FAIL', f'ALIGN check could not complete: {error}. Check the Python path in ALIGN settings.')

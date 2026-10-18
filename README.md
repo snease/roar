@@ -7,8 +7,8 @@ The Robust and Optimal Analog Reuse (ROAR) flow/tool is developed to enable a GU
 ## Requirements
 
 - **Python 3.10** or newer
-- **tcsh** or **csh** shell
-- Linux/Unix environment (tested on Rocky Linux, CentOS, Ubuntu)
+- **Bash** for the setup script
+- A Linux desktop environment with Qt/OpenGL system libraries
 
 **Compatibility requirement:** ROAR must remain compatible with Python 3.11.
 Preserve that support when changing code, dependencies or installation scripts.
@@ -18,8 +18,9 @@ ROAR and ALIGN do not need to use the same Python version.
 ## Python API
 
 See the [Python API guide](docs/PYTHON_API.md) for headless design editing,
-evaluation/exports, and live GUI sessions. Install with `pip install -e .`
-(headless) or `pip install -e '.[gui]'` (desktop).
+evaluation/exports, and live GUI sessions. In an activated Python environment,
+install the headless API with `python3 -m pip install -e .`. For the desktop,
+use the setup command below, which also checks native prerequisites.
 
 The header's layout button opens the [graphical floorplanner](docs/FLOORPLANNING.md)
 for sketching placement intent and inspecting generated ALIGN placements side by side.
@@ -29,67 +30,42 @@ and saved floorplan project.
 
 ## Install
 
-```tcsh
+```sh
 git clone https://github.com/alecadair/roar.git
 cd roar
-make install
+./bin/setup_roar.sh
 ```
 
-This will:
-1. Create a Python virtual environment (`.venv`)
-2. Install all dependencies from `requirements.txt`
-3. Generate the ROAR environment configuration file
+Setup creates the checkout's `.venv`, installs ROAR and its GUI dependencies,
+and checks that the GUI can start. If a virtual environment is already active,
+setup uses that environment instead. A failed check stops setup and reports
+what needs attention.
+
+On Ubuntu 22.04, setup offers to install the required native packages with
+`apt` after explicit confirmation in the terminal. On other distributions,
+install the corresponding Qt/OpenGL system packages separately. Run setup
+from a desktop session so it can check display access.
+
+The setup flow has not yet been verified end to end on a fresh OS installation.
 
 ## Run
 
-ROAR requires the Python virtual environment and shell environment to be activated before running:
-
-```tcsh
-cd roar
-source .venv/bin/activate.csh
-source roar_env.csh
+```sh
 ./bin/roar
 ```
 
-Or use the convenience launcher that handles activation automatically:
+The launcher uses the active virtual environment, or the checkout's `.venv`
+when none is active. Activation, sourcing `roar_env.csh`, and tcsh are not
+required. The older `setup_roar.csh` and `run_roar.csh` entry points remain
+compatibility wrappers.
 
-```tcsh
-./bin/run_roar.csh
-```
+To choose Python 3.11 when creating a new environment, run
+`./bin/setup_roar.sh --python python3.11`. For a CAD-managed runtime whose
+native libraries are provided separately, use
+`./bin/setup_roar.sh --skip-system-packages`; GUI verification still runs.
 
-**Important:** You must run these commands in **tcsh** or **csh**, not bash or sh.
-
-## Manual Install
-
-If you prefer to set up manually:
-
-```tcsh
-cd /path/to/roar
-./bin/setup_roar.csh
-```
-
-Then to run:
-
-```tcsh
-source .venv/bin/activate.csh
-source roar_env.csh
-./bin/roar
-```
-
-## Virtual Environment
-
-The virtual environment is created in `.venv/` during installation. It contains all Python dependencies for ROAR. You must activate it before running:
-
-```tcsh
-source .venv/bin/activate.csh
-```
-
-If you move the installation directory, the virtual environment should be recreated:
-
-```tcsh
-rm -rf .venv
-make install
-```
+See [Installation and Usage](docs/INSTALLATION_AND_USAGE.md) for setup options
+and troubleshooting.
 
 ## Disclaimer
 

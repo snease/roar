@@ -11,20 +11,16 @@ if [ -z "${ROAR_HOME:-}" ]; then
     export ROAR_HOME
 fi
 
-if [ -z "${VIRTUAL_ENV:-}" ]; then
-    echo "ROAR requires an active Python virtual environment." >&2
-    echo "Run: source \"$ROAR_HOME/.venv/bin/activate.csh\"" >&2
-    exit 1
-fi
-
-PYTHON_BIN="$VIRTUAL_ENV/bin/python3"
+# Prefer an explicitly active environment; otherwise use the checkout's setup.
+PYTHON_BIN="${VIRTUAL_ENV:-$ROAR_HOME/.venv}/bin/python3"
 if [ ! -x "$PYTHON_BIN" ]; then
-    echo "Missing Python interpreter in virtual environment: $PYTHON_BIN" >&2
+    printf 'Missing Python interpreter: %s\n' "$PYTHON_BIN" >&2
+    echo "Run bin/setup_roar.sh from the ROAR checkout to set it up." >&2
     exit 1
 fi
 
 # Optional fallback for systems that hit Qt symbol-mismatch errors.
-# Enable only when needed: setenv ROAR_FORCE_VENV_QT 1
+# Enable only when needed: ROAR_FORCE_VENV_QT=1 bin/roar
 if [ "${ROAR_FORCE_VENV_QT:-0}" = "1" ]; then
     PYQT6_QT_LIB_DIR=$(
         "$PYTHON_BIN" -c 'import pathlib, PyQt6; print(pathlib.Path(PyQt6.__file__).resolve().parent / "Qt6" / "lib")' 2>/dev/null || true
@@ -36,34 +32,6 @@ if [ "${ROAR_FORCE_VENV_QT:-0}" = "1" ]; then
             export LD_LIBRARY_PATH="$PYQT6_QT_LIB_DIR"
         fi
     fi
-fi
-
-# Ensure ROAR has a discoverable desktop entry/icon for dash/taskbar matching.
-XDG_DATA_HOME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
-APP_DIR="$XDG_DATA_HOME_DIR/applications"
-ICON_DIR="$XDG_DATA_HOME_DIR/icons/hicolor/256x256/apps"
-DESKTOP_FILE="$APP_DIR/roar.desktop"
-ICON_FILE="$ICON_DIR/roar.png"
-
-mkdir -p "$APP_DIR" "$ICON_DIR"
-cp "$ROAR_HOME/images/png/ROAR_ICON.png" "$ICON_FILE"
-
-cat > "$DESKTOP_FILE" <<EOF
-[Desktop Entry]
-Type=Application
-Version=1.0
-Name=ROAR
-Comment=Launch the ROAR analog design GUI
-Exec=$ROAR_HOME/bin/roar
-Icon=roar
-Terminal=false
-Categories=Development;Electronics;
-StartupNotify=true
-StartupWMClass=ROAR
-EOF
-
-if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
 fi
 
 exec "$PYTHON_BIN" "$ROAR_HOME/src/roar.py" "$@"

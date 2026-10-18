@@ -8,10 +8,10 @@ newer** is required. Its implementation is in [roar_api/design.py](../roar_api/d
 
 ## Installation, imports, and assets
 
-From a checkout, install the headless API with `pip install -e .`. For desktop
-Qt plots, use `pip install -e '.[gui]'`. These editable installations do not
-require the csh launchers; the existing desktop installation instructions are
-in [INSTALLATION_AND_USAGE.md](INSTALLATION_AND_USAGE.md).
+From a checkout and an activated Python environment, install the headless API
+with `python3 -m pip install -e .`. For the desktop, use `./bin/setup_roar.sh`;
+it installs the GUI extra and checks native dependencies and display access.
+See [INSTALLATION_AND_USAGE.md](INSTALLATION_AND_USAGE.md) for setup options.
 
 ```python
 from pathlib import Path

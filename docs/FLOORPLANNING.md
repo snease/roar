@@ -12,8 +12,8 @@ primitive variants and physical dimensions. Only explicit native constraints
 are sent to ALIGN. Dragging, snapping and drawing groups save your drawing
 without changing generation inputs or making a physical result stale.
 
-The editor uses ROAR's existing Qt interface and netlist parser. Install ROAR
-with `pip install -e '.[gui]'` after the desktop prerequisites below. ALIGN,
+The editor uses ROAR's existing Qt interface and netlist parser. Set up ROAR
+with `./bin/setup_roar.sh` from the checkout, then launch `./bin/roar`. ALIGN,
 Xschem, Magic and a PDK are not required to author or export a project. Generating placement needs
 a separate ALIGN installation and the tested SKY130 ALIGN backend on Linux or
 WSL. The Python API works with the headless installation, `pip install -e .`.
@@ -27,9 +27,29 @@ existing ROAR environment rather than reinstalling ROAR.
 
 ## Set up the ROAR desktop
 
-The tested desktop baseline is Ubuntu 22.04 x86-64, Python 3.10 and PyQt6 6.8,
-including Ubuntu under WSL2. Python 3.11 is also a required ROAR compatibility
-target; this branch's desktop validation used Python 3.10. The separate
+From the checkout root, use:
+
+```sh
+./bin/setup_roar.sh && ./bin/roar
+```
+
+On Ubuntu 22.04, setup detects missing native libraries and offers to install
+them with `apt` after confirmation. It creates the checkout's `.venv`, or uses
+your already active virtual environment, installs the GUI extra and verifies
+startup. A failed step stops with repair guidance. The launcher selects the
+same environment; the checkout's `.venv` needs no activation or shell setup.
+An external environment must be activated again in each new terminal.
+
+Use `./bin/setup_roar.sh --python python3.11` to select an installed interpreter
+when creating a new environment. Existing environments are preserved. CAD-managed
+systems can use `--skip-system-packages` when administrators supply the native
+libraries; the final GUI check still runs. Other distributions require their
+native dependencies to be installed separately.
+
+The tested desktop baseline is Ubuntu 22.04 x86-64 and PyQt6 6.8, including
+Ubuntu under WSL2. Setup and the floorplan suite passed on Python 3.10.12 and
+3.11.16 with supplied native libraries; Python 3.11 remains a required ROAR
+compatibility target. The separate
 ALIGN environment can remain on its tested Python 3.10 while ROAR runs on 3.11.
 A Python virtual environment contains Python
 packages and Qt's bundled libraries; the operating system supplies EGL/OpenGL,
@@ -48,22 +68,27 @@ sudo apt install python3.10 python3.10-venv \
   libxcb-sync1 libxcb-xfixes0 libxcb-xkb1
 ```
 
-For a new GUI environment, run this from the checkout root in a bash terminal:
+For a manually managed GUI environment, run this from the checkout root in a
+bash terminal after installing those prerequisites:
 
 ```sh
-python3.10 -m venv "$HOME/roar-gui"
+python3 -m venv "$HOME/roar-gui"
 . "$HOME/roar-gui/bin/activate"
 python3 -m pip install --upgrade pip setuptools wheel
 python3 -m pip install -e '.[gui]'
-python3 -m roar_api --check-setup
-python3 -m roar_api
+python3 -m roar_api --check-gui && python3 -m roar_api
 ```
 
 Activate that environment again in each new terminal with
 `. "$HOME/roar-gui/bin/activate"` before installing or launching. If pip says
 `Defaulting to user installation`, the virtual environment is not active.
 
-Use `python3 -m roar_api --check-setup` in an existing environment too. It checks
+Normal startup checks the GUI before opening the application; missing libraries
+or display failures produce repair guidance instead of a Qt crash or traceback.
+Use `./bin/roar --check-gui` to run that check alone. ALIGN is optional and is
+never checked during ordinary desktop startup.
+
+Use `python3 -m roar_api --check-setup` for a complete diagnostic. It checks
 GUI imports and display initialization in a child process, so a Qt startup
 failure is reported without opening ROAR. It also checks ALIGN when paths are
 saved in **ALIGN settings** or supplied through `ROAR_ALIGN_PYTHON` and
@@ -637,7 +662,7 @@ dependencies apart from ROAR, but is not an operating-system security sandbox.
 
 ## Checks
 
-After installing the GUI extra, run:
+After installing the GUI extra and native prerequisites, run from its environment:
 
 ```sh
 QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s src/floorplan/tests -v
@@ -650,6 +675,20 @@ and browser handoff using isolated subprocesses and mocked browser opening.
 GUI tests skip only when the PyQt6 package is absent. An installed Qt with missing
 native libraries or broken imports fails the check; run `python3 -m roar_api --check-setup`
 for repair guidance. The core package does not import Qt or ALIGN.
+
+The venv-based validation used Python 3.10 and 3.11 and a separately provisioned
+native-library directory via `LD_LIBRARY_PATH`; automated GUI tests used Qt's offscreen platform.
+A fresh venv verified Python package installation, not a fresh operating-system
+installation. A separate WSL display check also used those native libraries.
+The guided setup's clean-OS installation remains unverified: the available Docker
+daemon requires administrator access. Neither the offscreen tests nor a fresh
+venv alone establish that an ordinary desktop installation is ready.
+
+A separate Pixi feasibility trial passed the suite on Python 3.11.17, visible
+X11 startup and a real OTA preview using managed native libraries without the
+private library directory or system package installation. That trial ran on the
+same Ubuntu/WSLg host; it does not establish support for other distributions.
+Pixi is not yet a requirement of this checkout.
 
 For an independent compatibility check, use a separately installed ALIGN and a
 SKY130 ALIGN PDK directory containing `models.sp`:
