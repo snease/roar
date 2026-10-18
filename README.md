@@ -10,6 +10,11 @@ The Robust and Optimal Analog Reuse (ROAR) flow/tool is developed to enable a GU
 - **tcsh** or **csh** shell
 - Linux/Unix environment (tested on Rocky Linux, CentOS, Ubuntu)
 
+**Compatibility requirement:** ROAR must remain compatible with Python 3.11.
+Preserve that support when changing code, dependencies or installation scripts.
+The separate ALIGN environment currently uses a tested Python 3.10 setup;
+ROAR and ALIGN do not need to use the same Python version.
+
 ## Python API
 
 See the [Python API guide](docs/PYTHON_API.md) for headless design editing,

@@ -28,7 +28,10 @@ existing ROAR environment rather than reinstalling ROAR.
 ## Set up the ROAR desktop
 
 The tested desktop baseline is Ubuntu 22.04 x86-64, Python 3.10 and PyQt6 6.8,
-including Ubuntu under WSL2. A Python virtual environment contains Python
+including Ubuntu under WSL2. Python 3.11 is also a required ROAR compatibility
+target; this branch's desktop validation used Python 3.10. The separate
+ALIGN environment can remain on its tested Python 3.10 while ROAR runs on 3.11.
+A Python virtual environment contains Python
 packages and Qt's bundled libraries; the operating system supplies EGL/OpenGL,
 X11/xcb libraries and the display server. Installing the GUI extra does not
 install those system components. For other Linux distributions, use their
