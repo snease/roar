@@ -87,9 +87,11 @@ class HandoffTests(unittest.TestCase):
 
     def test_earlier_candidate_keeps_its_original_inputs_and_selected_variant(self):
         self.project.set_device_labels({'M1': '<b>Captured role</b>'})
+        self.project.set_constraints([{'constraint': 'Order', 'instances': ['M1', 'M2'], 'direction': 'left_to_right'}])
         preview, state = self.captured_preview()
         self.project.set_parameter('width', 2, dimension_unit='um', width_convention='per_finger')
         self.project.set_device_labels({'M1': 'Current role'})
+        self.project.set_constraints([{'constraint': 'Order', 'instances': ['M2', 'M1'], 'direction': 'left_to_right'}])
         before = deepcopy(preview)
         path = export_handoff(self.project, self.root / 'earlier.zip', preview=preview, state=state, candidate_index=1)
         with zipfile.ZipFile(path) as archive:
@@ -112,6 +114,12 @@ class HandoffTests(unittest.TestCase):
             self.assertIn(b'EARLIER INPUTS', archive.read('index.html'))
             self.assertIn('Width × height: 4 × 2 µm'.encode(), archive.read('index.html'))
             self.assertIn(b'Current role', archive.read('index.html'))
+            current, captured = archive.read('index.html').split(b'<h2>Captured devices</h2>')
+            self.assertIn(b'<td>Current role</td><td>sky130_fd_pr__nfet_01v8</td><td>2</td>', current)
+            self.assertIn(b'<td>&lt;b&gt;Captured role&lt;/b&gt;</td><td>sky130_fd_pr__nfet_01v8</td><td>1</td>', captured)
+            self.assertIn(b'<h2>Captured placement constraints</h2>', captured)
+            self.assertIn(b'[&quot;M1&quot;, &quot;M2&quot;]', captured)
+            self.assertIn(b'[&quot;M2&quot;, &quot;M1&quot;]', current)
             self.assertIn(b'&lt;b&gt;Captured role&lt;/b&gt;', archive.read('placement/placement.svg'))
             self.assertIn('PAIR_1 — 4 × 2 µm'.encode(), archive.read('placement/placement.svg'))
         self.assertEqual(preview, before)

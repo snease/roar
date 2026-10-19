@@ -4,8 +4,7 @@ This bundle demonstrates a ten-transistor current-mirror OTA using the
 graphical floorplanner and the supported SKY130A ALIGN backend. The sizes are
 synthetic layout examples, not an optimized or simulation-qualified design.
 
-1. Launch ROAR in your existing GUI environment (`python3 src/roar.py` or
-   `python3 -m roar_api` from the checkout root; Python 3.10 or newer). Open the
+1. After running `./bin/setup_roar.sh`, launch `./bin/roar` from the checkout root. Open the
    floorplan editor with the layout button in the main header.
 2. Choose **Open floorplan…** and select `cm_ota.roar.floorplan` here.
 3. Use **Captured sizes (no updates)** to keep the companion's saved values.
@@ -17,8 +16,9 @@ synthetic layout examples, not an optimized or simulation-qualified design.
    it in **Constraints**. Dragging and snapping alone create no native rules;
    **Group for drawing…** only moves labeled members together. Undo, then
    **Save as…** and reopen to check your saved arrangement.
-5. To generate physical geometry, open **Placement → ALIGN settings…**, choose
-   the separate ALIGN Python and supported backend, and use **Test installation**.
+5. To generate physical geometry, open **Placement → ALIGN settings…** and use
+   **Test installation**. Managed setup already selects the separate ALIGN Python
+   and supported backend.
    Choose **Generate preview** on **Floorplan** to compare a physical candidate
    beside the sketch. No browser is opened. Inspect dimensions, select a source
    device, and choose a net under **Connections**.
@@ -52,3 +52,5 @@ moving the bundle; their association uses a relative path.
 
 See the [floorplanning guide](../../../docs/FLOORPLANNING.md) for setup,
 constraint semantics, supported inputs, and the Python API.
+For an existing custom GUI environment, launch with `python3 -m roar_api` instead
+and configure its separate ALIGN Python and supported backend in ALIGN settings.

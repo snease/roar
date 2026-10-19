@@ -552,7 +552,9 @@ are not needed to reopen it. Live bindings are frozen for the recipient.
 When a physical candidate is included, its normalized geometry, drawing and
 original captured input set travel together. An **Earlier inputs** result stays
 separate from the current design; the report identifies the mismatch. If the
-original captured inputs are missing, export reports the problem rather than
+candidate is stale, the browser summary also shows its captured device sizes and
+constraints beside the physical drawing. If the original captured inputs are
+missing, export reports the problem rather than
 pairing the placement with current inputs. You can still export current inputs
 by clearing **Include displayed physical candidate**.
 

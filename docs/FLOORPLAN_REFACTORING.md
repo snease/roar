@@ -232,33 +232,14 @@ organization) and `INSTALLATION_AND_USAGE.md` (runtime maintenance).
 
 ## Validation and evidence
 
-Independent review after major batches found and resolved the issues noted above;
-its final reviewed scope has no remaining findings. Final checks:
+Run the checks documented in [FLOORPLANNING.md](FLOORPLANNING.md), including the
+unit/Qt suite, native placement/viewer acceptance and installed-wheel check.
+Visible desktop/OpenGL acceptance is separate from offscreen CI validation.
+Each check prints its receipt location; retain logs with the tested commit SHA
+and environment. CI uploads the `runtime-validation` artifact with seven-day
+retention. Local temporary paths are not durable evidence for other reviewers.
 
-- Full suite: **354 tests; 353 passed, one expected skip** (host already supplies
-  native Qt libraries, so the missing-library scenario is unavailable).
-- Native preview, explicit viewer opening, real Dash callbacks and access-control
-  checks: passed.
-- Installed wheel in the GUI/ALIGN-free environment: passed core API and actionable
-  missing-GUI launch checks.
-- Visible WSL desktop/OpenGL: passed via verified X11 fallback after Wayland failed.
-- Managed configuration/readiness refreshed using installed runtimes/assets;
-  ordinary `./bin/roar --help` passed. No desktop preferences changed.
-- `git diff --check`: passed.
-- After isolating an unrelated graph-layout callback in the minimal document
-  test window, all 25 document-integrity tests passed without that stray callback
-  error. Production document behavior is still exercised by the real workspace.
-
-Receipts:
-
-- `/tmp/roar-check-floorplan-pu0gzgg1/receipt.json`
-- `/tmp/roar-check-align-viewer-9hjl_gdc/receipt.json`
-- `/tmp/roar-check-gui-y4o858pa/receipt.json`
-- `/tmp/roar-check-package-g95g1mz9/receipt.json`
-
-Temporary per-test audit artifacts (354/354 current names accounted for):
-`/tmp/roar-domain-audit-f_8pgwi4/test-dispositions.csv`,
-`/tmp/roar-runner-necessity-audit.csv`, `/tmp/roar-runtime-necessity-audit.csv`, and
-`/tmp/roar-root-necessity-audit.csv`. These are investigation evidence, not CI
-inputs or another maintained framework. Initial execution mapping remains at
-`/tmp/roar-test-reachability-tgtrs3le/`.
+For committed PR changes, use `git diff --check origin/main...HEAD`; for pending
+edits, also use `git diff --check`. The captured native `layers.json` fixture
+retains upstream whitespace and is verified against its provenance hashes.
+Treat those fixture warnings separately from whitespace introduced in source.

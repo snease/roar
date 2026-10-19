@@ -87,7 +87,7 @@ def _table(headers, rows):
                                             for row in rows) + '</tbody></table>')
 
 
-def _intent_summary(project):
+def _intent_summary(project, label='Current'):
     labels = project.device_labels
     devices = []
     for device in project.devices:
@@ -102,10 +102,10 @@ def _intent_summary(project):
                     json.dumps({key: value for key, value in rule.items() if key != 'constraint'},
                                ensure_ascii=False, sort_keys=True, allow_nan=False)]
                    for index, (rule, enabled) in enumerate(zip(project.constraints, project._constraint_flags()), 1)]
-    return ('<h2>Current devices</h2><p>W is per finger; W and L are in micrometres. '
+    return (f'<h2>{_text(label)} devices</h2><p>W is per finger; W and L are in micrometres. '
             'Resistance uses SPICE notation.</p>' +
             _table(('Instance', 'Role', 'Model', 'W / finger (µm)', 'L (µm)', 'NF', 'M / resistance', 'Terminals'), devices) +
-            '<h2>Current placement constraints</h2>' +
+            f'<h2>{_text(label)} placement constraints</h2>' +
             (_table(('Row', 'State', 'Kind', 'Settings'), constraints) if constraints else '<p>No placement constraints.</p>'))
 
 
@@ -229,6 +229,8 @@ def export_handoff(project, destination, *, preview=None, state=None, candidate_
             physical = (f'<h2>Captured physical candidate: {_text(candidate["name"])}</h2>'
                         f'<p>Width × height: {_text(dimensions)}. Physical coordinates have y pointing up.</p>'
                         f'<p>{_text(mapping_note)}</p><img src="placement/placement.svg" alt="Captured physical placement">')
+            if stale:
+                physical += _intent_summary(captured, 'Captured')
             manifest['placement'] = {'candidate': candidate['name'], 'captured_fingerprint': captured_fingerprint,
                                      'earlier_inputs': earlier, 'stale': stale,
                                      'floorplan': 'placement/floorplan.roar.floorplan',
