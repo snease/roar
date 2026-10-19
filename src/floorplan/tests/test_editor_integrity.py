@@ -372,11 +372,12 @@ class EditorIntegrityTests(unittest.TestCase):
         self.dialog.set_project(project, design=self.source, source_origin="live")
         for failure in ("cancel", "companion"):
             with self.subTest(failure=failure), \
-                 patch.object(QFileDialog, "getSaveFileName", side_effect=[(str(target), ""), ("", "")]), \
+                 patch.object(QFileDialog, "getSaveFileName", side_effect=[(str(target), ""),
+                     (str(self.root / 'pair.roar.floorplan') if failure == 'companion' else '', '')]), \
                  patch.object(QMessageBox, "warning"), \
                  patch.object(QMessageBox, "information") as success:
                 if failure == "companion":
-                    with patch.object(self.dialog, "_save_project", side_effect=OSError("unwritable companion")):
+                    with patch.object(FloorplanProject, "save", side_effect=OSError("unwritable companion")):
                         window.save_app_state()
                 else:
                     window.save_app_state()
@@ -427,7 +428,7 @@ class EditorIntegrityTests(unittest.TestCase):
         self.assertEqual(FloorplanProject.load(companion).roar_project_path, str(saved_as))
         self.assertEqual(Design.load(saved_as).get_instance_parameters()["input_pair"]["W"]["value"], 12e-6)
 
-    def test_failed_design_commit_preserves_destination_and_keeps_companion_retryable(self):
+    def test_failed_design_commit_preserves_companion_bytes_and_discard_baseline(self):
         window = self._main_window()
         self.addCleanup(self._close_main_window, window)
         previous, target = self.root / "old.roar", self.root / "new.roar"
@@ -436,7 +437,11 @@ class EditorIntegrityTests(unittest.TestCase):
         project = FloorplanProject.from_text(CIRCUIT)
         project.roar_project_path = str(previous)
         self.dialog.set_project(project, companion, self.source, "live")
-        target.write_text("existing destination")
+        self.dialog._save_project()
+        companion_bytes = companion.read_bytes()
+        Design().add_instance('other', W=9e-6, L=.15e-6, NF=2).save(target)
+        target_bytes = target.read_bytes()
+        self.dialog.devices_table.item(0, 3).setText('3')
         replace = os.replace
         def fail_design_replace(source, destination):
             if Path(destination) == target:
@@ -449,14 +454,153 @@ class EditorIntegrityTests(unittest.TestCase):
             window.save_app_state()
         error.assert_called_once()
         success.assert_not_called()
-        self.assertEqual(target.read_text(), "existing destination")
+        self.assertEqual(target.read_bytes(), target_bytes)
+        self.assertEqual(companion.read_bytes(), companion_bytes)
         self.assertEqual(window.floorplan_workspace().path, str(previous))
         self.assertEqual(self.dialog.project.roar_project_path, str(previous))
         self.assertTrue(self.dialog._dirty)
         self.dialog._ensure_current_source()
         self.assertEqual(list(self.root.glob(".new.roar.*")), [])
-        self.assertTrue(self.dialog.save_for_application())
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Discard):
+            self.assertTrue(self.dialog.confirm_unsaved('close this floorplan', discard=True))
+        self.assertFalse(self.dialog._dirty)
+        self.assertEqual(self.dialog.project.roar_project_path, str(previous))
+        self.assertEqual(self.dialog.project.devices[0].width_um, 2)
         self.assertEqual(FloorplanProject.load(companion).roar_project_path, str(previous))
+
+    def test_failed_first_design_save_removes_new_companion_and_can_retry(self):
+        window = self._main_window()
+        self.addCleanup(self._close_main_window, window)
+        self.dialog.set_project(FloorplanProject.from_text(CIRCUIT), design=self.source, source_origin='live')
+        target, companion = self.root / 'first.roar', self.root / 'first.roar.floorplan'
+        replace = os.replace
+        def fail_design_replace(source, destination):
+            if Path(destination) == target:
+                raise OSError('design destination unavailable')
+            return replace(source, destination)
+        with patch.object(QFileDialog, 'getSaveFileName', side_effect=[(str(target), ''), (str(companion), '')]), \
+             patch('roar_api.floorplan.workspace.os.replace', side_effect=fail_design_replace), \
+             patch.object(QMessageBox, 'critical'):
+            window.save_app_state()
+        self.assertFalse(target.exists())
+        self.assertFalse(companion.exists())
+        self.assertIsNone(self.dialog.project_path)
+        self.assertIsNone(self.dialog.project.roar_project_path)
+        self.assertIsNone(window.floorplan_workspace().path)
+        with patch.object(QFileDialog, 'getSaveFileName', side_effect=[(str(target), ''), (str(companion), '')]), \
+             patch.object(QMessageBox, 'information'):
+            window.save_app_state()
+        self.assertEqual(FloorplanProject.load(companion).roar_project_path, str(target))
+        self.assertFalse(self.dialog._dirty)
+
+    def test_companion_rollback_failure_requires_repair_before_discard(self):
+        window = self._main_window()
+        self.addCleanup(self._close_main_window, window)
+        previous, target = self.root / 'old.roar', self.root / 'new.roar'
+        companion = self.root / 'pair.roar.floorplan'
+        window._record_design_document(previous)
+        project = FloorplanProject.from_text(CIRCUIT)
+        project.roar_project_path = str(previous)
+        self.dialog.set_project(project, companion, self.source, 'live')
+        self.dialog._save_project()
+        replace = os.replace
+        def fail_commit_and_rollback(source, destination):
+            if Path(destination) == target or Path(source).suffix == '.rollback':
+                raise OSError('storage unavailable')
+            return replace(source, destination)
+        with patch('roar_api.floorplan.workspace.os.replace', side_effect=fail_commit_and_rollback):
+            with self.assertRaisesRegex(RuntimeError, 'restoring.*also failed'):
+                window.floorplan_workspace().save_document(target, self.source.to_state())
+        self.assertTrue(self.dialog._dirty)
+        self.assertEqual(self.dialog.project.roar_project_path, str(previous))
+        self.assertEqual(FloorplanProject.load(companion).roar_project_path, str(target))
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Discard) as question:
+            self.assertFalse(self.dialog.confirm_unsaved('close', discard=True))
+        self.assertFalse(question.call_args.args[3] & QMessageBox.StandardButton.Discard)
+        self.assertTrue(self.dialog.save_for_application())
+        self.assertFalse(self.dialog._dirty)
+        self.assertEqual(FloorplanProject.load(companion).roar_project_path, str(previous))
+
+    def test_real_session_document_save_preserves_snapshot_contract_and_saves_companion(self):
+        script = r'''
+import os
+from pathlib import Path
+import sys
+from unittest.mock import patch
+sys.path.insert(0, sys.argv[1])
+root = Path(sys.argv[2])
+for kind in ('CONFIG', 'CACHE', 'DATA', 'STATE'):
+    os.environ['XDG_' + kind + '_HOME'] = str(root / kind.lower())
+from roar_api import Design, Session
+from roar_api.floorplan import FloorplanProject
+from PyQt6.QtWidgets import QFileDialog, QMessageBox
+source = Design().add_instance('pair', W=4e-6, L=.15e-6, NF=2)
+original = source.save(root / 'original.roar')
+session = Session.from_file(original)
+try:
+    workspace = session.app.floorplan_workspace()
+    session.apply(Design().add_instance('pair', W=6e-6, L=.15e-6, NF=2))
+    snapshot = session.save(root / 'snapshot.roar')
+    assert Path(snapshot).is_file()
+    assert workspace.path == str(original) and workspace.is_modified()
+    session.app.header.on_layout_button_clicked()
+    editor = session.app.header._floorplan_dialog
+    project = FloorplanProject.from_text('.subckt pair d g s b\nM1 d g s b nch W=2u L=.15u NF=2\n.ends pair\n')
+    project.roar_project_path = workspace.path
+    editor.set_project(project, design=workspace.snapshot(), source_origin='live')
+    target, companion = root / 'saved.roar', root / 'pair.roar.floorplan'
+    with patch.object(QFileDialog, 'getSaveFileName', side_effect=AssertionError('Unexpected dialog')), \
+         patch.object(QMessageBox, 'warning', side_effect=AssertionError('Unexpected warning')):
+        try:
+            session.save_document(target)
+        except ValueError as error:
+            assert 'companion_path' in str(error)
+        else:
+            raise AssertionError('Unsaved companion needs an explicit path')
+        assert not target.exists() and workspace.path == str(original)
+        assert editor.project.roar_project_path == str(original)
+        assert session.save_document(target, companion_path=companion) == target
+        assert workspace.path == str(target) and not workspace.is_modified()
+        assert FloorplanProject.load(companion).roar_project_path == str(target)
+        assert not editor._dirty
+        editor.devices_table.item(0, 3).setText('3')
+        assert session.save_document() == target
+        assert FloorplanProject.load(companion).devices[0].width_um == 3
+        assert not editor._dirty
+        original_companion = companion.read_bytes()
+        try:
+            session.save_document(companion)
+        except ValueError as error:
+            assert 'different save paths' in str(error)
+        else:
+            raise AssertionError('A document save must not overwrite its companion')
+        assert workspace.path == str(target) and companion.read_bytes() == original_companion
+        failed = root / 'failed.roar'
+        replace = os.replace
+        def fail_design(source, destination):
+            if Path(destination) == failed:
+                raise OSError('cannot commit design')
+            return replace(source, destination)
+        with patch('roar_api.floorplan.workspace.os.replace', side_effect=fail_design):
+            try:
+                session.save_document(failed)
+            except OSError:
+                pass
+            else:
+                raise AssertionError('Expected the write failure to propagate')
+        assert not failed.exists() and workspace.path == str(target)
+        assert companion.read_bytes() == original_companion
+        assert editor.project.roar_project_path == str(target) and not editor._dirty
+finally:
+    editor = session.app._floorplan_editor()
+    if editor is not None:
+        editor._dirty = False
+    session.close()
+'''
+        result = subprocess.run([sys.executable, '-I', '-c', script,
+            str(Path(__file__).resolve().parents[3]), str(self.root)],
+            env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen'}, capture_output=True, text=True, timeout=40)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_checkout_opens_floorplan_without_editable_install(self):
         # A fresh process with the existing GUI dependencies but no editable

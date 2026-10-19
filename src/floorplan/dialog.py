@@ -6,7 +6,7 @@ and MOS width is per finger, independently of the source's width convention.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
@@ -25,7 +25,7 @@ from .constraint_editor import ConstraintEditorDialog, constraint_summary, edita
 from .constraints import FIELDS
 
 from .workspace import load_roar_design
-from .documents import load_document
+from .documents import DocumentRollbackError, document_savepoint, load_document
 
 
 def _floorplan_example_directory():
@@ -410,6 +410,7 @@ class FloorplanDialog(QDialog):
         self.roar_design = None
         self._source_origin = None
         self._dirty = False
+        self._save_recovery = None
         self._rendering = False
         self._syncing_selection = False
         self._undo_states, self._redo_states = [], []
@@ -659,7 +660,7 @@ class FloorplanDialog(QDialog):
                 self._undo_states = self._undo_states[-100:]
                 self._redo_states.clear()
             self._history_current = state
-        self._dirty = self._document_state(state) != self._document_state(self._saved_state)
+        self._dirty = self._save_recovery is not None or self._document_state(state) != self._document_state(self._saved_state)
         self._update_document_title()
         self._update_history_buttons()
         if not automatic and self._source_error and self._source_mode != "saved":
@@ -684,7 +685,7 @@ class FloorplanDialog(QDialog):
             self._rendering = False
         self._refresh_sketch()
         self._history_current = self._editor_state()
-        self._dirty = self._document_state(self._history_current) != self._document_state(self._saved_state)
+        self._dirty = self._save_recovery is not None or self._document_state(self._history_current) != self._document_state(self._saved_state)
         self._update_document_title()
         self._update_history_buttons()
         self.placement_panel.schedule_refresh()
@@ -1379,13 +1380,20 @@ class FloorplanDialog(QDialog):
         self.sketch_panel.view.cancel_drag()
         if not self._dirty:
             return True
+        message = f"Save floorplan changes before you {action}?\nFloorplans are saved in a separate .roar.floorplan file."
+        buttons = QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel
+        if self._save_recovery is None:
+            buttons |= QMessageBox.StandardButton.Discard
+        else:
+            message += f"\nThe previous save could not restore {self._save_recovery}. Save to repair it before continuing."
         answer = QMessageBox.question(
-            self, "Unsaved floorplan edits", f"Save floorplan changes before you {action}?\nFloorplans are saved in a separate .roar.floorplan file.",
-            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            self, "Unsaved floorplan edits", message, buttons,
             QMessageBox.StandardButton.Save)
         if answer == QMessageBox.StandardButton.Save:
             return self.save_for_application()
         if answer == QMessageBox.StandardButton.Discard:
+            if self._save_recovery is not None:
+                return False
             if discard:
                 if self._saved_state is not None:
                     self._restore_editor_state(self._saved_state, refresh_source=False)
@@ -1420,19 +1428,22 @@ class FloorplanDialog(QDialog):
             return False
 
     @contextmanager
-    def saving_design_document(self, path, *, save_companion=False):
+    def saving_design_document(self, path, *, save_companion=False, companion_path=None, interactive=True):
         """Follow Save As only when this floorplan uses the current live document.
 
-        Save the companion before committing the design. If that commit fails,
-        restore the active association; a companion already written stays dirty
-        so a subsequent save can repair its persisted association.
+        Keep companion bytes, run ownership and the saved baseline provisional
+        until the main document commits. Failed saves retain the user's edits.
         """
         previous = self.workspace.path if self.workspace is not None else None
+        for companion in (self.project_path, companion_path):
+            if companion is not None and Path(companion).expanduser().resolve() == Path(path).expanduser().resolve():
+                raise ValueError("The ROAR document and floorplan companion need different save paths.")
         associated = self.project.roar_project_path if self.project is not None else None
         follows_current = (self.project is not None and self._source_mode == "live" and
                            (str(Path(associated).expanduser().resolve()) if associated else None) == previous)
         changed = follows_current and associated != path
         committed = False
+        yielded = False
         source_update_pending = self._source_timer.isActive()
         if changed:
             # A save-path dialog may run Qt's loop while the new association is
@@ -1441,18 +1452,28 @@ class FloorplanDialog(QDialog):
             self.project.roar_project_path = path
             self._record_edit(automatic=True)
         try:
-            if (save_companion or changed) and not self.save_for_application():
+            needs_save = (self._dirty or companion_path is not None
+                          or (self.project is not None and self.project_path is None))
+            saving = (self._saving_project(path=companion_path, interactive=interactive)
+                      if (save_companion or changed) and needs_save else nullcontext(True))
+            try:
+                with saving as ready:
+                    yielded = True
+                    yield ready
+                committed = bool(ready)
+            except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
+                if yielded or not interactive:
+                    raise
+                self.status.setText(str(exc))
+                QMessageBox.warning(self, "Floorplan could not be saved", str(exc))
                 yield False
-                return
-            yield True
-            committed = True
         finally:
             if changed and not committed:
                 self.project.roar_project_path = associated
                 self._record_edit(automatic=True)
             if changed and source_update_pending:
                 self._source_timer.start()
-        if changed:
+        if changed and committed:
             # Undoing a parameter edit must not undo the document's Save As.
             for state in self._undo_states + self._redo_states:
                 project = state["project"]
@@ -1516,24 +1537,46 @@ class FloorplanDialog(QDialog):
         options.deleteLater()
 
     def _save_project(self, save_as=False):
+        with self._saving_project(save_as=save_as) as saved:
+            return saved
+
+    @contextmanager
+    def _saving_project(self, *, save_as=False, path=None, interactive=True):
         candidate = self._collect_project()
-        path = str(self.project_path) if self.project_path and not save_as else ""
+        if self._save_recovery is not None:
+            if save_as or (path is not None and Path(path).expanduser().resolve() != self._save_recovery):
+                raise ValueError(f"Save the floorplan to repair {self._save_recovery} before using Save As.")
+            path = self._save_recovery
+        if path is None:
+            path = self.project_path if not save_as else None
+        path = str(path) if path is not None else ""
         if not path:
+            if not interactive:
+                raise ValueError("An unsaved floorplan needs companion_path when saving the document.")
             path, _ = QFileDialog.getSaveFileName(self, "Save Floorplan", str(self.project_path or f"{candidate.top}.roar.floorplan"), "Floorplan (*.roar.floorplan);;Legacy floorplan (*.floorplan.json)")
             if path and not Path(path).suffix:
                 path += ".roar.floorplan"
         if path:
-            with self.placement_panel.save_as_transaction(path):
-                candidate.save(path)
+            try:
+                with document_savepoint(path), self.placement_panel.save_as_transaction(path):
+                    candidate.save(path)
+                    yield True
+            except DocumentRollbackError as exc:
+                if exc.path == Path(path).expanduser().resolve():
+                    self._save_recovery = exc.path
+                    self._dirty = True
+                    self._update_document_title()
+                raise
             self.project = candidate
             self.project_path = Path(path)
+            self._save_recovery = None
             self._dirty = False
             self._history_current = self._saved_state = self._editor_state()
             self._update_document_title()
             self.status.setText(f"Saved {path}")
             self.placement_panel.schedule_refresh()
-            return True
-        return False
+        else:
+            yield False
 
     def _export_align(self):
         self._ensure_current_source()

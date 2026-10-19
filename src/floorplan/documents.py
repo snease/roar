@@ -1,12 +1,58 @@
-"""Bound user-authored JSON before recursive model and Qt operations."""
+"""Bound user-authored JSON and preserve documents across coordinated saves."""
+from contextlib import contextmanager
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 
 
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_DOCUMENT_DEPTH = 64
 MAX_DOCUMENT_ITEMS = 250_000
+
+
+class DocumentRollbackError(RuntimeError):
+    """A coordinated save failed and its original file could not be restored."""
+
+    def __init__(self, path, error, rollback_error):
+        self.path = path
+        super().__init__(f'Save failed ({error}); restoring {path} also failed: {rollback_error}')
+
+
+@contextmanager
+def document_savepoint(path):
+    """Restore a document if a later step in a coordinated save raises.
+
+    Writers still replace files atomically. This handles ordinary exceptions,
+    not a crash or power loss between commits to separate documents.
+    """
+    path = Path(path).expanduser().resolve()
+    original = (path.read_bytes(), path.stat().st_mode & 0o777) if path.exists() else None
+    try:
+        yield
+    except Exception as error:
+        temporary = None
+        try:
+            if original is None:
+                path.unlink(missing_ok=True)
+            elif (not path.is_file() or path.read_bytes() != original[0]
+                  or path.stat().st_mode & 0o777 != original[1]):
+                with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.' + path.name + '.',
+                                                 suffix='.rollback', delete=False) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(original[0])
+                temporary.chmod(original[1])
+                os.replace(temporary, path)
+        except OSError as rollback_error:
+            raise DocumentRollbackError(path, error, rollback_error) from error
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass  # Keep the original restore error available to recovery handling.
+        raise
 
 
 def validate_document(value):

@@ -373,7 +373,31 @@ class Session:
         return Design.from_state(state)
 
     def save(self, path):
+        """Write a detached snapshot without changing active document identity."""
         return self.capture().save(path)
+
+    def save_document(self, path: Path | str | None = None, *,
+                      companion_path: Path | str | None = None) -> Path:
+        """Save the active document and its open floorplan, without dialogs.
+
+        Omit ``path`` to save to the current document. An unsaved document needs
+        a path; an unsaved floorplan needs ``companion_path``. Existing companion
+        paths are reused. Validation and write failures raise without claiming a
+        successful save or changing the active document's identity.
+        """
+        app = self.app
+        workspace = app.floorplan_workspace()
+        path = workspace.path if path is None else path
+        if path is None or not str(path).strip():
+            raise ValueError("An unsaved document needs a save path.")
+        if companion_path is not None and app._floorplan_editor() is None:
+            raise ValueError("companion_path requires an open floorplan.")
+        target = Path(path).expanduser().resolve()
+        context = app._saving_design_document(str(target), True, companion_path=companion_path,
+                                             interactive=False)
+        if not workspace.save_document(target, self.capture().to_state(), save_context=context):
+            raise RuntimeError("Document save was cancelled.")
+        return target
 
     def export_design(self, path):
         return self.capture().export_design(path)

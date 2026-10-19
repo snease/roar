@@ -1,5 +1,6 @@
 """Document operations use fake editor callbacks and temporary files only."""
 from copy import deepcopy
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import tempfile
@@ -46,6 +47,30 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(self.capture_state_calls, 0)
         self.design = Design()
         self.assertFalse(self.workspace.is_modified())
+
+    def test_companion_commit_failure_rolls_back_design_bytes_and_identity(self):
+        previous = self.root / 'original.roar'
+        self.workspace.record(previous)
+        self.design.set_instance_attribute('M1', 'W', 4e-6)
+        for exists in (False, True):
+            with self.subTest(existing_destination=exists):
+                target = self.root / f'target-{exists}.roar'
+                if exists:
+                    target.write_bytes(b'previous destination')
+                @contextmanager
+                def fail_after_design_commit():
+                    yield True
+                    self.assertEqual(self.workspace.path, str(target))
+                    self.assertEqual(Design.load(target).get_instance_parameters()['M1']['W']['value'], 4e-6)
+                    raise OSError('companion ownership commit failed')
+                with self.assertRaisesRegex(OSError, 'companion ownership'):
+                    self.workspace.save_document(target, self.design.to_state(), save_context=fail_after_design_commit())
+                self.assertEqual(self.workspace.path, str(previous))
+                self.assertTrue(self.workspace.is_modified())
+                if exists:
+                    self.assertEqual(target.read_bytes(), b'previous destination')
+                else:
+                    self.assertFalse(target.exists())
 
     def test_record_tracks_path_and_design_changes_without_graph_changes(self):
         path = self.root / "original.roar"

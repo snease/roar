@@ -1735,9 +1735,10 @@ class ROARApp(QMainWindow):
         return self._floorplan_workspace
 
     @contextmanager
-    def _saving_design_document(self, path, complete):
+    def _saving_design_document(self, path, complete, *, companion_path=None, interactive=True):
         floorplan = self._floorplan_editor()
-        context = (floorplan.saving_design_document(path, save_companion=complete)
+        context = (floorplan.saving_design_document(path, save_companion=complete,
+                                                   companion_path=companion_path, interactive=interactive)
                    if floorplan is not None else nullcontext(True))
         with context as ready:
             yield ready

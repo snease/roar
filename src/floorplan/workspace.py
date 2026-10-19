@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 
 from roar_api import Design
-from .documents import load_document, validate_document
+from .documents import document_savepoint, load_document, validate_document
 
 
 def load_roar_design(path):
@@ -156,10 +156,12 @@ class DesignWorkspace:
             state = editor
         return design if self.save_document(target, state) else None
 
-    def save_document(self, path, state, *, indent=2):
+    def save_document(self, path, state, *, indent=2, save_context=None):
         """Atomically save a File action's raw document, including unfinished rows.
 
-        A GUI save context may save a companion before the document commits.
+        A save context may save a companion before the document commits; either
+        file is restored if a later commit step raises. An explicit context can
+        select dialog-free behavior for API callers.
         Loading/recording another document deliberately does not use this hook.
         """
         target = Path(path).expanduser().resolve()
@@ -167,18 +169,24 @@ class DesignWorkspace:
         content = json.dumps(state, indent=indent, allow_nan=False) + "\n"
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
+        previous = self.path, self._baseline
         try:
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent,
                                              prefix="." + target.name + ".", delete=False) as stream:
                 temporary = Path(stream.name)
                 stream.write(content)
-            context = (self._save_context(str(target), "design_editor" in state)
-                       if self._save_context is not None else nullcontext())
-            with context as ready:
+            context = save_context
+            if context is None:
+                context = (self._save_context(str(target), "design_editor" in state)
+                           if self._save_context is not None else nullcontext())
+            with document_savepoint(target), context as ready:
                 if ready is False:
                     return False
                 os.replace(temporary, target)
                 self.path, self._baseline = str(target), baseline
+        except Exception:
+            self.path, self._baseline = previous
+            raise
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
