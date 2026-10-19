@@ -1,0 +1,207 @@
+{
+  "version": "1.0.2",
+  "app_name": "ROAR",
+  "design_editor": {
+    "expression_editor": [],
+    "constraint_editor": [],
+    "instance_table": [
+      {
+        "Instance": "M1_2",
+        "Corners": "[*Global*]",
+        "kgm": "",
+        "ID": "",
+        "W": "2.2e-06",
+        "L": "5e-07",
+        "disabled": false,
+        "plot": false,
+        "_corners_data": null,
+        "_attributes": {
+          "W": {
+            "mode": "pinned",
+            "resolved": 2.2e-06,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "L": {
+            "mode": "pinned",
+            "resolved": 5e-07,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "NF": {
+            "mode": "pinned",
+            "resolved": 2,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          }
+        },
+        "NF": "2"
+      },
+      {
+        "Instance": "M3_4",
+        "Corners": "[*Global*]",
+        "kgm": "",
+        "ID": "",
+        "W": "2.2e-06",
+        "L": "5e-07",
+        "disabled": false,
+        "plot": false,
+        "_corners_data": null,
+        "_attributes": {
+          "W": {
+            "mode": "pinned",
+            "resolved": 2.2e-06,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "L": {
+            "mode": "pinned",
+            "resolved": 5e-07,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "NF": {
+            "mode": "pinned",
+            "resolved": 2,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          }
+        },
+        "NF": "2"
+      },
+      {
+        "Instance": "M5_6",
+        "Corners": "[*Global*]",
+        "kgm": "",
+        "ID": "",
+        "W": "2.2e-06",
+        "L": "5e-07",
+        "disabled": false,
+        "plot": false,
+        "_corners_data": null,
+        "_attributes": {
+          "W": {
+            "mode": "pinned",
+            "resolved": 2.2e-06,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "L": {
+            "mode": "pinned",
+            "resolved": 5e-07,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "NF": {
+            "mode": "pinned",
+            "resolved": 2,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          }
+        },
+        "NF": "2"
+      },
+      {
+        "Instance": "M7_8",
+        "Corners": "[*Global*]",
+        "kgm": "",
+        "ID": "",
+        "W": "2.2e-06",
+        "L": "5e-07",
+        "disabled": false,
+        "plot": false,
+        "_corners_data": null,
+        "_attributes": {
+          "W": {
+            "mode": "pinned",
+            "resolved": 2.2e-06,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "L": {
+            "mode": "pinned",
+            "resolved": 5e-07,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "NF": {
+            "mode": "pinned",
+            "resolved": 2,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          }
+        },
+        "NF": "2"
+      },
+      {
+        "Instance": "M9_10",
+        "Corners": "[*Global*]",
+        "kgm": "",
+        "ID": "",
+        "W": "2.2e-06",
+        "L": "5e-07",
+        "disabled": false,
+        "plot": false,
+        "_corners_data": null,
+        "_attributes": {
+          "W": {
+            "mode": "pinned",
+            "resolved": 2.2e-06,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "L": {
+            "mode": "pinned",
+            "resolved": 5e-07,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          },
+          "NF": {
+            "mode": "pinned",
+            "resolved": 2,
+            "source_label": "Synthetic floorplan demo",
+            "reduce": "literal",
+            "per_corner": {},
+            "as_column": true
+          }
+        },
+        "NF": "2"
+      }
+    ],
+    "iterative_solver": {
+      "enabled": false,
+      "max_iterations": 50,
+      "tolerance": 1e-06,
+      "damping": 1.0,
+      "initial_guesses": {}
+    }
+  }
+}

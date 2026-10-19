@@ -7,15 +7,120 @@ name = "roar-cad"
 version = "1.0.2"
 description = "Robust Optimal Analog Reuse design, lookup and graphing API"
 readme = "README.md"
+# Python 3.11 is a required compatibility target; preserve it in dependency updates.
 requires-python = ">=3.10"
 dependencies = ["numpy", "pandas", "sympy", "matplotlib"]
 
 [project.optional-dependencies]
-gui = ["PyQt6==6.8", "PyQt6-QScintilla", "jedi", "pyqtgraph>=0.13", "PyOpenGL", "colorama", "pyqtdarktheme"]
+gui = ["PyQt6==6.11.0", "PyQt6-Qt6>=6.11.2,<6.12", "PyQt6-QScintilla", "jedi", "pyqtgraph>=0.13", "PyOpenGL", "colorama", "pyqtdarktheme", "kiwisolver>=1.4"]
 
 [project.scripts]
 roar = "roar_api.__main__:main"
 
 [tool.setuptools]
-packages = ["roar_api", "roar_api._legacy"]
-package-dir = {"roar_api" = "roar_api", "roar_api._legacy" = "src/gui"}
+packages = ["roar_api", "roar_api._legacy", "roar_api.floorplan"]
+py-modules = ["parse_netlist"]
+package-dir = {"" = "src", "roar_api" = "roar_api", "roar_api._legacy" = "src/gui", "roar_api.floorplan" = "src/floorplan"}
+
+[tool.setuptools.package-data]
+"roar_api.floorplan" = ["align_profile.json", "ALIGN_SETUP.md"]
+
+# One workspace manages separate Python 3.11 runtimes for ROAR and ALIGN;
+# ALIGN's native wheel and dependencies stay isolated from the GUI.
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = [{ name = "linux-runtime", platform = "linux-64", glibc = "2.28", linux = "4.18" }]
+requires-pixi = "==0.75.0"
+
+# The conda runtime supplies the native Qt library required by the GUI extra.
+# This prevents Pixi from also installing the PyPI Qt wheel (glibc >=2.34).
+[tool.pixi.workspace.conda-pypi-map]
+conda-forge = { mapping = { qt6-main = "PyQt6-Qt6" } }
+
+[tool.pixi.feature.gui.dependencies]
+pyqt6 = "==6.11.0"
+qt6-main = "==6.11.2"
+qscintilla2 = "==2.14.1"
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+pip = "*"
+# Editable installation uses these locked build tools as well.
+setuptools = ">=64"
+wheel = "*"
+# Native desktop and OpenGL libraries are managed alongside the Qt stack.
+libegl = "*"
+libgl = "*"
+libglx = "*"
+libopengl = "*"
+libxcb = "*"
+xcb-util-cursor = "*"
+xcb-util-wm = "*"
+xcb-util-image = "*"
+xcb-util-keysyms = "*"
+xcb-util-renderutil = "*"
+libxkbcommon = "*"
+xorg-libx11 = "*"
+xorg-libxext = "*"
+xorg-libxrender = "*"
+xorg-libxi = "*"
+dbus = "*"
+fontconfig = "*"
+libglib = "*"
+wayland = "*"
+fonts-conda-ecosystem = "*"
+
+[tool.pixi.pypi-dependencies]
+roar-cad = { path = ".", editable = true }
+
+[tool.pixi.pypi-options]
+no-build-isolation = ["roar-cad"]
+
+[tool.pixi.activation.env]
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib"
+
+[tool.pixi.feature.align.dependencies]
+python = "3.11.*"
+pip = "*"
+# Use the compiled conda package instead of building gdspy on users' machines.
+gdspy = "==1.6.13"
+numpy = "==2.2.6"
+# gdspy imports Tk, which needs these even for a headless placement worker.
+xorg-libx11 = "*"
+
+[tool.pixi.feature.align.pypi-dependencies]
+align-analoglayout = { url = "https://files.pythonhosted.org/packages/f1/36/a5c2c1f7134949d8f2394b73b5c2ddf600f393530e98bda115055029115a/align_analoglayout-0.9.8-cp311-cp311-manylinux_2_28_x86_64.whl" }
+dash = "==3.4.0"
+
+[tool.pixi.feature.align.activation.env]
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib"
+
+# Test-only environment: exercise an installed wheel with no Qt or ALIGN.
+[tool.pixi.feature.headless.dependencies]
+python = "3.11.*"
+pip = "*"
+setuptools = ">=64"
+wheel = "*"
+
+[tool.pixi.feature.headless.pypi-dependencies]
+numpy = "*"
+pandas = "*"
+sympy = "*"
+matplotlib = "*"
+
+[tool.pixi.feature.gui.tasks]
+test-floorplan = { cmd = "python bin/check_runtime.py floorplan", description = "Python 3.11 floorplan tests with offscreen Qt", env = { QT_QPA_PLATFORM = "offscreen" } }
+check-gui = { cmd = "python bin/check_runtime.py gui", description = "Visible desktop and OpenGL acceptance check (requires a display)" }
+check-align-viewer = { cmd = "python bin/check_runtime.py align-viewer", description = "Generate a native placement and exercise real Dash viewer HTTP callbacks" }
+
+[tool.pixi.feature.align.tasks]
+check-align = { cmd = "python bin/check_runtime.py align", description = "Native ALIGN parser, schema and constraint translation check" }
+check-align-placement = { cmd = "python bin/check_runtime.py align-placement", description = "Real native ALIGN placement and geometry check (no routing)" }
+
+[tool.pixi.feature.headless.tasks]
+check-package = { cmd = "python bin/check_runtime.py package", description = "Build and install the wheel offline; check core API and missing-GUI diagnostics" }
+
+[tool.pixi.environments]
+default = { features = ["gui"] }
+align = { features = ["align"], no-default-feature = true }
+headless = { features = ["headless"], no-default-feature = true }

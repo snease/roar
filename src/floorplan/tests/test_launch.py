@@ -1,0 +1,90 @@
+"""Launcher diagnostics must work before importing newer Python syntax or Qt."""
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+
+
+class LauncherTests(unittest.TestCase):
+    def launch(self, environment):
+        return subprocess.run([sys.executable, '-B', '-m', 'roar_api'],
+                              cwd=Path(__file__).resolve().parents[3], env=environment,
+                              capture_output=True, text=True, timeout=40)
+
+    @unittest.skipUnless(importlib.util.find_spec('PyQt6'), 'Requires the GUI extra')
+    def test_qt_probe_rejects_successful_application_with_unusable_opengl(self):
+        from roar_api.floorplan.doctor import _QT_CHECK, _record
+        # Initialize real headless Qt, but emulate a desktop backend whose
+        # display opens while native context creation fails (the WSLg bug).
+        inject_failure = '''
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QOpenGLContext
+QApplication.platformName = lambda self: 'wayland'
+QOpenGLContext.create = lambda self: False
+'''
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', inject_failure + _QT_CHECK, '--gui-only'],
+            env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen'}, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_record(result.stdout, 'ROAR_PLATFORM '), {'platform': 'wayland'})
+        report = _record(result.stdout, 'ROAR_GUI ')
+        self.assertFalse(report['ok'])
+        self.assertIn('cannot create an OpenGL context', report['error'])
+
+    @unittest.skipUnless(sys.platform == 'linux' and importlib.util.find_spec('PyQt6'),
+                         'Requires a Linux GUI environment to check native prerequisites')
+    def test_real_missing_native_library_exits_cleanly_without_library_override(self):
+        environment = dict(os.environ)
+        for name in ('LD_LIBRARY_PATH', 'LD_PRELOAD', 'PYTHONPATH', 'PYTHONHOME'):
+            environment.pop(name, None)
+        probe = subprocess.run([sys.executable, '-I', '-B', '-c', 'from PyQt6 import QtWidgets'],
+                               env=environment, capture_output=True, text=True, timeout=15)
+        if probe.returncode == 0:
+            self.skipTest('Host provides the native Qt libraries without an override')
+        self.assertIn('.so', probe.stderr, probe.stderr)
+        result = self.launch(environment)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('GUI startup:', result.stderr)
+        self.assertIn('distribution', result.stderr)
+        self.assertNotIn('sudo apt install', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    @unittest.skipUnless(importlib.util.find_spec('PyQt6'), 'Requires the GUI extra')
+    def test_real_qt_platform_abort_does_not_abort_the_launcher(self):
+        environment = dict(os.environ)
+        environment['QT_QPA_PLATFORM'] = 'roar-intentionally-unavailable-platform'
+        result = self.launch(environment)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('GUI startup:', result.stderr)
+        self.assertIn('Remove the QT_QPA_PLATFORM override', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertNotIn('sudo apt install', result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_unsupported_python_explains_environment_before_importing_backend(self):
+        root = Path(__file__).resolve().parents[3]
+        script = """
+import runpy
+import sys
+sys.version_info = (3, int(sys.argv[2]), 0)
+sys.path.insert(0, sys.argv[1])
+if sys.argv[3] == 'script':
+    runpy.run_path(sys.argv[1] + '/src/roar.py', run_name='__main__')
+else:
+    runpy.run_module('roar_api', run_name='__main__')
+"""
+        for minor in (6, 9):
+            for launch in ("script", "module"):
+                with self.subTest(python=(3, minor), launch=launch):
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-S", "-c", script, str(root), str(minor), launch],
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("ROAR requires Python 3.10 or newer", result.stderr)
+                    self.assertIn("Python 3.{}.0".format(minor), result.stderr)
+                    self.assertIn("Activate your ROAR environment", result.stderr)
+                    self.assertNotIn("SyntaxError", result.stderr)
+                    if launch == "script":
+                        self.assertNotIn("Traceback", result.stderr)

@@ -1,0 +1,1081 @@
+"""Headless lifecycle tests use a small child process, never import ALIGN/Qt."""
+import dataclasses
+import hashlib
+import errno
+import contextlib
+import io
+from types import SimpleNamespace
+import json
+import multiprocessing
+import os
+from pathlib import Path
+import shutil
+import sys
+import subprocess
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+from roar_api.floorplan import FloorplanProject
+from roar_api.floorplan.align_runner import AlignConfig, AlignRunner, PROFILE, PROFILE_ID, project_fingerprint, validate_ota_project
+
+
+class ViewerReadinessTests(unittest.TestCase):
+    def test_readiness_preserves_capability_prefix(self):
+        from roar_api.floorplan.align_runner import _ready
+        captured = []
+        def open_request(request, timeout):
+            captured.append(request.full_url)
+            response = io.StringIO('{"layout": {}}')
+            response.status = 200
+            return response
+        with patch('roar_api.floorplan.align_runner.urllib.request.build_opener',
+                   return_value=SimpleNamespace(open=open_request)):
+            self.assertTrue(_ready('http://127.0.0.1:12345/roar-align/' + 'a' * 64 + '/'))
+        self.assertEqual(captured, ['http://127.0.0.1:12345/roar-align/' + 'a' * 64 + '/_dash-layout'])
+
+
+def _race_start(config, snapshot, path, barrier, results):
+    runner = AlignRunner(config, path)
+    launch = runner._launch
+    def slow_launch(*args):
+        time.sleep(0.15)  # Make the unpublished-PID window deterministic.
+        return launch(*args)
+    runner._launch = slow_launch
+    barrier.wait()
+    try:
+        result = runner.start(FloorplanProject.from_dict(snapshot))
+        results.put(('started', result.run_dir))
+    except ValueError as error:
+        results.put(('rejected', str(error)))
+
+
+FAKE_PYTHON = '''#!PYTHON
+import json, os, pathlib, signal, sys, time
+p=pathlib.Path(sys.argv[sys.argv.index('--manifest')+1])
+m=json.loads(p.read_text()); token=m['active']['token']
+mode=(pathlib.Path(__file__).parent/'mode').read_text()
+def write(status, error=None):
+    t=p.parent/'fake.tmp'
+    t.write_text(json.dumps({'token':token,'status':status,'error':error,'url':'http://127.0.0.1:12345/'}))
+    os.replace(t,p.parent/'status.json')
+def stop(*args):
+    write('stopped'); sys.exit(0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN if mode=='ignore' else stop)
+print('captured child log: '+mode,flush=True)
+write('generating')
+if m['active']['mode']=='preview':
+    if mode=='fail':
+        write('failed','intentional backend failure'); sys.exit(2)
+    if mode=='good':
+        dump=p.parent/'3_pnr'/'__placer_dump__.json'
+        dump.parent.mkdir(); dump.write_text(json.dumps([m['top'].upper(),{},[['PLACEMENT_0',{}]],{}]))
+        (p.parent/'preview.json').write_bytes((pathlib.Path(__file__).parent/'preview-fixture.json').read_bytes())
+        write('completed'); sys.exit(0)
+if mode not in ('pending','ignore'):
+    write('serving')
+while True: time.sleep(.02)
+'''
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'ALIGN process management requires Linux or WSL')
+class RunnerTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.base = Path(self.directory.name)
+        self.python = self.base / 'python'
+        self.python.write_text(FAKE_PYTHON.replace('PYTHON', sys.executable, 1))
+        self.python.chmod(0o755)
+        (self.base / 'mode').write_text('good')
+        self.config = AlignConfig(str(self.python), str(self.base / 'backend'), str(self.base / 'runs'))
+        fixture = Path(__file__).resolve().parents[3] / 'examples/floorplan/ota/cm_ota.roar.floorplan'
+        self.project = FloorplanProject.load(fixture)
+        self.project.align_profile = PROFILE_ID
+        from roar_api.floorplan.geometry import build_preview
+        capture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        preview = build_preview(capture, json.loads((capture / 'manifest.json').read_text()))
+        (self.base / 'preview-fixture.json').write_text(json.dumps(preview))
+        self.runner = AlignRunner(self.config, self.base / 'project.floorplan')
+        self.addCleanup(self.runner.shutdown)
+        self.validation = patch.object(AlignConfig, 'validate')
+        self.validation.start()
+        self.addCleanup(self.validation.stop)
+        self.readiness = patch('roar_api.floorplan.align_runner._ready', return_value=True)
+        self.ready = self.readiness.start()
+        self.addCleanup(self.readiness.stop)
+
+    def until(self, runner, status):
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            state = runner.poll(self.project)
+            if state.status == status:
+                return state
+            time.sleep(.02)
+        self.fail(f'Expected {status}: {state}; {runner.log_tail()}')
+
+    def start_viewer(self, runner):
+        runner.start(self.project)
+        self.until(runner, 'completed')
+        return runner.open_last(self.project)
+
+    def test_corrupt_history_is_optional_but_cannot_authorize_new_run(self):
+        index = self.runner._index(self.runner.project_path)
+        index.parent.mkdir(parents=True)
+        for content in ('[]', '{}', '{"version": 1}', '{"garbage": "x"}', '{',
+                        '{"version": 99}', '{"run_dir": 7}', 'x' * 16385):
+            with self.subTest(content=content[:40]):
+                index.write_text(content)
+                for getter in (self.runner.last_run, self.runner.last_placement, self.runner.last_preview):
+                    self.assertIsNone(getter(self.project))
+                with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN index record'):
+                    self.runner.start(self.project)
+                self.assertEqual(index.read_text(), content)
+        self.assertFalse(list(Path(self.config.run_root).glob('*/run.json')))
+
+    def test_corrupt_index_does_not_allow_duplicate_worker_or_save_as_target(self):
+        state = self.start_viewer(self.runner)
+        self.until(self.runner, 'serving')
+        index = self.runner._index(self.runner.project_path)
+        original = index.read_bytes()
+        destination = Path(self.runner.project_path)
+        destination.write_text('existing document')
+        index.write_text('[]')
+        try:
+            observer = AlignRunner(self.config, destination)
+            self.assertIsNone(observer.last_run(self.project))
+            # A cached controller also cannot republish over unresolved ownership.
+            self.assertIsNone(self.runner.poll(self.project))
+            self.assertEqual(index.read_text(), '[]')
+            with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN index record'):
+                observer.start(self.project)
+            draft = AlignRunner(self.config)
+            with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN index record'):
+                with draft.save_as_transaction(destination):
+                    destination.write_text('overwritten')
+            self.assertEqual(destination.read_text(), 'existing document')
+            self.assertEqual(index.read_text(), '[]')
+            self.assertIsNone(self.runner._process.poll())
+            self.assertEqual(len(list(Path(self.config.run_root).glob('*/run.json'))), 1)
+            self.assertTrue(Path(state.run_dir).is_dir())
+        finally:
+            index.write_bytes(original)
+
+    def test_failed_setup_without_worker_has_stable_failed_state(self):
+        with patch.object(self.runner, '_launch', side_effect=OSError('launch setup failed')):
+            with self.assertRaisesRegex(OSError, 'launch setup failed'):
+                self.runner.start(self.project)
+        state = self.runner.last_run(self.project)
+        self.assertEqual(state.status, 'failed')
+        self.assertIn('setup did not start a worker', state.error)
+        self.assertFalse(state.can_stop)
+        self.assertIsNone(self.runner._process)
+        self.assertEqual(self.runner.poll(self.project), state)
+
+    def test_invalid_ownership_cannot_signal_launch_or_transfer(self):
+        state = self.start_viewer(self.runner)
+        self.until(self.runner, 'serving')
+        path = Path(state.run_dir) / 'run.json'
+        original = path.read_bytes()
+        manifest = json.loads(original)
+        target = self.base / 'target.floorplan'
+        for mutate in (lambda m: m.update(version=99),
+                       lambda m: m.update(created_at=float('nan')),
+                       lambda m: m.update(created_at=10**400),
+                       lambda m: m['generation_config'].update(unused=float('inf')),
+                       lambda m: m.update(active=[]),
+                       lambda m: m['active'].update(pid=True),
+                       lambda m: m['active'].update(token=['bad']),
+                       lambda m: m['active'].update(stop_requested=10**400),
+                       lambda m: m['input_hashes'].update({'../escape': 'a' * 64})):
+            record = json.loads(original)
+            mutate(record)
+            path.write_text(json.dumps(record))
+            corrupted = path.read_bytes()
+            try:
+                self.assertIsNone(self.runner.last_run(self.project))
+                other = AlignRunner(self.config, self.runner.project_path)
+                self.assertIsNone(other.last_run(self.project))
+                with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN run record'):
+                    other.start(self.project)
+                with patch('roar_api.floorplan.align_runner.os.killpg') as signal:
+                    for operation in (self.runner.stop, self.runner.shutdown,
+                                      lambda: self.runner.start(self.project),
+                                      lambda: self.runner.open_last(self.project),
+                                      lambda: self.runner.rebind_project_path(target)):
+                        with self.assertRaisesRegex(ValueError, 'Cannot safely use ALIGN run record'):
+                            operation()
+                    signal.assert_not_called()
+                self.assertIsNone(self.runner._process.poll())
+                self.assertEqual(path.read_bytes(), corrupted)
+                self.assertFalse(target.exists())
+            finally:
+                path.write_bytes(original)
+        self.assertEqual(json.loads(path.read_bytes())['active']['pid'], manifest['active']['pid'])
+
+    def test_corrupt_status_is_recoverable_without_authorizing_ownership(self):
+        state = self.start_viewer(self.runner)
+        self.until(self.runner, 'serving')
+        path = Path(state.run_dir) / 'status.json'
+        for content in ('[]', '{"token": 3, "status": "serving"}', '{"version": 99}'):
+            path.write_text(content)
+            current = self.runner.poll(self.project)
+            self.assertEqual(current.status, 'starting')
+            self.assertTrue(current.can_stop)
+            self.assertIsNone(current.url)
+            self.assertEqual(path.read_text(), content)
+        # The real child remains stoppable using the separately validated manifest.
+        self.runner.stop()
+        self.until(self.runner, 'stopped')
+
+    def test_technology_gate_accepts_different_circuit_sizes_and_reports_unsupported_devices(self):
+        self.project.align_profile = None
+        with self.assertRaisesRegex(ValueError, 'Select layout technology SKY130'):
+            self.runner.start(self.project)
+        self.project.align_profile = PROFILE_ID
+        self.project.devices.pop()
+        validate_ota_project(self.project)
+        first = self.project.devices[0]
+        first.kind = 'resistor'
+        with self.assertRaisesRegex(ValueError, first.name + ': .*no supported resistor generator'):
+            self.runner.start(self.project)
+        first.kind = 'mos'
+        first.model = 'unsupported_model'
+        with self.assertRaisesRegex(ValueError, first.name + ': unsupported device model'):
+            validate_ota_project(self.project)
+        self.assertFalse(Path(self.config.run_root).exists())
+
+    def test_generator_geometry_preflight_preserves_repairable_drafts(self):
+        for key, value, message in [('width_um', 0.41, '0.42'), ('width_um', 2.53, '2.52'),
+                                    ('width_um', 1.015, 'multiple of 0.01'),
+                                    ('length_um', 0.145, 'at least 0.15'),
+                                    ('length_um', 0.152, 'multiple of 0.005'), ('nf', 1, 'even finger count')]:
+            project = FloorplanProject.from_dict(self.project.to_dict())
+            setattr(project.devices[0], key, value)
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, message):
+                validate_ota_project(project)
+            self.assertEqual(getattr(project.devices[0], key), value)
+        # Public device edits can pass geometry rules yet conflict with the
+        # saved parameter/override representation. Never publish that capture.
+        for device in self.project.devices:
+            device.width_um = 1.2
+        validate_ota_project(self.project)
+        self.project.validate()
+        with self.assertRaisesRegex(ValueError, 'saved sizes conflict with source parameters or overrides'):
+            self.runner.start(self.project)
+        self.assertFalse(list(Path(self.config.run_root).glob('*/run.json')))
+        self.assertIsNone(self.runner._process)
+
+    def test_boundary_halos_follow_backend_grid_and_disabled_constraints_are_ignored(self):
+        for horizontal, vertical in [(0, 0), (0.43, 0.42), (0.86, 0.84), (1.72, 2.52)]:
+            self.project.set_constraints([{'constraint': 'Boundary', 'halo_horizontal': horizontal, 'halo_vertical': vertical}])
+            validate_ota_project(self.project)
+        self.project.set_constraints([{'constraint': 'Boundary', 'halo_horizontal': 1.5, 'halo_vertical': 2}])
+        with self.assertRaisesRegex(ValueError, 'Constraint 1.*horizontal.*0.43 µm'):
+            validate_ota_project(self.project)
+        self.project.set_constraint_enabled(0, False)
+        validate_ota_project(self.project)
+
+    def test_concurrent_processes_publish_only_one_worker(self):
+        (self.base / 'mode').write_text('pending')
+        context = multiprocessing.get_context('fork')
+        barrier, results = context.Barrier(2), context.Queue()
+        workers = [context.Process(target=_race_start, args=(self.config, self.project.to_dict(),
+                   self.runner.project_path, barrier, results)) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        try:
+            outcomes = [results.get(timeout=6) for _ in workers]
+            for worker in workers:
+                worker.join(3)
+                self.assertEqual(worker.exitcode, 0)
+            self.assertEqual(sorted(item[0] for item in outcomes), ['rejected', 'started'])
+            self.assertIn('Stop the current ALIGN run', next(item[1] for item in outcomes if item[0] == 'rejected'))
+            self.runner.last_run(self.project)
+            self.assertEqual(len(list(Path(self.config.run_root).glob('*/run.json'))), 1)
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join()
+            self.runner.last_run(self.project)
+
+    def test_save_as_preflight_conflict_cannot_write_destination(self):
+        self.start_viewer(self.runner)
+        target = self.base / 'occupied.floorplan'
+        target.write_text('original destination')
+        other = AlignRunner(self.config, target)
+        self.addCleanup(other.shutdown)
+        self.start_viewer(other)
+        with self.assertRaisesRegex(ValueError, 'already has an active ALIGN run'):
+            with self.runner.save_as_transaction(target):
+                target.write_text('must not be written')
+        self.assertEqual(target.read_text(), 'original destination')
+        previous = self.runner.project_path
+        with self.assertRaisesRegex(OSError, 'write failed'):
+            with self.runner.save_as_transaction(self.base / 'new.floorplan'):
+                raise OSError('write failed')
+        self.assertEqual(self.runner.project_path, previous)
+
+    def test_unconfigured_draft_save_does_not_require_align_storage(self):
+        root = self.base / 'unconfigured-runs'
+        runner = AlignRunner(AlignConfig('', '', str(root)))
+        self.assertIsNone(runner.last_run(self.project))
+        self.assertIsNone(runner.last_placement(self.project))
+        target = self.base / 'draft.floorplan'
+        with runner.save_as_transaction(target):
+            self.project.save(target)
+        self.assertTrue(target.is_file())
+        self.assertFalse(root.exists())
+
+    def test_configured_draft_save_ignores_unavailable_runs_without_history(self):
+        blocker = self.base / 'former-directory'
+        blocker.write_text('The old storage location is no longer a directory.')
+        readonly = self.base / 'readonly-runs'
+        readonly.mkdir()
+        readonly.chmod(0o555)
+        self.addCleanup(readonly.chmod, 0o755)
+        for index, root in enumerate((self.base / 'missing-runs', blocker / 'runs', readonly)):
+            with self.subTest(root=root):
+                runner = AlignRunner(dataclasses.replace(self.config, run_root=str(root)))
+                target = self.base / f'offline-{index}.floorplan'
+                with runner.save_as_transaction(target):
+                    self.project.save(target)
+                self.assertEqual(FloorplanProject.load(target).top, self.project.top)
+                self.assertEqual(runner.project_path, str(target))
+                self.assertFalse((root / '.ownership.lock').is_file())
+
+    def test_draft_without_loaded_history_still_checks_active_save_target(self):
+        self.start_viewer(self.runner)
+        draft = AlignRunner(self.config)
+        target = Path(self.runner.project_path)
+        target.write_text('original destination')
+        with self.assertRaisesRegex(ValueError, 'already has an active ALIGN run'):
+            with draft.save_as_transaction(target):
+                target.write_text('must not be written')
+        self.assertEqual(target.read_text(), 'original destination')
+
+    def test_run_options_are_captured_and_invalid_settings_rejected(self):
+        self.project.run_options = {'nvariants': 7, 'placer_sa_iterations': 500, 'seed': 42, 'lambda_coeff': 2.5}
+        state = self.runner.start(self.project)
+        manifest = json.loads((Path(state.run_dir) / 'run.json').read_text())
+        self.assertEqual(manifest['generation_config']['run_options'], self.project.run_options)
+        self.runner.shutdown()
+        self.project.run_options['lambda_coeff'] = 0
+        with self.assertRaisesRegex(ValueError, 'weight'):
+            self.runner.start(self.project)
+
+    def test_save_as_rolls_back_document_and_history_if_ownership_commit_fails(self):
+        from roar_api.floorplan import align_runner
+        state = self.runner.start(self.project)
+        target = self.base / 'target.floorplan'
+        target.write_text('previous contents')
+        target.chmod(0o600)
+        manifest = Path(state.run_dir) / 'run.json'
+        original = manifest.read_bytes()
+        original_path = self.runner.project_path
+        write = align_runner._write_json
+        def fail_index(path, value):
+            if Path(path) == self.runner._index(str(target.resolve())):
+                raise OSError('ownership write failed')
+            return write(path, value)
+        with patch.object(align_runner, '_write_json', side_effect=fail_index):
+            with self.assertRaisesRegex(OSError, 'ownership write failed'):
+                with self.runner.save_as_transaction(target):
+                    target.write_text('new contents')
+        self.assertEqual(target.read_text(), 'previous contents')
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(manifest.read_bytes(), original)
+        self.assertEqual(self.runner.project_path, original_path)
+
+    def test_owned_live_process_does_not_fail_when_proc_observation_is_unavailable(self):
+        (self.base / 'mode').write_text('pending')
+        self.runner.start(self.project)
+        self.until(self.runner, 'generating')
+        with patch('roar_api.floorplan.align_runner._alive', return_value=False):
+            state = self.runner.poll(self.project)
+            self.assertEqual(state.status, 'generating')
+            self.assertTrue(state.can_stop)
+            self.runner.stop()
+            self.until(self.runner, 'stopped')
+
+    def test_worker_terminal_error_published_during_exit_is_preserved(self):
+        self.start_viewer(self.runner)
+        state = self.until(self.runner, 'serving')
+        self.runner.shutdown()
+        path = Path(state.run_dir) / 'status.json'
+        manifest = json.loads((Path(state.run_dir) / 'run.json').read_text())
+        manifest['active']['stop_requested'] = None
+        (Path(state.run_dir) / 'run.json').write_text(json.dumps(manifest))
+        token = manifest['active']['token']
+        path.write_text(json.dumps({'token': token, 'status': 'generating', 'error': None}))
+        def exit_after_status_read():
+            path.write_text(json.dumps({'token': token, 'status': 'failed', 'error': 'specific native diagnostic'}))
+            return 2
+        process = SimpleNamespace(pid=manifest['active']['pid'], returncode=2, poll=exit_after_status_read)
+        with patch.object(self.runner, '_process', process):
+            result = self.runner.poll(self.project)
+        self.assertEqual(result.status, 'failed')
+        self.assertEqual(result.error, 'specific native diagnostic')
+        self.assertEqual(json.loads(path.read_text())['error'], 'specific native diagnostic')
+
+    def test_snapshot_isolated_command_readiness_cache_and_restart(self):
+        before = self.project.to_dict()
+        state = self.start_viewer(self.runner)
+        state = self.until(self.runner, 'serving')
+        self.assertEqual(state.url, 'http://127.0.0.1:12345/')
+        self.assertTrue(state.has_placement)
+        self.assertEqual(self.project.to_dict(), before)
+        manifest = json.loads((Path(state.run_dir) / 'run.json').read_text())
+        arguments = Path('/proc') / str(manifest['active']['pid']) / 'cmdline'
+        self.assertIn(b'-I', arguments.read_bytes().split(b'\0'))
+        self.assertEqual(manifest['generation_config']['python'], str(self.python))
+        self.assertEqual(json.loads((Path(state.run_dir) / 'floorplan.json').read_text()), before)
+        calls = self.ready.call_count
+        index = self.runner._index(self.runner.project_path)
+        index_mtime = index.stat().st_mtime_ns
+        self.runner.poll(self.project)
+        self.runner.poll(self.project)
+        self.assertEqual(self.ready.call_count, calls)
+        self.assertEqual(index.stat().st_mtime_ns, index_mtime)
+        self.assertIn('captured child log', self.runner.log_tail())
+        restarted = AlignRunner(self.config, self.base / 'project.floorplan')
+        restored = restarted.last_run(self.project)
+        self.assertEqual(restored.run_dir, state.run_dir)
+        self.assertEqual(restored.status, 'serving')
+        self.assertTrue(restored.can_stop)
+        self.runner.stop()
+        self.until(self.runner, 'stopped')
+
+    def test_legacy_generating_worker_can_be_reconnected_and_stopped(self):
+        state = self.runner.start(self.project)
+        self.until(self.runner, 'completed')
+        path = Path(state.run_dir) / 'run.json'
+        manifest = json.loads(path.read_text())
+        manifest['version'] = 1
+        manifest.pop('fingerprint_version')
+        manifest['active'].update(mode='generate', pid=None, stop_requested=None)
+        path.write_text(json.dumps(manifest))
+        (self.base / 'mode').write_text('pending')
+        process = subprocess.Popen([str(self.python), '--manifest', str(path),
+                                   '--token', manifest['active']['token']],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(process.wait, timeout=2)
+        self.addCleanup(lambda: process.terminate() if process.poll() is None else None)
+        manifest['active']['pid'] = process.pid
+        path.write_text(json.dumps(manifest))
+        observer = AlignRunner(self.config, self.runner.project_path)
+        self.addCleanup(observer.shutdown)
+        restored = observer.last_run(self.project)
+        restored = self.until(observer, 'generating')
+        self.assertEqual(restored.run_dir, state.run_dir)
+        self.assertTrue(restored.can_stop)
+        self.assertEqual(json.loads(path.read_text())['active']['mode'], 'generate')
+        observer.stop()
+        self.until(observer, 'stopped')
+        self.assertEqual(process.wait(timeout=2), 0)
+
+    def test_older_window_cannot_replace_new_history_or_launch_duplicate_worker(self):
+        self.start_viewer(self.runner)
+        old = self.until(self.runner, 'serving')
+        self.runner.shutdown()
+        older_observer = AlignRunner(self.config, self.base / 'project.floorplan')
+        older_observer.last_run(self.project)
+        newer = AlignRunner(self.config, self.base / 'project.floorplan')
+        self.addCleanup(newer.shutdown)
+        self.start_viewer(newer)
+        current = self.until(newer, 'serving')
+        manifest_path = Path(current.run_dir) / 'run.json'
+        pid = json.loads(manifest_path.read_text())['active']['pid']
+        self.assertNotEqual(old.run_dir, current.run_dir)
+        self.runner.poll(self.project)
+        self.assertEqual(self.runner.last_placement(self.project).run_dir, current.run_dir)
+        with self.assertRaisesRegex(ValueError, 'Stop the current ALIGN run'):
+            self.runner.start(self.project)
+        reconnected = older_observer.open_last(self.project)
+        self.assertEqual(reconnected.run_dir, current.run_dir)
+        self.assertEqual(reconnected.status, 'serving')
+        self.assertEqual(json.loads(manifest_path.read_text())['active']['pid'], pid)
+        newer.shutdown()
+        self.runner.open_last(self.project)
+        reopened = self.until(self.runner, 'serving')
+        self.assertEqual(reopened.run_dir, current.run_dir)
+        self.assertEqual(json.loads(manifest_path.read_text())['active']['mode'], 'reopen')
+
+    def test_save_as_rebinds_live_run_without_restarting_worker(self):
+        self.start_viewer(self.runner)
+        original = self.until(self.runner, 'serving')
+        path = Path(original.run_dir) / 'run.json'
+        pid = json.loads(path.read_text())['active']['pid']
+        new_project = self.base / 'saved_as.floorplan'
+        self.runner.rebind_project_path(new_project)
+        self.assertEqual(json.loads(path.read_text())['active']['pid'], pid)
+        restarted = AlignRunner(self.config, new_project)
+        self.assertEqual(restarted.last_run(self.project).status, 'serving')
+        self.assertEqual(restarted.last_placement(self.project).run_dir, original.run_dir)
+        old = AlignRunner(self.config, self.base / 'project.floorplan')
+        self.assertIsNone(old.last_run(self.project))
+
+    def transferred_run(self, direct_child):
+        source = Path(tempfile.mkdtemp(dir=self.base)) / 'source.floorplan'
+        initiator = AlignRunner(self.config, source)
+        self.addCleanup(initiator.shutdown)
+        self.start_viewer(initiator)
+        state = self.until(initiator, 'serving')
+        observer = AlignRunner(self.config, source)
+        self.addCleanup(observer.shutdown)
+        observer.last_run(self.project)
+        stale, owner = (initiator, observer) if direct_child else (observer, initiator)
+        owner.rebind_project_path(source.with_name('destination.floorplan'))
+        return stale, owner, state
+
+    def test_transferred_run_detaches_cached_reads_and_reopen(self):
+        for direct_child in (False, True):
+            for operation in ('poll', 'last_run', 'last_placement', 'last_preview', 'log_tail', 'open_last'):
+                with self.subTest(direct_child=direct_child, operation=operation):
+                    stale, owner, state = self.transferred_run(direct_child)
+                    manifest_path = Path(state.run_dir) / 'run.json'
+                    manifest = manifest_path.read_bytes()
+                    source_index = stale._index(stale.project_path)
+                    original_index = source_index.read_bytes()
+                    if operation == 'open_last':
+                        with self.assertRaisesRegex(ValueError, 'No captured ALIGN placement'):
+                            stale.open_last(self.project)
+                    else:
+                        result = getattr(stale, operation)() if operation == 'log_tail' else getattr(stale, operation)(self.project)
+                        self.assertEqual(result, '' if operation == 'log_tail' else None)
+                    self.assertIsNone(stale._run_dir)
+                    self.assertIsNone(stale._process)
+                    self.assertEqual(manifest_path.read_bytes(), manifest)
+                    self.assertEqual(source_index.read_bytes(), original_index)
+                    self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_transferred_run_cannot_be_stopped_or_shutdown_from_old_controller(self):
+        for direct_child in (False, True):
+            for operation in ('stop', 'shutdown'):
+                with self.subTest(direct_child=direct_child, operation=operation):
+                    stale, owner, state = self.transferred_run(direct_child)
+                    manifest_path = Path(state.run_dir) / 'run.json'
+                    manifest = manifest_path.read_bytes()
+                    if operation == 'stop':
+                        with self.assertRaisesRegex(ValueError, 'No ALIGN run to stop'):
+                            stale.stop()
+                    else:
+                        self.assertIsNone(stale.shutdown())
+                    self.assertEqual(manifest_path.read_bytes(), manifest)
+                    self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_transferred_controller_can_start_new_source_run(self):
+        for direct_child in (False, True):
+            with self.subTest(direct_child=direct_child):
+                stale, owner, transferred = self.transferred_run(direct_child)
+                self.start_viewer(stale)
+                new = self.until(stale, 'serving')
+                self.assertNotEqual(new.run_dir, transferred.run_dir)
+                self.assertEqual(owner.last_run(self.project).run_dir, transferred.run_dir)
+                self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_transferred_child_is_reaped_after_its_new_owner_stops_it(self):
+        stale, owner, state = self.transferred_run(direct_child=True)
+        process = stale._process
+        self.assertIsNone(stale.poll(self.project))
+        owner.shutdown()
+        deadline = time.monotonic() + 1
+        while process.returncode is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertIsNotNone(process.returncode)
+        self.assertFalse((Path('/proc') / str(process.pid)).exists())
+
+    def test_transferred_source_index_does_not_block_save_as(self):
+        stale, owner, state = self.transferred_run(direct_child=False)
+        source = Path(stale.project_path)
+        draft = AlignRunner(self.config)
+        with draft.save_as_transaction(source):
+            self.project.save(source)
+        self.assertEqual(FloorplanProject.load(source).top, self.project.top)
+        self.assertIsNone(draft.last_run(self.project))
+        self.assertEqual(owner.poll(self.project).run_dir, state.run_dir)
+        self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_transferred_controller_cannot_rebind_other_projects_history(self):
+        for direct_child in (False, True):
+            for transaction in (False, True):
+                with self.subTest(direct_child=direct_child, transaction=transaction):
+                    stale, owner, state = self.transferred_run(direct_child)
+                    manifest_path = Path(state.run_dir) / 'run.json'
+                    manifest = manifest_path.read_bytes()
+                    target = Path(stale.project_path).with_name('third.floorplan')
+                    if transaction:
+                        with stale.save_as_transaction(target):
+                            self.project.save(target)
+                    else:
+                        stale.rebind_project_path(target)
+                    self.assertEqual(stale.project_path, str(target))
+                    self.assertIsNone(stale.last_run(self.project))
+                    self.assertFalse(stale._index(str(target)).exists())
+                    self.assertEqual(manifest_path.read_bytes(), manifest)
+                    self.assertEqual(owner.last_placement(self.project).run_dir, state.run_dir)
+                    self.assertEqual(owner.poll(self.project).status, 'serving')
+
+    def test_new_attempt_does_not_inherit_or_reopen_transferred_history(self):
+        from roar_api.floorplan.geometry import build_preview
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        preview = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
+        for named in (False, True):
+            for mode in ('fail', 'pending'):
+                for operation in ('inspect', 'reopen'):
+                    with self.subTest(named=named, mode=mode, operation=operation):
+                        source = Path(tempfile.mkdtemp(dir=self.base)) / 'source.floorplan' if named else None
+                        owner = AlignRunner(self.config, source)
+                        self.addCleanup(owner.shutdown)
+                        (self.base / 'mode').write_text('good')
+                        self.start_viewer(owner)
+                        original = self.until(owner, 'serving')
+                        directory = Path(original.run_dir)
+                        (directory / 'preview.json').write_text(json.dumps(preview))
+                        owner.shutdown()
+                        owner.rebind_project_path(directory / 'destination.floorplan')
+                        manifest_path = directory / 'run.json'
+                        original_manifest = manifest_path.read_bytes()
+                        attempt = AlignRunner(self.config, source)
+                        self.addCleanup(attempt.shutdown)
+                        (self.base / 'mode').write_text(mode)
+                        attempt.start(self.project)
+                        if mode == 'pending':
+                            self.until(attempt, 'generating')
+                            attempt.stop()
+                        state = self.until(attempt, 'stopped' if mode == 'pending' else 'failed')
+                        if operation == 'reopen':
+                            with self.assertRaisesRegex(ValueError, 'no generated placement'):
+                                attempt.open_last(self.project)
+                        else:
+                            self.assertFalse(state.has_placement)
+                            self.assertFalse(state.has_preview)
+                            self.assertIsNone(attempt.last_placement(self.project))
+                            self.assertIsNone(attempt.last_preview(self.project))
+                            pointer = json.loads(attempt._index(attempt.project_path or
+                                'snapshot:' + state.fingerprint).read_text())
+                            self.assertNotIn('placement_dir', pointer)
+                            self.assertNotIn('preview_dir', pointer)
+                            self.assertEqual(pointer['run_dir'], state.run_dir)
+                            self.assertEqual(pointer['last_attempt'], state.run_dir)
+                        self.assertEqual(manifest_path.read_bytes(), original_manifest)
+                        self.assertEqual(owner.last_placement(self.project).run_dir, original.run_dir)
+                        self.assertEqual(owner.last_preview(self.project).run_dir, original.run_dir)
+
+    def test_stale_reopen_keeps_artifacts_and_last_placement_after_failure(self):
+        self.start_viewer(self.runner)
+        good = self.until(self.runner, 'serving')
+        dump = Path(good.run_dir) / '3_pnr/__placer_dump__.json'
+        original = (dump.read_bytes(), dump.stat().st_mtime_ns)
+        self.runner.shutdown()
+        self.project.set_parameter('w1_2', 2.4e-6)
+        (self.base / 'mode').write_text('fail')
+        self.runner.start(self.project)
+        failed = self.until(self.runner, 'failed')
+        self.assertEqual(failed.error, 'intentional backend failure')
+        self.assertNotEqual(failed.run_dir, good.run_dir)
+        self.assertTrue(failed.has_placement)
+        placement = self.runner.last_placement(self.project)
+        self.assertEqual(placement.run_dir, good.run_dir)
+        self.assertTrue(placement.stale)
+        self.runner.open_last(self.project)
+        reopened = self.until(self.runner, 'serving')
+        self.assertEqual(reopened.run_dir, good.run_dir)
+        self.assertTrue(reopened.stale)
+        self.assertEqual((dump.read_bytes(), dump.stat().st_mtime_ns), original)
+        self.assertEqual(json.loads((Path(good.run_dir) / 'run.json').read_text())['active']['mode'], 'reopen')
+
+    def test_pending_cancel_shutdown_and_failed_attempt_without_placement(self):
+        (self.base / 'mode').write_text('pending')
+        self.runner.start(self.project)
+        self.until(self.runner, 'generating')
+        self.runner.stop()
+        state = self.until(self.runner, 'stopped')
+        self.assertFalse(state.has_placement)
+        with self.assertRaisesRegex(ValueError, 'no generated placement'):
+            self.runner.open_last(self.project)
+        (self.base / 'mode').write_text('ignore')
+        self.runner.start(self.project)
+        self.until(self.runner, 'generating')
+        started = time.monotonic()
+        stopped = self.runner.shutdown()
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(stopped.status, 'stopped')
+        self.assertFalse(stopped.can_stop)
+
+    def test_named_floorplans_are_scoped_and_tampered_inputs_refuse_reopen(self):
+        self.start_viewer(self.runner)
+        state = self.until(self.runner, 'serving')
+        other = AlignRunner(self.config, self.base / 'different.floorplan')
+        self.assertIsNone(other.last_run(self.project))
+        self.runner.shutdown()
+        manifest = json.loads((Path(state.run_dir) / 'run.json').read_text())
+        Path(manifest['netlist']).write_text('changed')
+        with self.assertRaisesRegex(ValueError, 'input files changed'):
+            self.runner.open_last(self.project)
+
+    def test_unsaved_run_adoption_and_fingerprint_incomplete_project(self):
+        unsaved = AlignRunner(self.config)
+        self.addCleanup(unsaved.shutdown)
+        self.start_viewer(unsaved)
+        state = self.until(unsaved, 'serving')
+        adopted = AlignRunner(self.config, self.base / 'newly_saved.floorplan')
+        self.addCleanup(adopted.shutdown)
+        self.assertEqual(adopted.last_run(self.project).run_dir, state.run_dir)
+        self.project.set_parameter('w1_2', None)
+        self.assertIsInstance(project_fingerprint(self.project), str)
+        self.assertTrue(adopted.poll(self.project).stale)
+        self.assertTrue(adopted.open_last(self.project).stale)
+
+    def test_preview_history_survives_changed_unsaved_inputs_failure_cancel_and_save_as(self):
+        from roar_api.floorplan.geometry import build_preview
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        data = build_preview(fixture, json.loads((fixture / 'manifest.json').read_text()))
+        (self.base / 'preview-fixture.json').write_text(json.dumps(data))
+        runner = AlignRunner(self.config)
+        self.addCleanup(runner.shutdown)
+        runner.start(self.project)
+        first = self.until(runner, 'completed')
+        self.assertTrue(first.has_preview)
+        self.assertIsNone(first.url)
+        self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        # A legacy capture's freshness belongs to its own captured circuit.
+        legacy_path = Path(first.run_dir) / 'run.json'
+        legacy = json.loads(legacy_path.read_text())
+        legacy['version'] = 1
+        legacy.pop('fingerprint_version')
+        legacy_path.write_text(json.dumps(legacy))
+        self.project.run_options['seed'] = 42
+        (self.base / 'mode').write_text('fail')
+        runner.start(self.project)
+        self.until(runner, 'failed')
+        self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        self.assertTrue(runner.last_preview(self.project).stale)
+        from roar_api.floorplan import align_runner
+        evidence = {path: path.read_bytes() for path in (
+            legacy_path, Path(first.run_dir) / 'status.json',
+            runner._run_dir / 'status.json', runner._index('snapshot:' + project_fingerprint(self.project)))}
+        with patch.object(runner, '_advance_run', wraps=runner._advance_run) as advance, \
+                patch.object(align_runner, '_tool_identity', wraps=align_runner._tool_identity) as identity, \
+                patch.object(align_runner, 'project_fingerprint', wraps=project_fingerprint) as fingerprint:
+            snapshot = runner.snapshot(self.project)
+        self.assertEqual(advance.call_count, 1)
+        self.assertEqual(identity.call_count, 1)
+        self.assertEqual(sum(call.args[0] is self.project for call in fingerprint.call_args_list), 1)
+        self.assertEqual(snapshot.current.status, 'failed')
+        self.assertEqual(snapshot.preview.run_dir, first.run_dir)
+        self.assertTrue(snapshot.preview.stale)
+        with patch.object(runner, '_advance_run', side_effect=AssertionError('advanced read-only snapshot')), \
+                patch.object(align_runner, '_write_json', side_effect=AssertionError('wrote history')):
+            self.assertEqual(runner.snapshot(self.project, advance=False), snapshot)
+        self.assertTrue(all(path.read_bytes() == contents for path, contents in evidence.items()))
+        self.project.run_options['seed'] = 43
+        (self.base / 'mode').write_text('pending')
+        runner.start(self.project)
+        self.until(runner, 'generating')
+        runner.stop()
+        self.until(runner, 'stopped')
+        self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        # A new controller can adopt the unsaved capture after a document save.
+        runner = AlignRunner(self.config, self.base / 'adopted.floorplan')
+        self.assertEqual(runner.last_preview(self.project).run_dir, first.run_dir)
+        destination = self.base / 'saved.floorplan'
+        with runner.save_as_transaction(destination):
+            self.project.save(destination)
+        reopened = AlignRunner(self.config, destination)
+        self.assertEqual(reopened.last_preview(self.project).run_dir, first.run_dir)
+        self.assertTrue(reopened.last_preview(self.project).stale)
+        (self.base / 'mode').write_text('good')
+        reopened.start(self.project)
+        second = self.until(reopened, 'completed')
+        self.assertNotEqual(second.run_dir, first.run_dir)
+        self.assertEqual(reopened.last_preview(self.project).run_dir, second.run_dir)
+        self.assertFalse(reopened.last_preview(self.project).stale)
+
+    def test_generation_fingerprint_ignores_authoring_provenance_but_tracks_effective_inputs(self):
+        original = project_fingerprint(self.project)
+        self.project.set_device_labels({self.project.devices[0].name: 'diffpair_inn'})
+        self.assertEqual(project_fingerprint(self.project), original)
+        snapshot = self.project.to_dict()
+        snapshot['source_path'] = '/different/source.sp'
+        snapshot['constraint_ids'] = ['replacement-' + str(i) for i in range(len(snapshot['constraints']))]
+        for parameter in snapshot['parameters'].values():
+            parameter['source'] = 'different sizing provenance'
+            parameter['binding'] = {'instance': 'M1', 'attribute': 'W', 'source': 'live'}
+        clone = FloorplanProject.from_dict(snapshot)
+        sketch = clone.sketch
+        sketch['positions'][clone.devices[0].name] = [40, 60]
+        clone.set_sketch(sketch)
+        self.assertEqual(project_fingerprint(clone), original)
+        clone.set_constraints(clone.constraints + [{'constraint': 'Boundary', 'max_width': 100}],
+                              enabled=[True] * len(clone.constraints) + [False])
+        self.assertEqual(project_fingerprint(clone), original)
+        clone.constraints[-1]['max_width'] = 200
+        self.assertEqual(project_fingerprint(clone), original)
+        clone.set_constraint_enabled(len(clone.constraints) - 1, True)
+        self.assertNotEqual(project_fingerprint(clone), original)
+        changes = [lambda p: setattr(p.devices[0], 'width_um', 1.23),
+                   lambda p: setattr(p.devices[0], 'model', 'different_model'),
+                   lambda p: p.devices[0].parameters.update(M=3),
+                   lambda p: p.run_options.update(seed=9),
+                   lambda p: setattr(p, 'align_profile', 'different_profile')]
+        for change in changes:
+            clone = FloorplanProject.from_dict(self.project.to_dict())
+            change(clone)
+            self.assertNotEqual(project_fingerprint(clone), original)
+
+    def test_staleness_tracks_backend_contents_and_tool_configuration(self):
+        backend = Path(self.config.backend_path)
+        backend.mkdir()
+        (backend / 'models.sp').write_text('original models')
+        self.start_viewer(self.runner)
+        self.until(self.runner, 'serving')
+        self.assertFalse(self.runner.poll(self.project).stale)
+        self.runner.config = dataclasses.replace(self.config, port=9010)
+        self.assertFalse(self.runner.poll(self.project).stale)
+        self.runner.config = dataclasses.replace(self.config, python='/different/python')
+        self.assertTrue(self.runner.poll(self.project).stale)
+        self.runner.config = self.config
+        (backend / 'models.sp').write_text('changed models')
+        self.assertTrue(self.runner.poll(self.project).stale)
+
+    def test_generation_fingerprint_normalizes_numeric_dimension_representation(self):
+        self.project.devices[0].width_um = 2.0
+        self.project.devices[0].length_um = 1.0
+        original = project_fingerprint(self.project)
+        self.project.devices[0].width_um = 2
+        self.project.devices[0].length_um = 1
+        self.assertEqual(project_fingerprint(self.project), original)
+        for invalid in (True, '2'):
+            self.project.devices[0].width_um = invalid
+            self.assertNotEqual(project_fingerprint(self.project), original)
+
+
+class WorkerErrorTests(unittest.TestCase):
+    def test_preview_runs_headless_placement_and_publishes_validated_geometry_without_viewer(self):
+        from roar_api.floorplan import _align_worker
+        from roar_api.floorplan.geometry import load_preview
+        fixture = Path(__file__).parent / 'fixtures' / 'align098_ota'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'capture'
+            shutil.copytree(fixture, root)
+            manifest = json.loads((root / 'manifest.json').read_text())
+            manifest.update(active={'token': 'preview-token', 'mode': 'preview', 'backend_path': directory},
+                            input_dir=str(root / 'input'),
+                            generation_config={'profile': PROFILE, 'run_options': {'seed': 17}})
+            path = root / 'run.json'
+            path.write_text(json.dumps(manifest))
+            (root / 'status.json').write_text('[]')
+            calls = []
+            modules = {
+                'align': SimpleNamespace(__version__=PROFILE['align_version'],
+                                         schematic2layout=lambda **kwargs: calls.append(kwargs)),
+                'dash': SimpleNamespace(__version__=str(PROFILE['dash_major']) + '.0.0'),
+                'align.gui.mockup': None, 'werkzeug.serving': None,
+            }
+            with patch.dict(sys.modules, modules), \
+                    patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', 'preview-token']), \
+                    patch.object(_align_worker.signal, 'signal'), \
+                    patch.object(_align_worker, 'native_preflight') as preflight, \
+                    patch.object(_align_worker, 'validate_viewer_assets', side_effect=AssertionError('viewer invoked')), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(_align_worker.main(), 0)
+                preflight.assert_called_once()
+                self.assertFalse(calls[0]['gui'])
+                self.assertEqual(calls[0]['flow_stop'], '3_pnr:place')
+                self.assertEqual(calls[0]['seed'], 17)
+                preview = load_preview(root / 'preview.json')
+                self.assertEqual(preview['candidates'][0]['bbox'], [0, 0, 25.8, 13.44])
+                status = json.loads((root / 'status.json').read_text())
+                self.assertEqual(status['status'], 'completed')
+                self.assertIsNone(status['url'])
+                evidence = list(root.glob('status.json.invalid-*'))
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(evidence[0].read_text(), '[]')
+                # A bad native capture must not publish a partial replacement.
+                (root / 'preview.json').unlink()
+                shutil.rmtree(root / '3_pnr' / 'Results')
+                self.assertEqual(_align_worker.main(), 1)
+                self.assertFalse((root / 'preview.json').exists())
+                self.assertFalse(list(root.glob('preview.*.tmp')))
+                self.assertEqual(json.loads((root / 'status.json').read_text())['status'], 'failed')
+
+    def test_viewer_credential_is_not_the_process_argument_token(self):
+        from roar_api.floorplan import _align_worker
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run.json'
+            activation = 'public-process-activation'
+            path.write_text(json.dumps({'active': {'token': activation, 'mode': 'reopen', 'backend_path': directory, 'port': 0},
+                'generation_config': {'profile': dict(PROFILE, dash_major=2), 'run_options': {'nvariants': 7, 'seed': 19}},
+                'input_dir': directory, 'top': 'test'}))
+            placer, captured = SimpleNamespace(), {}
+            def schematic2layout(**kwargs):
+                captured['options'] = kwargs
+                placer.run_gui(tagged_bboxes={}, module_name='TEST', lambda_coeff=1, port=0)
+            def application(**kwargs):
+                captured['prefix'] = os.environ['DASH_URL_BASE_PATHNAME']
+                self.assertNotIn('DASH_ROUTES_PATHNAME_PREFIX', os.environ)
+                self.assertNotIn('dash_requests_pathname_prefix', os.environ)
+                self.assertNotIn('DASH_APP_NAME', os.environ)
+                return SimpleNamespace(app=SimpleNamespace(server=object()), sel='TEST_0')
+            def server(host, port, application, **kwargs):
+                captured['viewer'] = application
+                def serve():
+                    captured['status'] = json.loads(path.with_name('status.json').read_text())
+                return SimpleNamespace(server_port=9012, serve_forever=serve, server_close=lambda: None)
+            modules = {
+                'align': SimpleNamespace(__version__=PROFILE['align_version'], schematic2layout=schematic2layout),
+                'dash': SimpleNamespace(__version__=str(PROFILE['dash_major']) + '.0.0'), 'align.pnr': SimpleNamespace(placer=placer),
+                'align.gui.mockup': SimpleNamespace(AppWithCallbacksAndState=application),
+                'werkzeug.serving': SimpleNamespace(make_server=server),
+            }
+            with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', activation]), \
+                    patch.dict(os.environ, {'DASH_ROUTES_PATHNAME_PREFIX': '/old/',
+                        'dash_requests_pathname_prefix': '/old/', 'DASH_APP_NAME': 'old-app'}), \
+                    patch.object(_align_worker.signal, 'signal'), patch.object(_align_worker, 'validate_viewer_assets'), contextlib.redirect_stdout(io.StringIO()):
+                environment = dict(os.environ)
+                self.assertEqual(_align_worker.main(), 0)
+                self.assertEqual(dict(os.environ), environment)
+            prefix = captured['viewer'].path_prefix
+            self.assertNotIn(activation, prefix)
+            self.assertRegex(prefix, r'^/roar-align/[0-9a-f]{64}/$')
+            self.assertEqual(captured['prefix'], prefix)
+            self.assertEqual(captured['status']['url'], 'http://127.0.0.1:9012' + prefix)
+            self.assertEqual(captured['options']['nvariants'], 7)
+            self.assertEqual(captured['options']['seed'], 19)
+            self.assertEqual(captured['options']['flow_start'], '3_pnr:gui')
+
+    def test_viewer_protects_layout_assets_and_callbacks_with_host_origin_and_authentication(self):
+        from roar_api.floorplan._align_worker import ProtectedViewer
+        token = 'a' * 64
+        prefix = f'/roar-align/{token}/'
+        calls = []
+        def application(environ, start):
+            calls.append(environ['PATH_INFO'])
+            start('200 OK', [('Content-Type', 'application/json')])
+            return [b'{"private": "placement"}']
+        viewer = ProtectedViewer(application, prefix)
+        viewer.port = 9012
+        def request(path='/', **updates):
+            environ = {'HTTP_HOST': '127.0.0.1:9012', 'PATH_INFO': path, 'REQUEST_METHOD': 'GET', 'QUERY_STRING': ''}
+            environ.update(updates)
+            response = {}
+            def start(status, headers, exc_info=None):
+                response.update(status=status, headers=dict(headers))
+            response['body'] = b''.join(viewer(environ, start))
+            return response
+        for path in ('/', '/_dash-layout', '/assets/test.js', '/_dash-update-component'):
+            self.assertEqual(request(path)['status'], '403 Forbidden')
+        self.assertEqual(calls, [])
+        for headers in ({'HTTP_HOST': 'untrusted.example:9012'},
+                        {'HTTP_ORIGIN': 'http://evil.example'},
+                        {'HTTP_ORIGIN': 'http://127.0.0.1:8080'},
+                        {'HTTP_SEC_FETCH_SITE': 'cross-site'}):
+            self.assertEqual(request(prefix + '_dash-layout', **headers)['status'], '403 Forbidden')
+        for path in (prefix[:-1], prefix.replace(token, 'b' * 64), '/_dash-layout'):
+            response = request(path, HTTP_COOKIE=f'roar_align_{token[:16]}={token}',
+                               HTTP_AUTHORIZATION='Bearer ' + token, QUERY_STRING='token=' + token)
+            self.assertEqual(response['status'], '403 Forbidden')
+            self.assertNotIn('Set-Cookie', response['headers'])
+        for path in ('', '_dash-layout', 'assets/test.js', '_dash-update-component'):
+            response = request(prefix + path, HTTP_ORIGIN='http://127.0.0.1:9012',
+                               REQUEST_METHOD='POST' if 'update' in path else 'GET')
+            self.assertEqual(response['status'], '200 OK')
+            self.assertEqual(response['headers']['Referrer-Policy'], 'no-referrer')
+            self.assertEqual(response['headers']['Cache-Control'], 'no-store')
+            self.assertNotIn('Set-Cookie', response['headers'])
+        self.assertEqual(calls, [prefix + path for path in ('', '_dash-layout', 'assets/test.js', '_dash-update-component')])
+
+    def test_loopback_permission_error_explains_how_to_reopen(self):
+        from roar_api.floorplan import _align_worker
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run.json'
+            token = 'test-activation'
+            path.write_text(json.dumps({'active': {'token': token, 'mode': 'reopen', 'backend_path': directory, 'port': 0},
+                'generation_config': {'profile': PROFILE}, 'input_dir': directory, 'top': 'test'}))
+            placer = SimpleNamespace()
+            def schematic2layout(**kwargs):
+                placer.run_gui(tagged_bboxes={}, module_name='TEST', lambda_coeff=1, port=0)
+            modules = {
+                'align': SimpleNamespace(__version__=PROFILE['align_version'], schematic2layout=schematic2layout),
+                'dash': SimpleNamespace(__version__=str(PROFILE['dash_major']) + '.0.0'),
+                'align.pnr': SimpleNamespace(placer=placer),
+                'align.gui.mockup': SimpleNamespace(AppWithCallbacksAndState=lambda **kwargs: SimpleNamespace(app=SimpleNamespace(server=object()))),
+                'werkzeug.serving': SimpleNamespace(make_server=lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError(errno.EPERM, 'Operation not permitted'))),
+            }
+            with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['worker', '--manifest', str(path), '--token', token]), \
+                    patch.object(_align_worker.signal, 'signal'), patch.object(_align_worker, 'validate_viewer_assets'), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(_align_worker.main(), 1)
+            status = json.loads(path.with_name('status.json').read_text())
+            self.assertEqual(status['status'], 'failed')
+            self.assertIn('Placement was generated', status['error'])
+            self.assertIn('loopback networking', status['error'])
+            self.assertIn('reopen the saved placement', status['error'])
+
+
+class ConfigTests(unittest.TestCase):
+    def test_missing_native_viewer_assets_explain_setup_repair(self):
+        from roar_api.floorplan._align_worker import validate_viewer_assets
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with patch.dict(sys.modules, {'align.gui.mockup': SimpleNamespace(__file__=str(base / 'mockup.py'))}):
+                with self.assertRaisesRegex(ValueError, 'viewer assets are missing.*Setup help'):
+                    validate_viewer_assets()
+                (base / 'assets').mkdir()
+                for name in ('00_from_codepen.css', '01_style.css', '02_typography.css', 'align.png'):
+                    (base / 'assets' / name).touch()
+                validate_viewer_assets()
+
+    def test_unsupported_host_is_rejected_before_launch(self):
+        with patch('roar_api.floorplan.align_runner.sys.platform', 'win32'):
+            with self.assertRaisesRegex(ValueError, 'Linux or WSL'):
+                AlignConfig('', '', '').validate()
+
+    def test_environment_uses_fixed_backend_only_and_portable_profile(self):
+        with patch.dict(os.environ, {'ROAR_ALIGN_PYTHON': '/tools/align/python', 'ROAR_ALIGN_PDK': '/wrong/official',
+                                     'ROAR_ALIGN_PDK_FIXED': '/tested/fixed', 'XDG_STATE_HOME': '/user/state'}, clear=True):
+            config = AlignConfig.from_environment()
+        self.assertEqual(config.backend_path, '/tested/fixed')
+        self.assertEqual(config.python, '/tools/align/python')
+        self.assertEqual(config.run_root, '/user/state/roar/align/runs')
+        self.assertEqual(PROFILE['run_defaults']['nvariants'], 4)
+        with patch.dict(os.environ, {'ROAR_ALIGN_PDK': '/wrong/official'}, clear=True):
+            self.assertEqual(AlignConfig.from_environment().backend_path, '')
+
+    @unittest.skipUnless(sys.platform == 'linux', 'ALIGN launcher requires Linux or WSL')
+    def test_backend_content_identity_is_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / 'gen_param.py').write_text('tested')
+            hashes = {'gen_param.py': hashlib.sha256(b'tested').hexdigest()}
+            with patch.dict(PROFILE, {'backend_hashes': hashes}):
+                config = AlignConfig(sys.executable, directory, str(base / 'runs'))
+                config.validate()
+                self.assertFalse((base / 'runs').exists())
+                runner = AlignRunner(config)
+                self.assertIsNone(runner.last_run())
+                config.prepare_storage()
+                self.assertTrue((base / 'runs').is_dir())
+                self.assertIsNone(runner.last_run())
+                self.assertFalse((base / 'runs' / '.ownership.lock').exists())
+                blocked = base / 'file-not-folder'
+                blocked.write_text('keep')
+                for root in (blocked, blocked / 'child'):
+                    with self.assertRaisesRegex(ValueError, 'Cannot write.*Choose a writable folder'):
+                        dataclasses.replace(config, run_root=str(root)).prepare_storage()
+                with patch('roar_api.floorplan.align_runner.tempfile.TemporaryFile', side_effect=PermissionError('denied')):
+                    with self.assertRaisesRegex(ValueError, 'Cannot write.*denied'):
+                        config.prepare_storage()
+                self.assertEqual(blocked.read_text(), 'keep')
+                (base / 'gen_param.py').write_text('changed')
+                with self.assertRaisesRegex(ValueError, 'Backend does not match'):
+                    config.validate()
+                with self.assertRaises(ValueError):
+                    dataclasses.replace(config, python='').validate()
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -34,18 +34,12 @@ fi
 
 # Run the setup
 echo "Setting up ROAR environment..."
-./bin/setup_roar.csh
+./bin/setup_roar.sh
 
 echo ""
 echo "✓ ROAR installation complete!"
 echo ""
 echo "To launch ROAR, run:"
 echo "  cd $TARGET_DIR"
-echo "  source .venv/bin/activate.csh"
-echo "  source roar_env.csh"
 echo "  ./bin/roar"
-echo ""
-echo "Or use the convenience launcher:"
-echo "  cd $TARGET_DIR"
-echo "  ./bin/run_roar.csh"
 

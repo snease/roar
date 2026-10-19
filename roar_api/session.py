@@ -58,6 +58,7 @@ class Session:
             raise TypeError("design must be a Design")
         self.home = home
         self._initial_design = design
+        self._initial_path = None
         self._app = app
         self._qapp = None
         self._backend = None
@@ -76,6 +77,21 @@ class Session:
     def from_app(cls, app: Any) -> Session:
         """Attach to an existing ROARApp without restoring or constructing it."""
         return cls(app=app)
+
+    @classmethod
+    def from_file(cls, path: Path | str, *, home: Path | str | None = None,
+                  show: bool = False) -> Session:
+        """Open saved content with its document identity and a clean baseline.
+
+        Read and validate the file immediately; Qt initialization remains lazy
+        until the first live operation unless ``show=True``.
+        """
+        path = Path(path).expanduser().resolve()
+        session = cls(Design.load(path), home=home)
+        session._initial_path = path
+        if show:
+            session.show()
+        return session
 
     def _attach(self) -> None:
         _main_thread()
@@ -115,6 +131,9 @@ class Session:
         initial, self._initial_design = self._initial_design, None
         if initial is not None:
             self.apply(initial)
+            if self._initial_path is not None:
+                self._app._record_design_document(self._initial_path)
+                self._initial_path = None
 
     @property
     def app(self):
@@ -354,7 +373,31 @@ class Session:
         return Design.from_state(state)
 
     def save(self, path):
+        """Write a detached snapshot without changing active document identity."""
         return self.capture().save(path)
+
+    def save_document(self, path: Path | str | None = None, *,
+                      companion_path: Path | str | None = None) -> Path:
+        """Save the active document and its open floorplan, without dialogs.
+
+        Omit ``path`` to save to the current document. An unsaved document needs
+        a path; an unsaved floorplan needs ``companion_path``. Existing companion
+        paths are reused. Validation and write failures raise without claiming a
+        successful save or changing the active document's identity.
+        """
+        app = self.app
+        workspace = app.floorplan_workspace()
+        path = workspace.path if path is None else path
+        if path is None or not str(path).strip():
+            raise ValueError("An unsaved document needs a save path.")
+        if companion_path is not None and app._floorplan_editor() is None:
+            raise ValueError("companion_path requires an open floorplan.")
+        target = Path(path).expanduser().resolve()
+        context = app._saving_design_document(str(target), True, companion_path=companion_path,
+                                             interactive=False)
+        if not workspace.save_document(target, self.capture().to_state(), save_context=context):
+            raise RuntimeError("Document save was cancelled.")
+        return target
 
     def export_design(self, path):
         return self.capture().export_design(path)
@@ -416,17 +459,58 @@ class Session:
         return self
 
     def run(self) -> int:
+        """Run the owned event loop; Ctrl+C requests normal window closure."""
         self._ensure()
-        from PyQt6.QtCore import QThread
+        import signal
+        from PyQt6.QtCore import QThread, QTimer
         if not self._owns_qapp or QThread.currentThread().loopLevel():
             raise RuntimeError("The host owns/runs Qt's event loop; use show() instead")
-        self.show()
-        return self._qapp.exec()
+        previous = signal.getsignal(signal.SIGINT)
+        handle_interrupt = previous == signal.default_int_handler
+        interrupted, closing = False, False
+
+        def request_close(signum, frame):
+            # Do not raise into an arbitrary Qt callback or open a modal dialog
+            # from a signal handler. Let the next event-loop tick close normally.
+            nonlocal interrupted
+            interrupted = True
+
+        def process_interrupt():
+            nonlocal interrupted, closing
+            if not interrupted or closing:
+                return
+            closing = True
+            try:
+                self.close()
+                if self._closed:
+                    self._qapp.exit(130)
+            finally:
+                # Repeated Ctrl+C while a save/discard prompt is open must not
+                # recurse into close or override the user's Cancel choice.
+                interrupted, closing = False, False
+
+        # Python handles SIGINT only when it regains control from Qt. Keep an
+        # idle native event loop responsive, while preserving custom API handlers.
+        timer = QTimer()
+        timer.timeout.connect(process_interrupt)
+        if handle_interrupt:
+            signal.signal(signal.SIGINT, request_close)
+        try:
+            timer.start(100)
+            self.show()
+            return self._qapp.exec()
+        finally:
+            timer.stop()
+            if handle_interrupt:
+                signal.signal(signal.SIGINT, previous)
 
     def close(self) -> None:
         _main_thread()
         if not self._closed and self._app is not None:
-            self._app.close()
+            if self._app.close() is False:
+                # The floorplan editor can cancel application close to protect
+                # unsaved work. Keep the window and Session usable in that case.
+                return
             if self._owns_window:
                 dialog = getattr(self._app.editor_window, "_iterative_solver_dialog", None)
                 if dialog is not None:

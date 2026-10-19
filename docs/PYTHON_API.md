@@ -8,10 +8,26 @@ newer** is required. Its implementation is in [roar_api/design.py](../roar_api/d
 
 ## Installation, imports, and assets
 
-From a checkout, install the headless API with `pip install -e .`. For desktop
-Qt plots, use `pip install -e '.[gui]'`. These editable installations do not
-require the csh launchers; the existing desktop installation instructions are
-in [INSTALLATION_AND_USAGE.md](INSTALLATION_AND_USAGE.md).
+For the desktop and its managed Python 3.11 runtime, run `./bin/setup_roar.sh`
+then `./bin/roar` from the checkout. Setup uses Pixi to install locked Python
+and native dependencies, with a separate Python 3.11 environment for ALIGN.
+Run your own API script in the managed ROAR environment with:
+
+```sh
+./.pixi/bin/pixi run --offline --locked --no-install -e default --executable python my_script.py
+```
+
+This supplies the API's Python and native dependencies. The managed ALIGN path
+configuration is supplied by `./bin/roar`; scripts that launch the floorplanner
+directly must provide their ALIGN configuration separately.
+
+For a headless or independently managed Python environment, the package remains
+installable with `python3 -m pip install -e .`; add `.[gui]` for live Qt operations
+and provide the required native libraries separately. Python 3.11 compatibility
+remains required. The managed `bin/roar` launcher always selects its own runtime;
+use your environment's `python3 -m roar_api` to launch a manual installation.
+See [INSTALLATION_AND_USAGE.md](INSTALLATION_AND_USAGE.md) for requirements,
+diagnostics and the manual fallback.
 
 ```python
 from pathlib import Path
@@ -425,8 +441,11 @@ session = roar.launch(design, home=HOME)  # Keep this reference alive.
 ```
 
 `launch(design=None, *, home=None, run=False)` also accepts a saved-state path;
-it shows a session and returns it. `run=True` is for an appropriate standalone
-host, not a notebook. For an already running ROAR window:
+it shows a session and returns it with that file's document identity and a clean
+saved baseline. `Session.from_file(path, *, home=None, show=False)` opens the
+same saved document while leaving Qt initialization lazy until a live operation
+is requested. The file is read and validated immediately. `run=True` is for an
+appropriate standalone host, not a notebook. For an already running ROAR window:
 
 ```python
 # existing_roar_app must be the real ROARApp, not just QApplication.
@@ -449,6 +468,7 @@ ROAR app and its `QApplication` must belong to the current thread. Passing both
 | `refresh(tab=None)` | Publish current editor symbols and refresh all windows, or one tab. |
 | `show()` / `run()` | Show under a host loop / run an owned standalone loop. |
 | `save`, `export_design`, `export_python`, `export_spice` | Capture the live state and delegate to the detached writers. |
+| `save_document(path=None, *, companion_path=None)` | Save the active full document and open floorplan, updating document identity and the saved baseline; return the resolved document path. |
 | `export_solver_python(path)` | Write the legacy computational solver script, not a reconstruction. |
 | `close()` | Close the window and invalidate the session; an attached window is also closed. |
 
@@ -456,6 +476,24 @@ ROAR app and its `QApplication` must belong to the current thread. Passing both
 while using their widgets. Live operations must occur on the GUI thread.
 Live export methods do not all create parent directories (in particular live
 plot/solver-script exports); create an export directory before using them.
+
+`save(path)` writes a snapshot copy and leaves the active document's identity
+and dirty state unchanged. Use `save_document()` for a document save:
+
+```python
+session = Session.from_file("design.roar")
+# Apply edits through the live session.
+session.save_document("revised.roar")  # Save As; a live companion follows this identity.
+session.save_document()                # Reuse the active document path.
+```
+
+These saves do not open dialogs. Supply `path` for an unnamed design and
+`companion_path="layout.roar.floorplan"` for an unsaved open floorplan; an
+existing companion keeps its path. The document and companion must use different
+paths. Validation or write failures raise, retaining the previous identity and
+saved baseline. The coordinated save restores earlier file contents on handled
+failure; it is not a power-loss transaction across files. If restoring a companion
+also fails, the editor requires a repair save before closing or discarding it.
 
 ### LiveGraph configuration, markers, and exports
 

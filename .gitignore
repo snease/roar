@@ -9,6 +9,7 @@
 
 # virtualenv
 .venv
+.pixi/
 venv/
 ENV/
 
@@ -17,6 +18,7 @@ ENV/
 verify_roar.py
 roar_cad.egg-info/
 tests/
+!src/floorplan/tests/
 
 
 
@@ -66,3 +68,4 @@ wheels/
 
 # ROAR Environment file
 roar_env.csh
+roar_env.sh

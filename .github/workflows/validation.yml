@@ -1,0 +1,57 @@
+name: Runtime validation
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  managed-checks:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      # CI verifies Qt imports/widgets headlessly. It cannot accept a desktop
+      # display or OpenGL rendering; run check-gui on the user's desktop.
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set validation artifact directory
+        run: echo "ROAR_CHECK_OUTPUT_DIR=${RUNNER_TEMP}/roar-checks" >> "$GITHUB_ENV"
+      - name: Install the pinned runtime and backend (headless CI setup)
+        id: setup
+        run: ./bin/setup_roar.sh
+      - name: Install the locked GUI-free package test environment
+        id: headless
+        run: ./.pixi/bin/pixi install --no-config --locked -e headless
+      - name: Floorplan tests (Python 3.11, offscreen Qt)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e default test-floorplan
+      - name: Build and installed-wheel core/missing-GUI smoke
+        if: ${{ !cancelled() && steps.headless.outcome == 'success' }}
+        run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e headless check-package
+      - name: Native schema and placement checks (Python 3.11, no routing)
+        # The small native placement cases also include the schema check.
+        # Run on every PR to cover indirect changes to native exports.
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e align check-align-placement
+      - name: Native viewer layout, assets, callbacks and access controls
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: ./.pixi/bin/pixi run --no-config --offline --locked --no-install -e default check-align-viewer
+      - name: Retain validation logs and receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-validation
+          path: |
+            ${{ runner.temp }}/roar-checks/**/receipt.json
+            ${{ runner.temp }}/roar-checks/**/*.log
+            ${{ runner.temp }}/roar-checks/**/native/**
+            ${{ runner.temp }}/roar-checks/**/wheels/*.whl
+          if-no-files-found: warn
+          retention-days: 7

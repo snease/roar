@@ -1,0 +1,36 @@
+{
+  "top": "current_mirror_ota",
+  "netlist": "input/current_mirror_ota.sp",
+  "fingerprint": "ota-baseline-capture",
+  "created_at": null,
+  "profile_id": "sky130-ota-vibeic-v1",
+  "generation_config": {
+    "profile": {
+      "id": "sky130-ota-vibeic-v1",
+      "label": "SKY130A",
+      "technology": "SKY130A",
+      "align_version": "0.9.8",
+      "dash_major": 2,
+      "backend_repository": "https://github.com/vibeic/ALIGN-pdk-sky130",
+      "backend_revision": "427b3b94242fdcf8009e418f6bbe14286fc71334",
+      "backend_environment": "ROAR_ALIGN_PDK_FIXED",
+      "python_environment": "ROAR_ALIGN_PYTHON",
+      "backend_hashes": {
+        "gen_param.py": "3a2fcc03163ae7ee1f89ce6d1c7a74be3cb5f3f558ed9b7230364f2d7bd72a3a",
+        "mos.py": "3ea8bcb3d56ce1193b9325045504f0582715ae3eadcde99d5723f4f9e96cf01a",
+        "layers.json": "baf138788e3a48e7d2e8d7035f54abf9518cad3b1ce1a7f55ac3160b5f35743f",
+        "models.sp": "4660e6645e442fdc0326741d3ca8ca89893014675da64340cb9ef422f61e90f0"
+      },
+      "models": [
+        "sky130_fd_pr__nfet_01v8",
+        "sky130_fd_pr__pfet_01v8"
+      ],
+      "run_defaults": {
+        "nvariants": 4,
+        "placer_sa_iterations": 100,
+        "seed": 0
+      },
+      "instructions": "Select the separate ALIGN Python environment and the configured SKY130A backend's SKY130_PDK directory. ROAR_ALIGN_PDK_FIXED identifies this backend; ROAR_ALIGN_PDK may point to the incompatible official backend. Machine paths belong in user settings."
+    }
+  }
+}
