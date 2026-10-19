@@ -350,16 +350,28 @@ def _check_combinations(constraints, row_numbers):
 
     for axis, graph in graphs.items():
         completed = set()
-        def visit(node, path, rows):
-            if node in path:
-                start = path.index(node)
-                involved = ', '.join(str(r) for r in sorted(set(rows[start:])))
-                raise ValueError(f'Constraints {involved}: contradictory {axis} order cycle: ' + ' → '.join(path[start:] + [node]))
-            if node in completed:
-                return
-            for following, row in graph.get(node, {}).items():
-                visit(following, path + [node], rows + [row])
-            completed.add(node)
         for node in graph:
-            visit(node, [], [])
-
+            if node in completed:
+                continue
+            path, rows = [node], []
+            visiting = {node: 0}
+            pending = [iter(graph.get(node, {}).items())]
+            while pending:
+                following, row = next(pending[-1], (None, None))
+                if following is None:
+                    completed.add(path[-1])
+                    visiting.pop(path.pop())
+                    pending.pop()
+                    if rows:
+                        rows.pop()
+                    continue
+                if following in visiting:
+                    start = visiting[following]
+                    involved = ', '.join(str(r) for r in sorted(set(rows[start:] + [row])))
+                    raise ValueError(f'Constraints {involved}: contradictory {axis} order cycle: ' + ' → '.join(path[start:] + [following]))
+                if following in completed:
+                    continue
+                visiting[following] = len(path)
+                path.append(following)
+                rows.append(row)
+                pending.append(iter(graph.get(following, {}).items()))

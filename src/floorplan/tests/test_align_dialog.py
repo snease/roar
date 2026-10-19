@@ -356,6 +356,21 @@ class PlacementPanelTests(unittest.TestCase):
                 validate_run_options({'lambda_coeff': value})
         dialog.deleteLater()
 
+    def test_settings_preserve_untouched_weight_precision_but_accept_explicit_edits(self):
+        for weight in (1.2345, 0.014):
+            with self.subTest(weight=weight):
+                dialog = AlignSettingsDialog(self.config, None, placement_options={'lambda_coeff': weight})
+                dialog.run_root.setText(str(self.root / 'other-runs'))
+                dialog.option_fields['nvariants'].setValue(8)
+                dialog.accept()
+                self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+                self.assertEqual(dialog.run_options['lambda_coeff'], weight)
+                self.assertEqual(dialog.run_options['nvariants'], 8)
+                dialog.option_fields['lambda_coeff'].setValue(2.5)
+                dialog.accept()
+                self.assertEqual(dialog.run_options['lambda_coeff'], 2.5)
+                dialog.deleteLater()
+
     def test_installation_test_starts_asynchronously_and_displays_versions(self):
         dialog = AlignSettingsDialog(self.config, PROFILE_ID)
         callbacks = []

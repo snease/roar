@@ -75,6 +75,34 @@ class FloorplanDialogTests(unittest.TestCase):
         dialog.source_mode.setCurrentIndex(index)
         dialog.source_mode.activated.emit(index)
 
+    def test_preview_actions_follow_invalid_inputs_and_active_run_state(self):
+        from roar_api.floorplan.align_runner import RunSnapshot, RunState
+        placement, preview = self.dialog.placement_panel, self.dialog.preview_panel
+        runner = Mock()
+        runner.snapshot.return_value = RunSnapshot()
+        with patch.object(placement, '_ensure_runner', return_value=runner), \
+             patch.object(placement, '_validator', return_value=None):
+            placement.refresh()
+            self.assertTrue(preview.generate_button.isEnabled())
+            self.dialog.devices_table.item(0, 3).setText('unfinished')
+            placement.refresh()
+            self.assertFalse(preview.generate_button.isEnabled())
+            self.assertTrue(preview.generate_button.toolTip())
+            runner.snapshot.return_value = RunSnapshot(current=RunState(
+                str(self.root / 'run'), 'starting', None, None, 'align.log', 'fingerprint'))
+            placement.refresh()
+            self.assertTrue(preview.generate_button.isEnabled())
+            self.assertEqual(preview.generate_button.text(), 'Show active ALIGN run…')
+            self.assertFalse(preview.settings_button.isEnabled())
+            runner.snapshot.return_value = RunSnapshot()
+            placement.refresh()
+            self.assertFalse(preview.generate_button.isEnabled())
+            self.assertTrue(preview.settings_button.isEnabled())
+            for name in ('generate_button', 'settings_button'):
+                source, target = getattr(placement, name), getattr(preview, name)
+                self.assertEqual((source.isEnabled(), source.text(), source.toolTip()),
+                                 (target.isEnabled(), target.text(), target.toolTip()))
+
     def workspace(self, design, path=None):
         editor = SimpleNamespace(design=design)
         editor.capture = Mock(wraps=lambda: editor.design)

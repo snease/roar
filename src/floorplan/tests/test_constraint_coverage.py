@@ -65,6 +65,19 @@ class ConstraintCoverageTests(unittest.TestCase):
                 {'constraint': 'Order', 'instances': ['M2', 'M1'], 'direction': 'top_to_bottom'},
             ])
 
+    def test_long_order_validates_and_reports_a_late_cycle_without_recursion(self):
+        names = [f'M{i}' for i in range(1500)]
+        project = FloorplanProject.from_text('.subckt many d g s b\n' + '\n'.join(
+            f'{name} d g s b nch W=1u L=.15u NF=2' for name in names) + '\n.ends many\n')
+        order = {'constraint': 'Order', 'instances': names, 'direction': 'left_to_right'}
+        project.set_constraints([order])
+        with self.assertRaisesRegex(ValueError, r'Constraints 1, 2:.*M1497 → M1498 → M1499 → M1497'):
+            project.set_constraints([order, {
+                'constraint': 'Order', 'instances': [names[-1], names[-3]],
+                'direction': 'left_to_right',
+            }])
+        self.assertEqual(project.constraints, [order])
+
     def test_clock_power_and_ground_roles_cannot_conflict(self):
         with self.assertRaisesRegex(ValueError, 'conflicting'):
             self.project.set_constraints([

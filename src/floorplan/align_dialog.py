@@ -218,7 +218,14 @@ class AlignSettingsDialog(QDialog):
         weight.setRange(*OPTION_LIMITS['lambda_coeff'])
         weight.setDecimals(2)
         weight.setValue(self.run_options['lambda_coeff'])
+        # A saved/API value can have more precision than the editing widget.
+        # Opening settings must not turn its display rounding into a model edit.
+        self._weight_edited = False
+        weight.valueChanged.connect(self._weight_changed)
+        weight.lineEdit().textEdited.connect(self._weight_changed)
         weight.setToolTip('ALIGN minimizes log(area) + λ × log(estimated wirelength). Larger values favor shorter wires. Default: 1.')
+        if weight.value() != self.run_options['lambda_coeff']:
+            weight.setToolTip(weight.toolTip() + f"\nSaved weight: {self.run_options['lambda_coeff']!r}; retained until you edit this field.")
         self.option_fields['lambda_coeff'] = weight
         form.addRow('Wirelength weight (λ):', weight)
         layout.addWidget(_label('Run options are saved with this floorplan. This flow generates placement candidates; it does not route or produce final GDS.'))
@@ -311,6 +318,9 @@ class AlignSettingsDialog(QDialog):
         if path:
             field.setText(path)
 
+    def _weight_changed(self):
+        self._weight_edited = True
+
     def accept(self):
         try:
             if not self.technology.model().item(self.technology.currentIndex()).isEnabled():
@@ -322,7 +332,8 @@ class AlignSettingsDialog(QDialog):
             self.error.setText(str(exc))
             return
         self.config = config
-        self.run_options = {key: field.value() for key, field in self.option_fields.items()}
+        self.run_options = {key: (self.run_options[key] if key == 'lambda_coeff' and not self._weight_edited
+                                 else field.value()) for key, field in self.option_fields.items()}
         super().accept()
 
 
@@ -384,9 +395,10 @@ class PlacementRunDialog(QDialog):
 
 
 class PlacementPanel(QWidget):
-    """Poll the headless runner without importing ALIGN or blocking Qt."""
+    """Qt controls and polling for the separate ALIGN worker."""
 
     previewReady = pyqtSignal(object, object)
+    actionsChanged = pyqtSignal()
 
     def __init__(self, project_provider, path_provider, profile_setter, parent=None,
                  *, settings=None, runner_factory=AlignRunner,
@@ -489,6 +501,13 @@ class PlacementPanel(QWidget):
     def _active(self):
         return self._state is not None and self._state.status in ACTIVE
 
+    def _update_actions(self, error):
+        self.generate_button.setEnabled(self._active() or not error)
+        self.generate_button.setText("Show active ALIGN run…" if self._active() else "Generate physical preview")
+        self.generate_button.setToolTip(error)
+        self.settings_button.setEnabled(not self._active())
+        self.actionsChanged.emit()
+
     def _ensure_runner(self):
         path = self._path_provider()
         key = str(path) if path else None
@@ -509,12 +528,11 @@ class PlacementPanel(QWidget):
             self._apply_state(snapshot.current)
             self._refresh_preview(snapshot.preview, None)
             historical = snapshot.placement
-            self.generate_button.setEnabled(self._active())
+            self._update_actions(str(exc))
             self.open_last_button.setEnabled(historical is not None and not (self._active() and self._state.status != 'serving'))
             self.open_last_button.setToolTip(str(historical.run_dir) if historical else '')
             self.status.setText(str(exc))
             self.last_label.setText("Current edits are invalid. Open last placement uses its captured input." if historical else "")
-            self.settings_button.setEnabled(not self._active())
             if self._active():
                 self._poll_timer.start()
             return
@@ -535,10 +553,7 @@ class PlacementPanel(QWidget):
         self._apply_state(snapshot.current)
         if self._active():
             self._poll_timer.start()
-        self.generate_button.setEnabled(self._active() or not error)
-        self.generate_button.setText("Show active ALIGN run…" if self._active() else "Generate physical preview")
-        self.generate_button.setToolTip(error)
-        self.settings_button.setEnabled(not self._active())
+        self._update_actions(error)
         state = snapshot.placement
         self.open_last_button.setEnabled(state is not None and not (self._active() and self._state.status != "serving"))
         self.open_last_button.setToolTip(str(state.run_dir) if state else "")

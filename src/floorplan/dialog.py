@@ -491,6 +491,8 @@ class FloorplanDialog(QDialog):
                           "run_options_setter": self._set_run_options}, **(placement_options or {})))
         self.tabs.addTab(self.placement_panel, "Placement")
         self.placement_panel.previewReady.connect(self._show_physical_preview)
+        self.placement_panel.actionsChanged.connect(self._sync_placement_actions)
+        self._sync_placement_actions()
         self.preview_panel.generationRequested.connect(lambda: self._guard(self.placement_panel.generate_preview))
         self.preview_panel.settingsRequested.connect(lambda: self._guard(self.placement_panel.edit_settings))
         self.status = QLabel("")
@@ -503,6 +505,13 @@ class FloorplanDialog(QDialog):
         bottom.addWidget(close)
         layout.addLayout(bottom)
         self.tabs.setEnabled(False)
+
+    def _sync_placement_actions(self):
+        for name in ('generate_button', 'settings_button'):
+            source, target = getattr(self.placement_panel, name), getattr(self.preview_panel, name)
+            target.setText(source.text())
+            target.setEnabled(source.isEnabled())
+            target.setToolTip(source.toolTip())
 
     def _button(self, text, action):
         button = QPushButton(text)
